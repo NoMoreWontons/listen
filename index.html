@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>listen</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  #controls { display: flex; align-items: center; gap: 1rem; }
+  button { font-size: 1rem; padding: .5rem 1.1rem; border-radius: 8px; border: 1px solid #888; cursor: pointer; }
+  button.recording { background: #e33; color: #fff; border-color: #e33; }
+  .timer { font-variant-numeric: tabular-nums; font-size: 1.2rem; color: #e33; display: none; }
+  .timer.on { display: inline; }
+  .mic { font-size: .9rem; display: none; }
+  .mic.on { display: inline; }
+  #wave { display: none; width: 100%; height: 80px; margin-top: 1rem; background: #fafafa; border-radius: 8px; }
+  #wave.on { display: block; }
+  .rec { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  .status { font-size: .8rem; color: #777; text-transform: uppercase; letter-spacing: .04em; }
+  pre { white-space: pre-wrap; word-wrap: break-word; }
+  h4 { margin: .6rem 0 .2rem; }
+</style>
+</head>
+<body>
+<h1>listen</h1>
+<div id="controls">
+  <button id="btn">● Record</button>
+  <span id="timer" class="timer">0:00</span>
+  <span id="mic" class="mic"></span>
+</div>
+<canvas id="wave"></canvas>
+<div id="list"></div>
+
+<script>
+let mr, rid, recording = false;
+let audioCtx, analyser, rafId, timerId, startTime;
+const btn = document.getElementById('btn');
+const timer = document.getElementById('timer');
+const mic = document.getElementById('mic');
+const canvas = document.getElementById('wave');
+const ctx = canvas.getContext('2d');
+
+function fmt(s) { return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+
+function drawWave() {
+  rafId = requestAnimationFrame(drawWave);
+  const buf = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(buf);
+  // peak deviation from the 128 silence baseline → is the mic actually hearing anything?
+  let peak = 0;
+  for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128));
+  if (peak > 3) { mic.textContent = '🎤 receiving audio'; mic.style.color = '#2a2'; }
+  else { mic.textContent = '🔇 no input'; mic.style.color = '#c00'; }
+  // size the backing store to the displayed size so the line isn't stretched
+  canvas.width = canvas.clientWidth;
+  canvas.height = canvas.clientHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#e33';
+  ctx.beginPath();
+  const slice = canvas.width / buf.length;
+  for (let i = 0; i < buf.length; i++) {
+    const y = (buf[i] / 128) * canvas.height / 2;
+    const x = i * slice;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function startMeters(stream) {
+  audioCtx = new AudioContext();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  audioCtx.createMediaStreamSource(stream).connect(analyser);
+  canvas.classList.add('on');
+  mic.classList.add('on');
+  drawWave();
+  startTime = Date.now();
+  timer.textContent = '0:00';
+  timer.classList.add('on');
+  timerId = setInterval(() => { timer.textContent = fmt(Math.floor((Date.now() - startTime) / 1000)); }, 1000);
+}
+
+function stopMeters() {
+  cancelAnimationFrame(rafId);
+  clearInterval(timerId);
+  canvas.classList.remove('on');
+  timer.classList.remove('on');
+  mic.classList.remove('on');
+  if (audioCtx) audioCtx.close();
+}
+
+btn.onclick = async () => {
+  if (!recording) {
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      alert('Mic access failed: ' + e.name + ' — ' + e.message + '\nAllow the microphone for 127.0.0.1 and try again.');
+      return;
+    }
+    rid = (await (await fetch('/start', { method: 'POST' })).json()).id;
+    mr = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    mr.ondataavailable = e => { if (e.data.size) fetch('/chunk/' + rid, { method: 'POST', body: e.data }); };
+    mr.onstop = () => { fetch('/stop/' + rid, { method: 'POST' }); stream.getTracks().forEach(t => t.stop()); refresh(); };
+    mr.start(10000); // 10s chunks → survives a tab crash
+    startMeters(stream);
+    recording = true;
+    btn.textContent = '■ Stop';
+    btn.classList.add('recording');
+  } else {
+    mr.stop();
+    recording = false;
+    btn.textContent = '● Record';
+    btn.classList.remove('recording');
+    stopMeters();
+  }
+};
+
+function esc(s) { return s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+
+async function refresh() {
+  const rows = await (await fetch('/recordings')).json();
+  document.getElementById('list').innerHTML = rows.map(r => `
+    <div class="rec">
+      <b>${esc(r.title || '')}</b> <span class="status">${r.status}</span>
+      ${r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
+      ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
+    </div>`).join('');
+}
+
+setInterval(refresh, 5000);
+refresh();
+</script>
+</body>
+</html>
