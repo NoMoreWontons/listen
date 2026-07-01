@@ -4,32 +4,240 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>listen</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  :root {
+    --stone:      #EDE9DE; /* page ground, warm cardboard */
+    --panel:      #2B2A28; /* transport console, brushed-graphite chassis */
+    --panel-edge: #444038; /* console bevel highlight */
+    --lcd:        #F3EEE2; /* cream readout window */
+    --ink:        #2B2A28;
+    --ink-soft:   #837c6c;
+    --ink-on-panel: #C9C4B6;
+    --rec:        #D9432F; /* transport REC lamp */
+    --live:       #3FA78C; /* signal LED, "hearing audio" */
+    --amber:      #DE9A32; /* transcribing */
+    --card:       #FBF9F3;
+    --card-edge:  #E1DACB;
+    --radius-panel: 18px;
+    --radius-card: 10px;
+    --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    font-family: system-ui, sans-serif;
+    background: var(--stone);
+    color: var(--ink);
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 4rem;
+    line-height: 1.5;
+  }
+
+  .brand { margin-bottom: 1.75rem; }
+  .brand h1 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 1.8rem;
+    letter-spacing: -0.02em;
+    margin: 0;
+  }
+  .tagline {
+    margin: .15rem 0 0;
+    font-size: .8rem;
+    color: var(--ink-soft);
+    text-transform: uppercase;
+    letter-spacing: .08em;
+  }
+
+  .deck-label {
+    display: block;
+    font-family: var(--font-display);
+    font-size: .68rem;
+    font-weight: 600;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-on-panel);
+    opacity: .65;
+    margin-bottom: .5rem;
+  }
+
+  /* ---- transport console ---- */
+  .deck {
+    background: var(--panel);
+    border-radius: var(--radius-panel);
+    padding: 1.4rem 1.5rem 1.6rem;
+    box-shadow:
+      inset 0 1px 0 var(--panel-edge),
+      0 10px 24px -14px rgba(0,0,0,.55);
+  }
+
+  .deck-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .deck-group.signal { text-align: right; }
+
   #controls { display: flex; align-items: center; gap: 1rem; }
-  button { font-size: 1rem; padding: .5rem 1.1rem; border-radius: 8px; border: 1px solid #888; cursor: pointer; }
-  button.recording { background: #e33; color: #fff; border-color: #e33; }
-  .timer { font-variant-numeric: tabular-nums; font-size: 1.2rem; color: #e33; display: none; }
-  .timer.on { display: inline; }
-  .mic { font-size: .9rem; display: none; }
+
+  button#btn {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: .95rem;
+    letter-spacing: .01em;
+    padding: .65rem 1.3rem;
+    border-radius: 999px;
+    border: 1px solid #55504a;
+    background: #38352f;
+    color: var(--ink-on-panel);
+    cursor: pointer;
+    box-shadow: 0 1px 0 rgba(255,255,255,.05) inset, 0 2px 4px rgba(0,0,0,.3);
+    transition: transform .12s ease, background .2s ease, box-shadow .2s ease;
+  }
+  button#btn:hover { background: #423e37; }
+  button#btn:active { transform: translateY(1px); }
+  button#btn:focus-visible {
+    outline: 2px solid var(--live);
+    outline-offset: 2px;
+  }
+  button#btn.recording {
+    background: var(--rec);
+    color: #fff;
+    border-color: var(--rec);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(217,67,47,.55); }
+    50%      { box-shadow: 0 0 0 7px rgba(217,67,47,0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    button#btn.recording { animation: none; }
+  }
+
+  /* timer as a recessed LCD counter window */
+  .timer {
+    display: none;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 1.05rem;
+    background: var(--lcd);
+    color: var(--ink);
+    padding: .45rem .7rem;
+    border-radius: 6px;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,.35);
+    letter-spacing: .03em;
+  }
+  .timer.on { display: inline-block; }
+
+  .mic {
+    display: none;
+    font-size: .82rem;
+    font-family: var(--font-mono);
+    color: var(--ink-on-panel);
+  }
   .mic.on { display: inline; }
-  #wave { display: none; width: 100%; height: 80px; margin-top: 1rem; background: #fafafa; border-radius: 8px; }
+
+  /* oscilloscope panel */
+  #wave {
+    display: none;
+    width: 100%;
+    height: 84px;
+    margin-top: 1.25rem;
+    border-radius: 8px;
+    background:
+      linear-gradient(var(--panel-edge) 1px, transparent 1px) 0 50% / 100% 21px,
+      #221f1c;
+    box-shadow: inset 0 1px 4px rgba(0,0,0,.5);
+  }
   #wave.on { display: block; }
-  .rec { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
-  .status { font-size: .8rem; color: #777; text-transform: uppercase; letter-spacing: .04em; }
-  pre { white-space: pre-wrap; word-wrap: break-word; }
-  h4 { margin: .6rem 0 .2rem; }
+
+  /* ---- sessions ---- */
+  .sessions { margin-top: 2.25rem; }
+  .sessions > .deck-label { color: var(--ink-soft); opacity: 1; margin-bottom: .75rem; }
+
+  #list:empty::before {
+    content: "No sessions yet — press record to start your first one.";
+    display: block;
+    font-size: .88rem;
+    color: var(--ink-soft);
+    border: 1px dashed var(--card-edge);
+    border-radius: var(--radius-card);
+    padding: 1.5rem;
+    text-align: center;
+  }
+
+  .rec {
+    background: var(--card);
+    border: 1px solid var(--card-edge);
+    border-radius: var(--radius-card);
+    padding: 1rem 1.15rem;
+    margin: 0 0 .85rem;
+  }
+  .rec b {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1rem;
+  }
+  .status {
+    font-family: var(--font-mono);
+    font-size: .68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    padding: .15rem .5rem;
+    border-radius: 999px;
+    margin-left: .5rem;
+    vertical-align: 1px;
+    background: #e9e4d6;
+    color: var(--ink-soft);
+  }
+  .status[data-s="recording"]    { background: #fbe4e0; color: #a8331f; }
+  .status[data-s="transcribing"] { background: #f7e8cf; color: #93670f; }
+  .status[data-s="done"]         { background: #dcf0ea; color: #226e5b; }
+  .status[data-s="error"]        { background: #f4d9d9; color: #8f2323; }
+
+  h4 { font-family: var(--font-display); font-size: .8rem; margin: .8rem 0 .3rem; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .06em; }
+  pre { white-space: pre-wrap; word-wrap: break-word; font-size: .88rem; margin: 0; }
+  details summary { cursor: pointer; font-size: .82rem; color: var(--ink-soft); margin-top: .6rem; }
+  details summary:focus-visible { outline: 2px solid var(--live); outline-offset: 2px; }
 </style>
 </head>
 <body>
-<h1>listen</h1>
-<div id="controls">
-  <button id="btn">● Record</button>
-  <span id="timer" class="timer">0:00</span>
-  <span id="mic" class="mic"></span>
+<div class="brand">
+  <h1>listen</h1>
+  <p class="tagline">lecture &amp; meeting transcriber</p>
 </div>
-<canvas id="wave"></canvas>
-<div id="list"></div>
+
+<section class="deck" aria-label="Recording console">
+  <div class="deck-row">
+    <div class="deck-group">
+      <span class="deck-label">Transport</span>
+      <div id="controls">
+        <button id="btn">● Record</button>
+        <span id="timer" class="timer">0:00</span>
+      </div>
+    </div>
+    <div class="deck-group signal">
+      <span class="deck-label">Signal</span>
+      <span id="mic" class="mic"></span>
+    </div>
+  </div>
+  <canvas id="wave"></canvas>
+</section>
+
+<section class="sessions">
+  <span class="deck-label">Sessions</span>
+  <div id="list"></div>
+</section>
 
 <script>
 let mr, rid, recording = false;
@@ -49,14 +257,14 @@ function drawWave() {
   // peak deviation from the 128 silence baseline → is the mic actually hearing anything?
   let peak = 0;
   for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128));
-  if (peak > 3) { mic.textContent = '🎤 receiving audio'; mic.style.color = '#2a2'; }
-  else { mic.textContent = '🔇 no input'; mic.style.color = '#c00'; }
+  if (peak > 3) { mic.textContent = '🎤 receiving audio'; mic.style.color = '#3FA78C'; }
+  else { mic.textContent = '🔇 no input'; mic.style.color = '#D9432F'; }
   // size the backing store to the displayed size so the line isn't stretched
   canvas.width = canvas.clientWidth;
   canvas.height = canvas.clientHeight;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.lineWidth = 2;
-  ctx.strokeStyle = '#e33';
+  ctx.strokeStyle = '#DE9A32';
   ctx.beginPath();
   const slice = canvas.width / buf.length;
   for (let i = 0; i < buf.length; i++) {
@@ -123,7 +331,7 @@ async function refresh() {
   const rows = await (await fetch('/recordings')).json();
   document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
-      <b>${esc(r.title || '')}</b> <span class="status">${r.status}</span>
+      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>
       ${r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
       ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
     </div>`).join('');
