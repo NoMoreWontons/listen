@@ -109,6 +109,16 @@
     outline: 2px solid var(--live);
     outline-offset: 2px;
   }
+
+  select#micSelect {
+    font-family: var(--font-mono);
+    font-size: .78rem;
+    background: #38352f;
+    color: var(--ink-on-panel);
+    border: 1px solid #55504a;
+    border-radius: 6px;
+    padding: .4rem .5rem;
+  }
   button#btn.recording {
     background: var(--rec);
     color: #fff;
@@ -224,6 +234,7 @@
       <div id="controls">
         <button id="btn">● Record</button>
         <span id="timer" class="timer">0:00</span>
+        <select id="micSelect" title="Microphone"></select>
       </div>
     </div>
     <div class="deck-group signal">
@@ -245,8 +256,20 @@ let audioCtx, analyser, rafId, timerId, startTime;
 const btn = document.getElementById('btn');
 const timer = document.getElementById('timer');
 const mic = document.getElementById('mic');
+const micSelect = document.getElementById('micSelect');
 const canvas = document.getElementById('wave');
 const ctx = canvas.getContext('2d');
+
+async function loadMics() {
+  const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
+  const saved = localStorage.getItem('micId');
+  micSelect.innerHTML = devices.map((d, i) =>
+    `<option value="${d.deviceId}">${esc(d.label || 'Microphone ' + (i + 1))}</option>`).join('');
+  if (saved && devices.some(d => d.deviceId === saved)) micSelect.value = saved;
+}
+micSelect.onchange = () => localStorage.setItem('micId', micSelect.value);
+navigator.mediaDevices.addEventListener('devicechange', loadMics);
+loadMics();
 
 function fmt(s) { return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
 
@@ -302,11 +325,15 @@ btn.onclick = async () => {
   if (!recording) {
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const audio = micSelect.value
+        ? { deviceId: { exact: micSelect.value }, autoGainControl: true, noiseSuppression: true }
+        : { autoGainControl: true, noiseSuppression: true };
+      stream = await navigator.mediaDevices.getUserMedia({ audio });
     } catch (e) {
       alert('Mic access failed: ' + e.name + ' — ' + e.message + '\nAllow the microphone for 127.0.0.1 and try again.');
       return;
     }
+    loadMics(); // labels are blank until permission is granted once
     rid = (await (await fetch('/start', { method: 'POST' })).json()).id;
     mr = new MediaRecorder(stream, { mimeType: 'audio/webm' });
     mr.ondataavailable = e => { if (e.data.size) fetch('/chunk/' + rid, { method: 'POST', body: e.data }); };
@@ -332,6 +359,7 @@ async function refresh() {
   document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
       <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>
+      ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
       ${r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
       ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
     </div>`).join('');

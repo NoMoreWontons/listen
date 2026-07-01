@@ -29,6 +29,9 @@ def audio_path(rid):
 # --- Whisper: load the model once, lazily, GPU with CPU fallback ---
 _model = None
 _model_lock = threading.Lock()
+# ponytail: CTranslate2 isn't safe for concurrent transcribe() calls on one
+# model instance — reuse this lock to serialize them too, not just loading.
+_transcribe_lock = threading.Lock()
 
 
 def get_model():
@@ -51,9 +54,19 @@ def sweep_old_audio(directory=AUDIO_DIR, days=RETENTION_DAYS):
             f.unlink()
 
 
+def resume_stuck():
+    # ponytail: a prior crash/hang can leave rows stuck in "transcribing"
+    # with their audio still on disk — restart resolves the hang, so retry them.
+    stuck = sb.table("recordings").select("id").eq("status", "transcribing").execute().data
+    for row in stuck:
+        if audio_path(row["id"]).exists():
+            threading.Thread(target=process, args=(row["id"],), daemon=True).start()
+
+
 @asynccontextmanager
 async def lifespan(app):
     sweep_old_audio()  # ponytail: sweep on launch, not a cron — the tool is launched to be used
+    resume_stuck()
     yield
 
 
@@ -103,7 +116,8 @@ def recordings():
 
 def process(rid):
     try:
-        segments, _ = get_model().transcribe(str(audio_path(rid)))
+        with _transcribe_lock:
+            segments, _ = get_model().transcribe(str(audio_path(rid)))
         transcript = "".join(s.text for s in segments).strip()
         summary = summarize(transcript)
         sb.table("recordings").update(
