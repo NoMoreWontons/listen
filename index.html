@@ -244,6 +244,7 @@
     padding: .35rem .8rem; font-size: .78rem; border: 0; border-radius: 6px; cursor: pointer;
     background: var(--amber); color: #3a2c00; font-weight: 600;
   }
+  .lbl-hint { flex: 1 1 100%; font-size: .68rem; color: var(--ink-soft); font-style: italic; }
 
   h4 { font-family: var(--font-display); font-size: .8rem; margin: .8rem 0 .3rem; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .06em; }
   pre { white-space: pre-wrap; word-wrap: break-word; font-size: .88rem; margin: 0; }
@@ -388,12 +389,17 @@ function escAttr(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', 
 const STAGE_LABEL = { loading_model: 'loading model', transcribing: 'transcribing', summarizing: 'summarizing' };
 
 function labelEditor(r) {
+  const live = r.status !== 'done';
+  const hint = live
+    ? '<span class="lbl-hint">set now — files to Obsidian when transcription finishes; Claude fills blanks</span>'
+    : '';
   return `<div class="labels" data-rid="${r.id}">
     <input class="lbl-sem"   placeholder="semester" value="${escAttr(r.semester)}">
     <input class="lbl-class" placeholder="class" value="${escAttr(r.class)}">
     <input class="lbl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
     <input class="lbl-topic" placeholder="topic" value="${escAttr(r.topic)}">
-    <button onclick="saveLabels('${r.id}')">Save to Obsidian</button>
+    <button onclick="saveLabels('${r.id}')">${live ? 'Save labels' : 'Save to Obsidian'}</button>
+    ${hint}
   </div>`;
 }
 
@@ -426,7 +432,7 @@ async function refresh() {
       ${r.status === 'transcribing' ? progressBar(r) : ''}
       ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
-      ${r.status === 'done' && r.transcript ? labelEditor(r) : ''}
+      ${r.status !== 'error' ? labelEditor(r) : ''}
       ${r.status === 'done' && r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
       ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
       ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}

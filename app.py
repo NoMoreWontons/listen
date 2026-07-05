@@ -364,12 +364,18 @@ def finalize(rid, transcript, created_at=None, source="local"):
     _set(rid, stage="summarizing", progress=100)
     summary, cls, unit, topic, tokens_in, tokens_out = analyze(transcript)
 
+    # honor labels the user set live/before stop; Claude only fills the blanks
+    pre = (sb.table("recordings").select("semester,class,unit,topic")
+           .eq("id", rid).single().execute().data or {})
+    keep = lambda k, v: (pre.get(k) or "").strip() or v
+
     created_at = created_at or datetime.datetime.now().isoformat()
     fields = {
         "status": "done", "stage": None, "progress": None,
         "transcript": transcript, "summary": summary,
-        "semester": _semester(created_at),
-        "class": cls, "unit": unit, "topic": topic,
+        "semester": keep("semester", _semester(created_at)),
+        "class": keep("class", cls), "unit": keep("unit", unit),
+        "topic": keep("topic", topic),
         "tokens_in": tokens_in, "tokens_out": tokens_out,
         "source": source,
     }

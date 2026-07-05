@@ -16,7 +16,9 @@ the local FastAPI server holds the service key and does all the work. See
 3. Claude summarises the transcript and infers **semester / class / unit / topic**.
 4. The row lands in Supabase and a Markdown note is written to your Obsidian vault at
    `<vault>/<semester>/<class>/<unit>/<topic>.md`.
-5. You can correct the labels in the web UI; saving re-files the note.
+5. You can set semester/class/unit/topic in the web UI **during recording or after**
+   — hand-set labels win; Claude only fills the ones you leave blank. Saving after
+   `done` re-files the note.
 6. Raw audio stays local and is auto-deleted after `RETENTION_DAYS`.
 
 **Notion fallback (optional):** if `NOTION_TOKEN` is set, the server polls one Notion
