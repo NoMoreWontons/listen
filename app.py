@@ -421,7 +421,11 @@ def analyze(transcript):
 def _semester(iso_date):
     """'Fall 26' / 'Spring 27' / 'Summer 26' from an ISO datetime string.
     Claude can't infer the term from lecture content, so default from the
-    recording date; the user can correct it in the UI."""
+    recording date; the user can correct it in the UI.
+    SEMESTER_OVERRIDE wins when set (e.g. 'Bridge' for the pre-term pilot)."""
+    override = os.getenv("SEMESTER_OVERRIDE", "").strip()
+    if override:
+        return override
     try:
         dt = datetime.datetime.fromisoformat((iso_date or "").replace("Z", ""))
     except ValueError:

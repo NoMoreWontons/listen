@@ -69,6 +69,7 @@ is a multi-GB download; set `WHISPER_MODEL=tiny` for a fast first run.
 | `WHISPER_MODEL` | no | default `large-v3-turbo`; `tiny` for a quick start |
 | `RETENTION_DAYS` | no | default `7` — how long local audio is kept |
 | `OBSIDIAN_VAULT` | no | default `~/College Lectures`; folder notes are written to |
+| `SEMESTER_OVERRIDE` | no | blank = auto from date; set e.g. `Bridge` to force the semester label on new recordings |
 | `NOTION_TOKEN` | no | enables the Notion fallback; empty = feature off |
 | `NOTION_DB_ID` | no | the Notion database polled for AI meeting notes |
 | `NOTION_POLL_MIN` | no | default `10` — minutes between Notion polls |
