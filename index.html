@@ -215,6 +215,36 @@
   .status[data-s="done"]         { background: #dcf0ea; color: #226e5b; }
   .status[data-s="error"]        { background: #f4d9d9; color: #8f2323; }
 
+  .progress { margin-top: .65rem; }
+  .bar { height: 6px; border-radius: 999px; background: #e9e4d6; overflow: hidden; }
+  .bar-fill { height: 100%; background: var(--amber); transition: width .4s ease; }
+  .bar-fill.indeterminate { width: 35%; animation: indeterminate 1.3s ease-in-out infinite; }
+  @keyframes indeterminate {
+    0%   { margin-left: -35%; }
+    100% { margin-left: 100%; }
+  }
+  .progress-label {
+    display: block; margin-top: .3rem; font-family: var(--font-mono); font-size: .7rem;
+    color: var(--ink-soft); text-transform: uppercase; letter-spacing: .04em;
+  }
+  .error-msg {
+    font-family: var(--font-mono); font-size: .82rem; color: #8f2323; background: #f4d9d9;
+    border-radius: 6px; padding: .5rem .7rem; margin: .6rem 0 0; white-space: pre-wrap;
+  }
+  .tokens { font-family: var(--font-mono); font-size: .7rem; color: var(--ink-soft); margin: .5rem 0 0; }
+  .src { font-family: var(--font-mono); font-size: .62rem; text-transform: uppercase; letter-spacing: .05em;
+    background: #e6def5; color: #5b3f8f; border-radius: 999px; padding: .12rem .5rem; }
+
+  .labels { display: flex; flex-wrap: wrap; gap: .4rem; margin: .7rem 0 .2rem; }
+  .labels input {
+    flex: 1 1 8rem; min-width: 6rem; padding: .35rem .5rem; font-size: .82rem;
+    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
+  }
+  .labels button {
+    padding: .35rem .8rem; font-size: .78rem; border: 0; border-radius: 6px; cursor: pointer;
+    background: var(--amber); color: #3a2c00; font-weight: 600;
+  }
+
   h4 { font-family: var(--font-display); font-size: .8rem; margin: .8rem 0 .3rem; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .06em; }
   pre { white-space: pre-wrap; word-wrap: break-word; font-size: .88rem; margin: 0; }
   details summary { cursor: pointer; font-size: .82rem; color: var(--ink-soft); margin-top: .6rem; }
@@ -353,14 +383,52 @@ btn.onclick = async () => {
 };
 
 function esc(s) { return s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+function escAttr(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+const STAGE_LABEL = { loading_model: 'loading model', transcribing: 'transcribing', summarizing: 'summarizing' };
+
+function labelEditor(r) {
+  return `<div class="labels" data-rid="${r.id}">
+    <input class="lbl-sem"   placeholder="semester" value="${escAttr(r.semester)}">
+    <input class="lbl-class" placeholder="class" value="${escAttr(r.class)}">
+    <input class="lbl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
+    <input class="lbl-topic" placeholder="topic" value="${escAttr(r.topic)}">
+    <button onclick="saveLabels('${r.id}')">Save to Obsidian</button>
+  </div>`;
+}
+
+async function saveLabels(rid) {
+  const box = document.querySelector(`.labels[data-rid="${rid}"]`);
+  const q = new URLSearchParams({
+    semester: box.querySelector('.lbl-sem').value,
+    klass: box.querySelector('.lbl-class').value,
+    unit:  box.querySelector('.lbl-unit').value,
+    topic: box.querySelector('.lbl-topic').value,
+  });
+  await fetch(`/label/${rid}?` + q, { method: 'POST' });
+  refresh();
+}
+
+function progressBar(r) {
+  const label = STAGE_LABEL[r.stage] || r.stage || 'working';
+  const known = r.progress !== null && r.progress !== undefined;
+  const fill = known ? `<div class="bar-fill" style="width:${r.progress}%"></div>` : '<div class="bar-fill indeterminate"></div>';
+  return `<div class="progress"><div class="bar">${fill}</div><span class="progress-label">${esc(label)}${known ? ' — ' + r.progress + '%' : '…'}</span></div>`;
+}
 
 async function refresh() {
+  // ponytail: don't blow away a label field the user is mid-edit on the 5s tick
+  if (document.activeElement && document.getElementById('list').contains(document.activeElement)) return;
   const rows = await (await fetch('/recordings')).json();
   document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
-      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>
+      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.source === 'notion' ? ' <span class="src">via notion</span>' : ''}
+      ${r.status === 'transcribing' ? progressBar(r) : ''}
+      ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
-      ${r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
+      ${r.status === 'done' && r.transcript ? labelEditor(r) : ''}
+      ${r.status === 'done' && r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
+      ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
       ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
     </div>`).join('');
 }

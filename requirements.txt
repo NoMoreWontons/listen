@@ -4,3 +4,4 @@ python-dotenv
 supabase
 anthropic
 faster-whisper
+httpx
