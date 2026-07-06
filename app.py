@@ -82,11 +82,14 @@ def _load_model():
     from huggingface_hub import snapshot_download
 
     repo_id = WHISPER_MODEL if re.match(r".*/.*", WHISPER_MODEL) else _MODELS[WHISPER_MODEL]
-    model_path = snapshot_download(
-        repo_id,
-        allow_patterns=["config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.*"],
-        tqdm_class=_download_progress_tqdm(),
-    )
+    patterns = ["config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.*"]
+    try:
+        # ponytail: snapshot_download prints "Downloading (incomplete total...)"
+        # on every call regardless of cache hit — skip straight to the cached
+        # copy when it's already there so a warm start doesn't look like a redownload.
+        model_path = snapshot_download(repo_id, allow_patterns=patterns, local_files_only=True)
+    except Exception:
+        model_path = snapshot_download(repo_id, allow_patterns=patterns, tqdm_class=_download_progress_tqdm())
     _model_progress["pct"] = None  # download done; loading into memory now
     try:
         model = WhisperModel(model_path, device="cuda", compute_type="float16")
