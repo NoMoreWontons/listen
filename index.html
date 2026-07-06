@@ -240,6 +240,11 @@
     flex: 1 1 8rem; min-width: 6rem; padding: .35rem .5rem; font-size: .82rem;
     border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
   }
+  .labels textarea {
+    flex: 1 1 100%; padding: .35rem .5rem; font-size: .82rem; font-family: inherit;
+    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
+    resize: vertical;
+  }
   .labels button {
     padding: .35rem .8rem; font-size: .78rem; border: 0; border-radius: 6px; cursor: pointer;
     background: var(--amber); color: #3a2c00; font-weight: 600;
@@ -398,6 +403,8 @@ function labelEditor(r) {
     <input class="lbl-class" placeholder="class" value="${escAttr(r.class)}">
     <input class="lbl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
     <input class="lbl-topic" placeholder="topic" value="${escAttr(r.topic)}">
+    <textarea class="lbl-notes" rows="2"
+      placeholder="your notes — woven into the AI summary on save">${esc(r.notes || '')}</textarea>
     <button onclick="saveLabels('${r.id}')">${live ? 'Save labels' : 'Save to Obsidian'}</button>
     ${hint}
   </div>`;
@@ -405,13 +412,18 @@ function labelEditor(r) {
 
 async function saveLabels(rid) {
   const box = document.querySelector(`.labels[data-rid="${rid}"]`);
-  const q = new URLSearchParams({
-    semester: box.querySelector('.lbl-sem').value,
-    klass: box.querySelector('.lbl-class').value,
-    unit:  box.querySelector('.lbl-unit').value,
-    topic: box.querySelector('.lbl-topic').value,
-  });
-  await fetch(`/label/${rid}?` + q, { method: 'POST' });
+  const resp = await (await fetch(`/label/${rid}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      semester: box.querySelector('.lbl-sem').value,
+      klass: box.querySelector('.lbl-class').value,
+      unit:  box.querySelector('.lbl-unit').value,
+      topic: box.querySelector('.lbl-topic').value,
+      notes: box.querySelector('.lbl-notes').value,
+    }),
+  })).json();
+  if (resp.error) alert(resp.error);
   refresh();
 }
 

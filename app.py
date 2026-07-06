@@ -7,7 +7,7 @@ import datetime
 import pathlib
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Body
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -182,6 +182,38 @@ def _notion_block_text(block_id, depth=0):
     return "".join(out)
 
 
+def _notion_page_split(page_id):
+    """(transcript, notes): the subtree under the top-level block titled
+    'Transcript' is the transcript; all other page text (the user's own notes,
+    Notion's AI summary) is notes. No such block -> whole page is the
+    transcript, notes empty (pre-notes behavior)."""
+    transcript, other, cursor = [], [], None
+    while True:
+        params = {"page_size": 100}
+        if cursor:
+            params["start_cursor"] = cursor
+        r = httpx.get(f"{_NOTION_API}/blocks/{page_id}/children",
+                      headers=_notion_headers(), params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        for b in data["results"]:
+            body = b.get(b["type"], {})
+            text = "".join(rt.get("plain_text", "") for rt in body.get("rich_text", []))
+            if b.get("has_children") and text.strip().lower() == "transcript":
+                transcript.append(_notion_block_text(b["id"], 1))
+                continue
+            if text:
+                other.append(text + "\n")
+            if b.get("has_children"):
+                other.append(_notion_block_text(b["id"], 1))
+        if not data.get("has_more"):
+            break
+        cursor = data["next_cursor"]
+    if transcript:
+        return "".join(transcript), "".join(other)
+    return "".join(other), ""
+
+
 def _notion_new_pages():
     """Database rows whose notion_id isn't already in Supabase."""
     seen = {r["notion_id"] for r in
@@ -210,12 +242,14 @@ def import_notion_once():
         return
     for pg in pages:
         try:
-            transcript = _notion_block_text(pg["id"]).strip()
+            transcript, notes = _notion_page_split(pg["id"])
+            transcript, notes = transcript.strip(), notes.strip()
             if not transcript:
                 continue  # empty note, nothing to import yet
             row = sb.table("recordings").insert({
                 "title": pg["title"], "status": "transcribing",
                 "source": "notion", "notion_id": pg["id"],
+                "notes": notes or None,  # finalize reads it back and feeds analyze
             }).execute().data[0]
             finalize(row["id"], transcript, created_at=pg["created_time"], source="notion")
             print(f"[listen] imported notion lecture '{pg['title']}'")
@@ -303,7 +337,7 @@ def recordings():
     return (
         sb.table("recordings")
         .select("id,title,created_at,status,transcript,summary,stage,progress,"
-                "tokens_in,tokens_out,semester,class,unit,topic,obsidian_path,source")
+                "tokens_in,tokens_out,semester,class,unit,topic,obsidian_path,source,notes")
         .order("created_at", desc=True)
         .execute()
         .data
@@ -311,14 +345,31 @@ def recordings():
 
 
 @app.post("/label/{rid}")
-def label(rid: str, semester: str = "", klass: str = "", unit: str = "", topic: str = ""):
-    """User-corrected labels: update the row, then re-file the Obsidian note
-    (write_note moves it off the old path)."""
-    _set(rid, **{"semester": semester, "class": klass, "unit": unit, "topic": topic})
+def label(rid: str, payload: dict = Body(...)):
+    """User-corrected labels + notes (JSON body — notes can exceed URL limits):
+    update the row, re-integrate the summary if the notes changed on a finished
+    recording, then re-file the Obsidian note (write_note moves it off the old
+    path). Notes are saved before the Claude call so a failed re-summarize
+    never loses them."""
+    old = (sb.table("recordings").select("status,transcript,notes")
+           .eq("id", rid).single().execute().data or {})
+    notes = payload.get("notes", "")
+    _set(rid, **{"semester": payload.get("semester", ""), "class": payload.get("klass", ""),
+                 "unit": payload.get("unit", ""), "topic": payload.get("topic", ""),
+                 "notes": notes})
+    error = None
+    if (old.get("status") == "done"
+            and (old.get("transcript") or "").strip()
+            and notes.strip() != (old.get("notes") or "").strip()):
+        try:
+            summary, *_, tokens_in, tokens_out = analyze(old["transcript"], notes)
+            _set(rid, summary=summary, tokens_in=tokens_in, tokens_out=tokens_out)
+        except Exception as e:
+            error = f"notes saved, but re-summarize failed: {e}"
     row = sb.table("recordings").select("*").eq("id", rid).single().execute().data
     path = write_note(row)
     _set(rid, obsidian_path=path)
-    return {"ok": True, "obsidian_path": path}
+    return {"ok": error is None, "obsidian_path": path, "error": error}
 
 
 def _set(rid, **fields):
@@ -365,12 +416,11 @@ def finalize(rid, transcript, created_at=None, source="local"):
     """Shared tail for any transcript source (whisper or Notion): summarize +
     label with Claude, write the row done, file the Obsidian note."""
     _set(rid, stage="summarizing", progress=100)
-    summary, cls, unit, topic, tokens_in, tokens_out = analyze(transcript)
-
-    # honor labels the user set live/before stop; Claude only fills the blanks
-    pre = (sb.table("recordings").select("semester,class,unit,topic")
+    # honor labels/notes the user set live/before stop; Claude only fills the blanks
+    pre = (sb.table("recordings").select("semester,class,unit,topic,notes")
            .eq("id", rid).single().execute().data or {})
     keep = lambda k, v: (pre.get(k) or "").strip() or v
+    summary, cls, unit, topic, tokens_in, tokens_out = analyze(transcript, pre.get("notes") or "")
 
     created_at = created_at or datetime.datetime.now().isoformat()
     fields = {
@@ -391,11 +441,18 @@ def finalize(rid, transcript, created_at=None, source="local"):
         _set(rid, obsidian_path=path)
 
 
-def analyze(transcript):
+def analyze(transcript, notes=""):
     """One Claude call: summary + college-lecture labels (class/unit/topic).
-    Returns (summary, class, unit, topic, tokens_in, tokens_out)."""
+    User notes, when present, are woven into the summary rather than kept
+    as a separate section. Returns (summary, class, unit, topic, tokens_in,
+    tokens_out)."""
     if not transcript:
         return "", "", "", "", 0, 0
+    notes_part = (
+        "\nThe student took their own notes during this lecture. Integrate them "
+        "into the summary, giving weight to anything they flagged:\n"
+        + notes.strip() + "\n"
+    ) if (notes or "").strip() else ""
     msg = claude.messages.create(
         model="claude-haiku-4-5",
         max_tokens=800,
@@ -409,7 +466,7 @@ def analyze(transcript):
                     "- unit: the broader unit/module this lecture belongs to\n"
                     "- topic: the specific topic of THIS lecture (used as the note title)\n"
                     "- summary: concise key points and any action items, as a markdown "
-                    "bullet list\n\nTranscript:\n" + transcript
+                    "bullet list\n" + notes_part + "\nTranscript:\n" + transcript
                 ),
             }
         ],

@@ -16,7 +16,8 @@ create table recordings (
   topic text,          -- specific lecture topic (Obsidian note title)
   obsidian_path text,  -- absolute path of the written .md note, null until filed
   source text default 'local',  -- 'local' (whisper) or 'notion' (AI meeting notes)
-  notion_id text       -- source Notion page id, dedup key for the poller
+  notion_id text,      -- source Notion page id, dedup key for the poller
+  notes text           -- user's own notes, integrated into the Claude summary
 );
 create unique index if not exists recordings_notion_id_key
   on recordings (notion_id) where notion_id is not null;
@@ -33,4 +34,5 @@ create unique index if not exists recordings_notion_id_key
 --   add column if not exists topic text,
 --   add column if not exists obsidian_path text,
 --   add column if not exists source text default 'local',
---   add column if not exists notion_id text;
+--   add column if not exists notion_id text,
+--   add column if not exists notes text;

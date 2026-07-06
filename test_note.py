@@ -39,5 +39,28 @@ def test_write_and_refile():
     print("ok: write_note files, re-files, skips empty, disambiguates")
 
 
+def test_analyze_integrates_notes():
+    captured = {}
+
+    class FakeMsg:
+        content = [type("T", (), {"text": '{"class":"C","unit":"U","topic":"T","summary":"S"}'})()]
+        usage = type("U", (), {"input_tokens": 1, "output_tokens": 2})()
+
+    def fake_create(**kw):
+        captured.clear()
+        captured.update(kw)
+        return FakeMsg()
+
+    app.claude.messages.create = fake_create
+    summary, *_ = app.analyze("lecture body", "watch slide 12")
+    prompt = captured["messages"][0]["content"]
+    assert "watch slide 12" in prompt, prompt
+    assert summary == "S", summary
+    app.analyze("lecture body")  # no notes -> no notes preamble
+    assert "their own notes" not in captured["messages"][0]["content"]
+    print("ok: analyze feeds user notes into the summary prompt")
+
+
 if __name__ == "__main__":
     test_write_and_refile()
+    test_analyze_integrates_notes()

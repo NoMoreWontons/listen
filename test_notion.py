@@ -20,6 +20,11 @@ PAGES = {
         {"id": "c1", "type": "paragraph",
          "paragraph": {"rich_text": [{"plain_text": "Nested transcript body."}]}, "has_children": False},
     ], "has_more": False},
+    # a page with no Transcript block at all (plain typed note)
+    "flat": {"results": [
+        {"id": "f1", "type": "paragraph",
+         "paragraph": {"rich_text": [{"plain_text": "Only text."}]}, "has_children": False},
+    ], "has_more": False},
 }
 
 
@@ -43,5 +48,19 @@ def test_flattens_nested_text():
     print("ok: notion block text flattens nested transcript")
 
 
+def test_split_transcript_from_notes():
+    app.httpx.get = fake_get
+    app.NOTION_TOKEN = "x"
+    transcript, notes = app._notion_page_split("root")
+    assert "Nested transcript body." in transcript, transcript
+    assert "Nested transcript body." not in notes, notes
+    assert "Intro line." in notes, notes
+    # no Transcript block -> whole page is the transcript, notes empty
+    transcript, notes = app._notion_page_split("flat")
+    assert "Only text." in transcript and notes == "", (transcript, notes)
+    print("ok: notion page splits transcript toggle from user notes")
+
+
 if __name__ == "__main__":
     test_flattens_nested_text()
+    test_split_transcript_from_notes()
