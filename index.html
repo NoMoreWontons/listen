@@ -280,8 +280,8 @@
     </div>
     <div class="deck-group">
       <span class="deck-label">Upload</span>
-      <button id="uploadBtn" class="upload-btn" title="Upload a pre-recorded audio file (or drop it anywhere on the page)">&#8686; Audio file</button>
-      <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg" hidden>
+      <button id="uploadBtn" class="upload-btn" title="Upload audio or a PDF (or drop it anywhere on the page)">&#8686; Audio / PDF</button>
+      <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg,.pdf" hidden>
     </div>
     <div class="deck-group signal">
       <span class="deck-label">Signal</span>
@@ -428,7 +428,8 @@ document.body.addEventListener('drop', e => { e.preventDefault(); uploadFile(e.d
 
 async function uploadFile(f) {
   if (!f) return;
-  const resp = await (await fetch(`/upload?kind=audio&filename=${encodeURIComponent(f.name)}`,
+  const kind = f.name.toLowerCase().endsWith('.pdf') ? 'pdf' : 'audio';
+  const resp = await (await fetch(`/upload?kind=${kind}&filename=${encodeURIComponent(f.name)}`,
     { method: 'POST', body: f })).json();
   if (resp.error) alert(resp.error);
   refresh();

@@ -42,6 +42,10 @@ def audio_path(rid):
     return AUDIO_DIR / f"{rid}.webm"
 
 
+def pdf_path(rid):
+    return AUDIO_DIR / f"{rid}.pdf"
+
+
 # --- Whisper: load the model once, lazily, GPU with CPU fallback ---
 _model = None
 _model_future = None
@@ -265,9 +269,10 @@ def _notion_poll_loop():
 
 def sweep_old_audio(directory=AUDIO_DIR, days=RETENTION_DAYS):
     cutoff = time.time() - days * 86400
-    for f in directory.glob("*.webm"):
-        if f.stat().st_mtime < cutoff:
-            f.unlink()
+    for pattern in ("*.webm", "*.pdf"):
+        for f in directory.glob(pattern):
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
 
 
 def resume_stuck():
@@ -338,16 +343,22 @@ async def upload(request: Request, kind: str = "audio", filename: str = ""):
     Raw request body (like /chunk) — multipart would drag in python-multipart."""
     data = await request.body()
     title = pathlib.Path(filename).stem or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    if kind != "audio":
+    if kind not in ("audio", "pdf"):
         return {"error": f"unknown kind '{kind}'"}
+    source = "upload_audio" if kind == "audio" else kind
     row = sb.table("recordings").insert(
-        {"title": title, "status": "transcribing", "source": "upload_audio"}
+        {"title": title, "status": "transcribing", "source": source}
     ).execute().data[0]
     rid = row["id"]
-    # ponytail: .webm name whatever the real container — ffmpeg sniffs the format
-    # from content, and sweep_old_audio's *.webm glob keeps covering the file
-    audio_path(rid).write_bytes(data)
-    threading.Thread(target=process, args=(rid,), daemon=True).start()
+    if kind == "audio":
+        # ponytail: .webm name whatever the real container — ffmpeg sniffs the format
+        # from content, and sweep_old_audio's *.webm glob keeps covering the file
+        audio_path(rid).write_bytes(data)
+        threading.Thread(target=process, args=(rid,), daemon=True).start()
+    else:
+        pdf_path(rid).write_bytes(data)  # survives a crash; recovery = re-upload
+        _set(rid, stage="summarizing")
+        threading.Thread(target=process_pdf, args=(rid,), daemon=True).start()
     return {"id": rid}
 
 
@@ -397,6 +408,7 @@ def delete_recording(rid: str):
     alone — never destroy vault content from the app."""
     sb.table("recordings").delete().eq("id", rid).execute()
     audio_path(rid).unlink(missing_ok=True)
+    pdf_path(rid).unlink(missing_ok=True)
     return {"ok": True}
 
 
@@ -468,6 +480,84 @@ def finalize(rid, transcript, created_at=None):
     path = write_note(row)
     if path:
         _set(rid, obsidian_path=path)
+
+
+def process_pdf(rid):
+    """Summarize + label an uploaded PDF and file it like a lecture: one Claude
+    call on the raw document, key points into the transcript column, then the
+    same write_note tail."""
+    try:
+        pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source,created_at")
+               .eq("id", rid).single().execute().data or {})
+        summary, sem, cls, unit, topic, key_points, tokens_in, tokens_out = analyze_pdf(
+            pdf_path(rid).read_bytes(), pre.get("notes") or "")
+        keep = lambda k, v: (pre.get(k) or "").strip() or v
+        created_at = pre.get("created_at") or datetime.datetime.now().isoformat()
+        # precedence: user label > SEMESTER_OVERRIDE > semester stated in the
+        # document > recording date (_semester applies the override itself)
+        sem_default = os.getenv("SEMESTER_OVERRIDE", "").strip() or sem or _semester(created_at)
+        fields = {
+            "status": "done", "stage": None, "progress": None,
+            "transcript": key_points, "summary": summary,
+            "semester": keep("semester", sem_default),
+            "class": keep("class", cls), "unit": keep("unit", unit),
+            "topic": keep("topic", topic),
+            "tokens_in": tokens_in, "tokens_out": tokens_out,
+        }
+        _set(rid, **fields)
+        row = {"id": rid, "created_at": created_at, "source": pre.get("source"), **fields}
+        path = write_note(row)
+        if path:
+            _set(rid, obsidian_path=path)
+    except Exception as e:
+        _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]")
+
+
+def analyze_pdf(pdf_bytes, notes=""):
+    """One Claude call on a PDF (native document block — no OCR dependency,
+    scanned pages included). Returns (summary, semester, class, unit, topic,
+    key_points, tokens_in, tokens_out)."""
+    import base64
+    notes_part = (
+        "\nThe student took their own notes on this material. Integrate them "
+        "into the summary, giving weight to anything they flagged:\n"
+        + notes.strip() + "\n"
+    ) if (notes or "").strip() else ""
+    msg = claude.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=3000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "document",
+                 "source": {"type": "base64", "media_type": "application/pdf",
+                            "data": base64.b64encode(pdf_bytes).decode()}},
+                {"type": "text", "text": (
+                    "This is course material from a college class (lecture slides, "
+                    "handout, or reading). Return ONLY a JSON object with keys: "
+                    "class, unit, topic, semester, key_points, summary.\n"
+                    "- class: the course subject (e.g. 'Biology', 'US History')\n"
+                    "- unit: the broader unit/module this material belongs to\n"
+                    "- topic: the specific topic of THIS document (used as the note title)\n"
+                    "- semester: the term if stated in the document (e.g. 'Fall 26'), else \"\"\n"
+                    "- key_points: the document's content distilled as thorough markdown "
+                    "notes (this stands in for a transcript)\n"
+                    "- summary: concise key points and any action items, as a markdown "
+                    "bullet list\n" + notes_part
+                )},
+            ],
+        }],
+    )
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+    try:
+        d = json.loads(raw)
+        parts = (d.get("summary", ""), d.get("semester", ""), d.get("class", ""),
+                 d.get("unit", ""), d.get("topic", ""), d.get("key_points", ""))
+    except (json.JSONDecodeError, AttributeError):
+        # ponytail: model ignored the JSON ask — keep its text, Unsorted bucket
+        parts = (raw, "", "Unsorted", "Unsorted", "Untitled", raw)
+    return (*parts, msg.usage.input_tokens, msg.usage.output_tokens)
 
 
 def analyze(transcript, notes=""):
