@@ -8,7 +8,7 @@ import pathlib
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Request, Body
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from supabase import create_client
@@ -343,7 +343,7 @@ async def upload(request: Request, kind: str = "audio", filename: str = ""):
     Raw request body (like /chunk) — multipart would drag in python-multipart."""
     data = await request.body()
     title = pathlib.Path(filename).stem or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    if kind not in ("audio", "pdf"):
+    if kind not in ("audio", "pdf", "syllabus"):
         return {"error": f"unknown kind '{kind}'"}
     source = "upload_audio" if kind == "audio" else kind
     row = sb.table("recordings").insert(
@@ -489,8 +489,9 @@ def process_pdf(rid):
     try:
         pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source,created_at")
                .eq("id", rid).single().execute().data or {})
-        summary, sem, cls, unit, topic, key_points, tokens_in, tokens_out = analyze_pdf(
-            pdf_path(rid).read_bytes(), pre.get("notes") or "")
+        syllabus = pre.get("source") == "syllabus"
+        summary, sem, cls, unit, topic, key_points, assignments, tokens_in, tokens_out = analyze_pdf(
+            pdf_path(rid).read_bytes(), pre.get("notes") or "", syllabus=syllabus)
         keep = lambda k, v: (pre.get(k) or "").strip() or v
         created_at = pre.get("created_at") or datetime.datetime.now().isoformat()
         # precedence: user label > SEMESTER_OVERRIDE > semester stated in the
@@ -504,6 +505,14 @@ def process_pdf(rid):
             "topic": keep("topic", topic),
             "tokens_in": tokens_in, "tokens_out": tokens_out,
         }
+        if syllabus:
+            # klass must be the post-precedence value — it's the upsert dedup key
+            saved = save_assignments(rid, fields["class"], assignments)
+            if saved:
+                fields["summary"] += (
+                    "\n\n### Due dates\n\n| Due | What | Kind |\n|---|---|---|\n"
+                    + "\n".join(f"| {a['due_on']} | {a['title']} | {a['kind']} |" for a in saved)
+                )
         _set(rid, **fields)
         row = {"id": rid, "created_at": created_at, "source": pre.get("source"), **fields}
         path = write_note(row)
@@ -513,16 +522,70 @@ def process_pdf(rid):
         _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]")
 
 
-def analyze_pdf(pdf_bytes, notes=""):
+def save_assignments(rid, klass, items):
+    """Upsert Claude-extracted assignments on (klass, title): re-uploading a
+    revised syllabus updates due_on/kind and re-parents rows to the new card
+    while preserving row ids (stable ICS UIDs). Returns the saved rows."""
+    rows = []
+    for a in items or []:
+        title = (a.get("title") or "").strip()
+        try:
+            due = str(datetime.date.fromisoformat(str(a.get("due_date", ""))[:10]))
+        except ValueError:
+            continue  # unparseable/missing date — skip rather than crash the upload
+        if title:
+            rows.append({"recording_id": rid, "title": title, "due_on": due,
+                         "klass": klass, "kind": (a.get("kind") or "assignment")})
+    if rows:
+        sb.table("assignments").upsert(rows, on_conflict="klass,title").execute()
+    return sorted(rows, key=lambda r: r["due_on"])
+
+
+def _ics_escape(s):
+    return (s or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+@app.get("/assignments/{rid}.ics")
+def assignments_ics(rid: str):
+    """All-day VEVENTs for the syllabus card, generated on demand. Stable UIDs
+    (assignment row uuid) mean re-importing updates events instead of duplicating."""
+    rows = (sb.table("assignments").select("*").eq("recording_id", rid)
+            .order("due_on").execute().data)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//listen//EN"]
+    for a in rows:
+        label = f"{a['title']} ({a['klass']})" if a["klass"] else a["title"]
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{a['id']}@listen",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART;VALUE=DATE:{a['due_on'].replace('-', '')}",
+            f"SUMMARY:{_ics_escape(label)}",
+            f"CATEGORIES:{_ics_escape(a['kind'] or 'assignment')}",
+            "END:VEVENT",
+        ]
+    lines.append("END:VCALENDAR")
+    return Response("\r\n".join(lines) + "\r\n", media_type="text/calendar",
+                    headers={"Content-Disposition": f'attachment; filename="{rid}.ics"'})
+
+
+def analyze_pdf(pdf_bytes, notes="", syllabus=False):
     """One Claude call on a PDF (native document block — no OCR dependency,
     scanned pages included). Returns (summary, semester, class, unit, topic,
-    key_points, tokens_in, tokens_out)."""
+    key_points, assignments, tokens_in, tokens_out); assignments is [] unless
+    syllabus=True."""
     import base64
     notes_part = (
         "\nThe student took their own notes on this material. Integrate them "
         "into the summary, giving weight to anything they flagged:\n"
         + notes.strip() + "\n"
     ) if (notes or "").strip() else ""
+    syllabus_part = (
+        "- assignments: an array of every dated deliverable in the document, each "
+        "{title, due_date, kind}. due_date is 'YYYY-MM-DD' (resolve relative dates "
+        "like 'Week 3' from dates stated in the document; omit items with no "
+        "resolvable date). kind is one of: assignment, exam, quiz, project.\n"
+    ) if syllabus else ""
     msg = claude.messages.create(
         model="claude-haiku-4-5",
         max_tokens=3000,
@@ -534,8 +597,9 @@ def analyze_pdf(pdf_bytes, notes=""):
                             "data": base64.b64encode(pdf_bytes).decode()}},
                 {"type": "text", "text": (
                     "This is course material from a college class (lecture slides, "
-                    "handout, or reading). Return ONLY a JSON object with keys: "
-                    "class, unit, topic, semester, key_points, summary.\n"
+                    "handout, syllabus, or reading). Return ONLY a JSON object with keys: "
+                    "class, unit, topic, semester, key_points, summary"
+                    + (", assignments" if syllabus else "") + ".\n"
                     "- class: the course subject (e.g. 'Biology', 'US History')\n"
                     "- unit: the broader unit/module this material belongs to\n"
                     "- topic: the specific topic of THIS document (used as the note title)\n"
@@ -543,20 +607,25 @@ def analyze_pdf(pdf_bytes, notes=""):
                     "- key_points: the document's content distilled as thorough markdown "
                     "notes (this stands in for a transcript)\n"
                     "- summary: concise key points and any action items, as a markdown "
-                    "bullet list\n" + notes_part
+                    "bullet list\n" + syllabus_part + notes_part
                 )},
             ],
         }],
     )
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+    def txt(v):
+        # model sometimes returns a bullet list as a JSON array — flatten to markdown
+        return "\n".join(f"- {x}" for x in v) if isinstance(v, list) else (v or "")
+
     try:
         d = json.loads(raw)
-        parts = (d.get("summary", ""), d.get("semester", ""), d.get("class", ""),
-                 d.get("unit", ""), d.get("topic", ""), d.get("key_points", ""))
+        parts = (txt(d.get("summary")), txt(d.get("semester")), txt(d.get("class")),
+                 txt(d.get("unit")), txt(d.get("topic")), txt(d.get("key_points")),
+                 d.get("assignments", []))
     except (json.JSONDecodeError, AttributeError):
         # ponytail: model ignored the JSON ask — keep its text, Unsorted bucket
-        parts = (raw, "", "Unsorted", "Unsorted", "Untitled", raw)
+        parts = (raw, "", "Unsorted", "Unsorted", "Untitled", raw, [])
     return (*parts, msg.usage.input_tokens, msg.usage.output_tokens)
 
 

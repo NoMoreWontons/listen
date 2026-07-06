@@ -428,7 +428,10 @@ document.body.addEventListener('drop', e => { e.preventDefault(); uploadFile(e.d
 
 async function uploadFile(f) {
   if (!f) return;
-  const kind = f.name.toLowerCase().endsWith('.pdf') ? 'pdf' : 'audio';
+  let kind = 'audio';
+  if (f.name.toLowerCase().endsWith('.pdf')) {
+    kind = confirm('Is this a syllabus?\nOK = syllabus (extract due dates to calendar)\nCancel = lecture material') ? 'syllabus' : 'pdf';
+  }
   const resp = await (await fetch(`/upload?kind=${kind}&filename=${encodeURIComponent(f.name)}`,
     { method: 'POST', body: f })).json();
   if (resp.error) alert(resp.error);
@@ -477,6 +480,7 @@ async function refresh() {
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
       ${r.status !== 'error' ? labelEditor(r) : ''}
       ${r.status === 'done' && r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
+      ${r.source === 'syllabus' && r.status === 'done' ? `<p><a href="/assignments/${r.id}.ics">&#128197; Download due dates (.ics) — import into Google Calendar</a></p>` : ''}
       ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
       ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
     </div>`).join('');
