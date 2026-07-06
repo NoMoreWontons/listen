@@ -372,6 +372,15 @@ def label(rid: str, payload: dict = Body(...)):
     return {"ok": error is None, "obsidian_path": path, "error": error}
 
 
+@app.delete("/recordings/{rid}")
+def delete_recording(rid: str):
+    """Delete the row and its audio file. The Obsidian note (if any) is left
+    alone — never destroy vault content from the app."""
+    sb.table("recordings").delete().eq("id", rid).execute()
+    audio_path(rid).unlink(missing_ok=True)
+    return {"ok": True}
+
+
 def _set(rid, **fields):
     sb.table("recordings").update(fields).eq("id", rid).execute()
 

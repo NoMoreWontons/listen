@@ -210,6 +210,11 @@
     background: #e9e4d6;
     color: var(--ink-soft);
   }
+  .rec .del {
+    float: right; border: none; background: none; cursor: pointer;
+    color: var(--ink-soft); font-size: .85rem; padding: .1rem .3rem;
+  }
+  .rec .del:hover { color: #a8331f; }
   .status[data-s="recording"]    { background: #fbe4e0; color: #a8331f; }
   .status[data-s="transcribing"] { background: #f7e8cf; color: #93670f; }
   .status[data-s="done"]         { background: #dcf0ea; color: #226e5b; }
@@ -410,6 +415,12 @@ function labelEditor(r) {
   </div>`;
 }
 
+async function deleteRec(rid) {
+  if (!confirm('Delete this recording and its audio? The Obsidian note (if written) stays.')) return;
+  await fetch(`/recordings/${rid}`, { method: 'DELETE' });
+  refresh();
+}
+
 async function saveLabels(rid) {
   const box = document.querySelector(`.labels[data-rid="${rid}"]`);
   const resp = await (await fetch(`/label/${rid}`, {
@@ -440,7 +451,7 @@ async function refresh() {
   const rows = await (await fetch('/recordings')).json();
   document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
-      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.source === 'notion' ? ' <span class="src">via notion</span>' : ''}
+      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.source === 'notion' ? ' <span class="src">via notion</span>' : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
       ${r.status === 'transcribing' ? progressBar(r) : ''}
       ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
