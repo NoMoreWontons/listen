@@ -771,6 +771,49 @@ def ensure_hubs(row):
             f"# {unit}\n\n{desc}\n\nClass: [[{sem}/{cls}/{cls}|{cls}]]\n", encoding="utf-8")
 
 
+def _rgb(h, s, l):
+    import colorsys
+    r, g, b = colorsys.hls_to_rgb(h % 1.0, l, s)
+    return (int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255)
+
+
+def write_graph_config():
+    """Regenerates Obsidian graph color groups from the vault's folder tree:
+    each semester and class gets its own hue; units are tones of their class
+    hue; topic notes a lighter tone of their unit. Only the colorGroups key of
+    .obsidian/graph.json is touched — other graph settings stay."""
+    groups = []
+    sems = sorted(d for d in OBSIDIAN_VAULT.iterdir()
+                  if d.is_dir() and not d.name.startswith("."))
+    classes = [(sem, c) for sem in sems
+               for c in sorted(p for p in sem.iterdir() if p.is_dir())]
+    n = max(len(classes), 1)
+    for i, (sem, c) in enumerate(classes):
+        hue = i / n
+        units = sorted(p for p in c.iterdir() if p.is_dir())
+        m = max(len(units), 1)
+        for j, u in enumerate(units):
+            tone = 0.28 + 0.22 * j / m       # unit hubs: darker tones of the class hue
+            rel = f"{sem.name}/{c.name}/{u.name}"
+            groups.append({"query": f'path:"{rel}/{u.name}.md"',
+                           "color": {"a": 1, "rgb": _rgb(hue, 0.75, tone)}})
+            groups.append({"query": f'path:"{rel}"',  # topic notes: lighter tone of the unit
+                           "color": {"a": 1, "rgb": _rgb(hue, 0.60, tone + 0.30)}})
+        groups.append({"query": f'path:"{sem.name}/{c.name}"',  # class hub + strays
+                       "color": {"a": 1, "rgb": _rgb(hue, 0.90, 0.50)}})
+    for i, sem in enumerate(sems):  # semesters: their own evenly spaced hues, muted
+        groups.append({"query": f'path:"{sem.name}"',
+                       "color": {"a": 1, "rgb": _rgb(i / max(len(sems), 1) + 0.05, 0.35, 0.55)}})
+    cfg_p = OBSIDIAN_VAULT / ".obsidian" / "graph.json"
+    try:
+        cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cfg = {}
+    cfg["colorGroups"] = groups
+    cfg_p.parent.mkdir(parents=True, exist_ok=True)
+    cfg_p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
 def write_note(row):
     """Writes/moves the lecture note to <vault>/<class>/<unit>/<topic>.md.
     Deletes the note at the row's old obsidian_path if the labels changed the
@@ -795,6 +838,7 @@ def write_note(row):
     dest.write_text(_note_md(row), encoding="utf-8")
     try:
         ensure_hubs(row)
+        write_graph_config()
     except Exception as e:
-        print(f"[listen] hub notes failed (note itself is written): {e}")
+        print(f"[listen] hub notes/graph config failed (note itself is written): {e}")
     return str(dest)
