@@ -712,12 +712,63 @@ def _note_md(row):
         "tags": f"[lecture, {source}]",  # Obsidian reads this inline-list as tags
     }
     front = "\n".join(f"{k}: {v}" for k, v in fm.items())
+    sem, cls, unit = _slug(row.get("semester")), _slug(row.get("class")), _slug(row.get("unit"))
     return (
         f"---\n{front}\n---\n\n"
         f"# {row.get('topic') or row.get('title') or 'Lecture'}\n\n"
+        f"Unit: [[{sem}/{cls}/{unit}/{unit}|{unit}]]\n\n"
         f"## Summary\n\n{row.get('summary') or ''}\n\n"
         f"## Transcript\n\n{row.get('transcript') or ''}\n"
     )
+
+
+def _hub_desc(kind, name, context):
+    """2-4 sentence description for a class/unit hub note. Claude with web
+    search for background; plain Claude if the search tool isn't available."""
+    prompt = (
+        f"Write a 2-4 sentence encyclopedic description of the college {kind} "
+        f"'{name}'. Context from the student's lecture notes:\n{(context or '')[:1500]}\n\n"
+        "Search the web if helpful for accurate background. "
+        "Return ONLY the description text, no preamble."
+    )
+    try:
+        msg = claude.messages.create(
+            model="claude-haiku-4-5", max_tokens=300,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+            messages=[{"role": "user", "content": prompt}])
+    except Exception:
+        msg = claude.messages.create(
+            model="claude-haiku-4-5", max_tokens=300,
+            messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in msg.content if b.type == "text").strip()
+
+
+def ensure_hubs(row):
+    """Folder hub notes so the Obsidian graph chains
+    lecture -> unit -> class -> semester. Semester hub is title-only; class
+    and unit hubs get a Claude-written description (web search when available)
+    plus a wikilink up the chain.
+    ponytail: hubs are written once and never refreshed — delete a hub file to
+    regenerate it with newer context."""
+    sem, cls, unit = _slug(row.get("semester")), _slug(row.get("class")), _slug(row.get("unit"))
+    summary = row.get("summary") or ""
+    sem_p = OBSIDIAN_VAULT / sem / f"{sem}.md"
+    cls_p = OBSIDIAN_VAULT / sem / cls / f"{cls}.md"
+    unit_p = OBSIDIAN_VAULT / sem / cls / unit / f"{unit}.md"
+    if not sem_p.exists():
+        sem_p.parent.mkdir(parents=True, exist_ok=True)
+        sem_p.write_text(f"# {sem}\n", encoding="utf-8")
+    if not cls_p.exists():
+        cls_p.parent.mkdir(parents=True, exist_ok=True)
+        desc = _hub_desc("course", row.get("class") or cls, summary)
+        cls_p.write_text(
+            f"# {cls}\n\n{desc}\n\nSemester: [[{sem}/{sem}|{sem}]]\n", encoding="utf-8")
+    if not unit_p.exists():
+        unit_p.parent.mkdir(parents=True, exist_ok=True)
+        desc = _hub_desc(f"unit of the course '{row.get('class') or cls}'",
+                         row.get("unit") or unit, summary)
+        unit_p.write_text(
+            f"# {unit}\n\n{desc}\n\nClass: [[{sem}/{cls}/{cls}|{cls}]]\n", encoding="utf-8")
 
 
 def write_note(row):
@@ -742,4 +793,8 @@ def write_note(row):
         old_p.unlink()  # labels moved the note; drop the stale file
 
     dest.write_text(_note_md(row), encoding="utf-8")
+    try:
+        ensure_hubs(row)
+    except Exception as e:
+        print(f"[listen] hub notes failed (note itself is written): {e}")
     return str(dest)
