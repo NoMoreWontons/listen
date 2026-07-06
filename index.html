@@ -439,7 +439,7 @@ async function uploadFile(f) {
 }
 
 async function deleteRec(rid) {
-  if (!confirm('Delete this recording and its audio? The Obsidian note (if written) stays.')) return;
+  if (!confirm('Delete this recording, its audio, and its Obsidian note? This cannot be undone.')) return;
   await fetch(`/recordings/${rid}`, { method: 'DELETE' });
   // the clicked ✕ still holds focus inside #list, which makes refresh() skip
   document.activeElement.blur();

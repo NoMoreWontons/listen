@@ -404,11 +404,17 @@ def label(rid: str, payload: dict = Body(...)):
 
 @app.delete("/recordings/{rid}")
 def delete_recording(rid: str):
-    """Delete the row and its audio file. The Obsidian note (if any) is left
-    alone — never destroy vault content from the app."""
+    """Delete the row, its audio/pdf, and the Obsidian note the app wrote."""
+    rows = sb.table("recordings").select("obsidian_path").eq("id", rid).execute().data
     sb.table("recordings").delete().eq("id", rid).execute()
     audio_path(rid).unlink(missing_ok=True)
     pdf_path(rid).unlink(missing_ok=True)
+    note = rows[0].get("obsidian_path") if rows else None
+    if note:
+        p = pathlib.Path(note)
+        # only ever remove the single file this app wrote, and only inside the vault
+        if p.is_relative_to(OBSIDIAN_VAULT):
+            p.unlink(missing_ok=True)
     return {"ok": True}
 
 
