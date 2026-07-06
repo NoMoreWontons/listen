@@ -89,7 +89,7 @@
 
   #controls { display: flex; align-items: center; gap: 1rem; }
 
-  button#btn {
+  button#btn, button.upload-btn {
     font-family: var(--font-display);
     font-weight: 600;
     font-size: .95rem;
@@ -103,8 +103,8 @@
     box-shadow: 0 1px 0 rgba(255,255,255,.05) inset, 0 2px 4px rgba(0,0,0,.3);
     transition: transform .12s ease, background .2s ease, box-shadow .2s ease;
   }
-  button#btn:hover { background: #423e37; }
-  button#btn:active { transform: translateY(1px); }
+  button#btn:hover, button.upload-btn:hover { background: #423e37; }
+  button#btn:active, button.upload-btn:active { transform: translateY(1px); }
   button#btn:focus-visible {
     outline: 2px solid var(--live);
     outline-offset: 2px;
@@ -278,6 +278,11 @@
         <select id="micSelect" title="Microphone"></select>
       </div>
     </div>
+    <div class="deck-group">
+      <span class="deck-label">Upload</span>
+      <button id="uploadBtn" class="upload-btn" title="Upload a pre-recorded audio file (or drop it anywhere on the page)">&#8686; Audio file</button>
+      <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg" hidden>
+    </div>
     <div class="deck-group signal">
       <span class="deck-label">Signal</span>
       <span id="mic" class="mic"></span>
@@ -415,6 +420,20 @@ function labelEditor(r) {
   </div>`;
 }
 
+const fileInput = document.getElementById('fileInput');
+document.getElementById('uploadBtn').onclick = () => fileInput.click();
+fileInput.onchange = () => { uploadFile(fileInput.files[0]); fileInput.value = ''; };
+document.body.addEventListener('dragover', e => e.preventDefault());
+document.body.addEventListener('drop', e => { e.preventDefault(); uploadFile(e.dataTransfer.files[0]); });
+
+async function uploadFile(f) {
+  if (!f) return;
+  const resp = await (await fetch(`/upload?kind=audio&filename=${encodeURIComponent(f.name)}`,
+    { method: 'POST', body: f })).json();
+  if (resp.error) alert(resp.error);
+  refresh();
+}
+
 async function deleteRec(rid) {
   if (!confirm('Delete this recording and its audio? The Obsidian note (if written) stays.')) return;
   await fetch(`/recordings/${rid}`, { method: 'DELETE' });
@@ -451,7 +470,7 @@ async function refresh() {
   const rows = await (await fetch('/recordings')).json();
   document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
-      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.source === 'notion' ? ' <span class="src">via notion</span>' : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
+      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload'))}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
       ${r.status === 'transcribing' ? progressBar(r) : ''}
       ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}

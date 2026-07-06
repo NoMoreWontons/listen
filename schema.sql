@@ -22,6 +22,21 @@ create table recordings (
 create unique index if not exists recordings_notion_id_key
   on recordings (notion_id) where notion_id is not null;
 
+-- source also takes 'upload_audio' | 'pdf' | 'syllabus' for uploaded files.
+
+-- Syllabus due dates. gcal_event_id unused until Calendar API sync (Approach B).
+create table if not exists assignments (
+  id uuid primary key default gen_random_uuid(),
+  recording_id uuid references recordings(id) on delete cascade,
+  title text not null,
+  due_on date not null,      -- date-only: avoids timezone day-shift
+  klass text default '',
+  kind text default 'assignment',  -- assignment | exam | quiz | project
+  gcal_event_id text,
+  created_at timestamptz default now(),
+  unique (klass, title)      -- re-upload upserts instead of duplicating
+);
+
 -- Migration for an existing table (safe to re-run):
 -- alter table recordings
 --   add column if not exists stage text,

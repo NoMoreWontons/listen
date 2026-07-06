@@ -251,7 +251,7 @@ def import_notion_once():
                 "source": "notion", "notion_id": pg["id"],
                 "notes": notes or None,  # finalize reads it back and feeds analyze
             }).execute().data[0]
-            finalize(row["id"], transcript, created_at=pg["created_time"], source="notion")
+            finalize(row["id"], transcript, created_at=pg["created_time"])
             print(f"[listen] imported notion lecture '{pg['title']}'")
         except Exception as e:
             print(f"[listen] notion import '{pg['title']}' failed: {e}")
@@ -330,6 +330,25 @@ def stop(rid: str):
     sb.table("recordings").update({"status": "transcribing"}).eq("id", rid).execute()
     threading.Thread(target=process, args=(rid,), daemon=True).start()
     return {"ok": True}
+
+
+@app.post("/upload")
+async def upload(request: Request, kind: str = "audio", filename: str = ""):
+    """Uploaded course material joins the same pipeline as a live recording.
+    Raw request body (like /chunk) — multipart would drag in python-multipart."""
+    data = await request.body()
+    title = pathlib.Path(filename).stem or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    if kind != "audio":
+        return {"error": f"unknown kind '{kind}'"}
+    row = sb.table("recordings").insert(
+        {"title": title, "status": "transcribing", "source": "upload_audio"}
+    ).execute().data[0]
+    rid = row["id"]
+    # ponytail: .webm name whatever the real container — ffmpeg sniffs the format
+    # from content, and sweep_old_audio's *.webm glob keeps covering the file
+    audio_path(rid).write_bytes(data)
+    threading.Thread(target=process, args=(rid,), daemon=True).start()
+    return {"id": rid}
 
 
 @app.get("/recordings")
@@ -416,17 +435,18 @@ def process(rid):
                     _set(rid, progress=pct)
                     last_pct = pct
         transcript = "".join(parts).strip()
-        finalize(rid, transcript, source="local")
+        finalize(rid, transcript)
     except Exception as e:
         _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]")
 
 
-def finalize(rid, transcript, created_at=None, source="local"):
-    """Shared tail for any transcript source (whisper or Notion): summarize +
-    label with Claude, write the row done, file the Obsidian note."""
+def finalize(rid, transcript, created_at=None):
+    """Shared tail for any transcript source (whisper, upload, or Notion):
+    summarize + label with Claude, write the row done, file the Obsidian note.
+    The row's own source value is preserved."""
     _set(rid, stage="summarizing", progress=100)
     # honor labels/notes the user set live/before stop; Claude only fills the blanks
-    pre = (sb.table("recordings").select("semester,class,unit,topic,notes")
+    pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source")
            .eq("id", rid).single().execute().data or {})
     keep = lambda k, v: (pre.get(k) or "").strip() or v
     summary, cls, unit, topic, tokens_in, tokens_out = analyze(transcript, pre.get("notes") or "")
@@ -439,7 +459,7 @@ def finalize(rid, transcript, created_at=None, source="local"):
         "class": keep("class", cls), "unit": keep("unit", unit),
         "topic": keep("topic", topic),
         "tokens_in": tokens_in, "tokens_out": tokens_out,
-        "source": source,
+        "source": pre.get("source") or "local",
     }
     _set(rid, **fields)
 
