@@ -5,6 +5,7 @@ import time
 import threading
 import datetime
 import pathlib
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Request, Body
@@ -362,9 +363,21 @@ async def upload(request: Request, kind: str = "audio", filename: str = ""):
     return {"id": rid}
 
 
+def _obsidian_uri(path):
+    """obsidian://open link for a note path inside the vault, else None."""
+    if not path:
+        return None
+    try:
+        rel = pathlib.Path(path).relative_to(OBSIDIAN_VAULT)
+    except ValueError:
+        return None
+    return ("obsidian://open?vault=" + urllib.parse.quote(OBSIDIAN_VAULT.name)
+            + "&file=" + urllib.parse.quote(rel.with_suffix("").as_posix()))
+
+
 @app.get("/recordings")
 def recordings():
-    return (
+    rows = (
         sb.table("recordings")
         .select("id,title,created_at,status,transcript,summary,stage,progress,"
                 "tokens_in,tokens_out,semester,class,unit,topic,obsidian_path,source,notes")
@@ -372,6 +385,9 @@ def recordings():
         .execute()
         .data
     )
+    for r in rows:
+        r["obsidian_uri"] = _obsidian_uri(r.get("obsidian_path"))
+    return rows
 
 
 @app.post("/label/{rid}")
@@ -400,6 +416,39 @@ def label(rid: str, payload: dict = Body(...)):
     path = write_note(row)
     _set(rid, obsidian_path=path)
     return {"ok": error is None, "obsidian_path": path, "error": error}
+
+
+@app.post("/ocr")
+async def ocr(request: Request, filename: str = ""):
+    """Photo/PDF of handwritten or printed notes -> markdown text for the notes
+    box. Raw body like /upload. Returns the text; the browser appends it to the
+    notes textarea so the user reviews before saving."""
+    import base64
+    data = await request.body()
+    ext = pathlib.Path(filename).suffix.lower().lstrip(".")
+    media = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+             "gif": "image/gif", "webp": "image/webp"}.get(ext)
+    if media:
+        block = {"type": "image", "source": {"type": "base64", "media_type": media,
+                                             "data": base64.b64encode(data).decode()}}
+    elif ext == "pdf":
+        block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                                "data": base64.b64encode(data).decode()}}
+    else:
+        return {"error": f"unsupported file type '.{ext}' — use jpg/png/gif/webp/pdf"}
+    try:
+        msg = claude.messages.create(
+            model="claude-haiku-4-5", max_tokens=3000,
+            messages=[{"role": "user", "content": [block, {"type": "text", "text": (
+                "These are a student's notes (may be handwritten). Transcribe them "
+                "to markdown, faithful to the original wording and structure. Keep "
+                "lists as lists; mark anything illegible as [illegible]. Return "
+                "ONLY the transcription."
+            )}]}],
+        )
+        return {"text": msg.content[0].text.strip()}
+    except Exception as e:
+        return {"error": f"transcription failed: {e}"}
 
 
 @app.delete("/recordings/{rid}")
@@ -649,18 +698,25 @@ def analyze(transcript, notes=""):
     ) if (notes or "").strip() else ""
     msg = claude.messages.create(
         model="claude-haiku-4-5",
-        max_tokens=800,
+        max_tokens=1500,
         messages=[
             {
                 "role": "user",
                 "content": (
-                    "This is a college lecture transcript. Return ONLY a JSON object "
-                    "with keys: class, unit, topic, summary.\n"
+                    "This is a college lecture transcript from a single microphone — "
+                    "speakers are not labelled. Infer who is speaking from content: "
+                    "the lecturer teaches; students ask questions or answer prompts.\n"
+                    "Return ONLY a JSON object with keys: class, unit, topic, summary.\n"
                     "- class: the course subject (e.g. 'Biology', 'US History')\n"
                     "- unit: the broader unit/module this lecture belongs to\n"
                     "- topic: the specific topic of THIS lecture (used as the note title)\n"
-                    "- summary: concise key points and any action items, as a markdown "
-                    "bullet list\n" + notes_part + "\nTranscript:\n" + transcript
+                    "- summary: markdown. First, concise key points and any action items "
+                    "as a bullet list — built from the LECTURER's material; ignore student "
+                    "chatter unless the lecturer engages it. Then, if any student questions "
+                    "or lecturer prompts occurred, append a '## Questions & answers' section: "
+                    "one bullet per exchange, '**Q:** …' then '**A:** …' with the lecturer's "
+                    "response (or '*unanswered*'). Omit the section if there were none.\n"
+                    + notes_part + "\nTranscript:\n" + transcript
                 ),
             }
         ],

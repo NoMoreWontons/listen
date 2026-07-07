@@ -33,10 +33,21 @@
     font-family: system-ui, sans-serif;
     background: var(--stone);
     color: var(--ink);
-    max-width: 720px;
+    max-width: 1200px;
     margin: 0 auto;
     padding: 2.5rem 1.25rem 4rem;
     line-height: 1.5;
+  }
+
+  .main {
+    display: grid;
+    grid-template-columns: 3fr 2fr;
+    gap: 1.5rem;
+    align-items: start;
+    margin-top: 2.25rem;
+  }
+  @media (max-width: 800px) {
+    .main { grid-template-columns: 1fr; }
   }
 
   .brand { margin-bottom: 1.75rem; }
@@ -171,8 +182,51 @@
   #wave.on { display: block; }
 
   /* ---- sessions ---- */
-  .sessions { margin-top: 2.25rem; }
-  .sessions > .deck-label { color: var(--ink-soft); opacity: 1; margin-bottom: .75rem; }
+  .sessions > .deck-label, .folders > .deck-label { color: var(--ink-soft); opacity: 1; margin-bottom: .75rem; }
+
+  a.obs { color: inherit; text-decoration: underline dotted; }
+  a.obs:hover { text-decoration: underline; }
+
+  /* ---- folder tree ---- */
+  .folders {
+    background: var(--card);
+    border: 1px solid var(--card-edge);
+    border-radius: var(--radius-card);
+    padding: 1rem 1.15rem;
+  }
+  .folders details { margin: .15rem 0; }
+  .folders details details { margin-left: 1.1rem; }
+  .folders summary {
+    cursor: pointer;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: .92rem;
+    padding: .25rem .35rem;
+    border-radius: 6px;
+    margin: 0;
+  }
+  .folders summary:hover { background: #f1ecdf; }
+  .folders summary::before { content: "📁 "; }
+  .folders details[open] > summary::before { content: "📂 "; }
+  .folders .topic {
+    margin-left: 2.1rem;
+    padding: .2rem .35rem;
+    font-size: .85rem;
+  }
+  .folders .topic::before { content: "📄 "; }
+  .folders .topic .when {
+    font-family: var(--font-mono);
+    font-size: .68rem;
+    color: var(--ink-soft);
+    margin-left: .4rem;
+  }
+  #tree:empty::before {
+    content: "Nothing filed yet — finished recordings appear here by semester / class / unit.";
+    display: block;
+    font-size: .88rem;
+    color: var(--ink-soft);
+    padding: .5rem 0;
+  }
 
   #list:empty::before {
     content: "No sessions yet — press record to start your first one.";
@@ -274,6 +328,7 @@
       <span class="deck-label">Transport</span>
       <div id="controls">
         <button id="btn">● Record</button>
+        <button id="pauseBtn" hidden>&#10074;&#10074; Pause</button>
         <span id="timer" class="timer">0:00</span>
         <select id="micSelect" title="Microphone"></select>
       </div>
@@ -291,10 +346,16 @@
   <canvas id="wave"></canvas>
 </section>
 
-<section class="sessions">
-  <span class="deck-label">Sessions</span>
-  <div id="list"></div>
-</section>
+<div class="main">
+  <section class="sessions">
+    <span class="deck-label">Recent</span>
+    <div id="list"></div>
+  </section>
+  <section class="folders">
+    <span class="deck-label">Library</span>
+    <div id="tree"></div>
+  </section>
+</div>
 
 <script>
 let mr, rid, recording = false;
@@ -355,7 +416,10 @@ function startMeters(stream) {
   startTime = Date.now();
   timer.textContent = '0:00';
   timer.classList.add('on');
-  timerId = setInterval(() => { timer.textContent = fmt(Math.floor((Date.now() - startTime) / 1000)); }, 1000);
+  timerId = setInterval(() => {
+    if (mr && mr.state === 'paused') return; // hold the clock while paused
+    timer.textContent = fmt(Math.floor((Date.now() - startTime) / 1000));
+  }, 1000);
 }
 
 function stopMeters() {
@@ -389,12 +453,32 @@ btn.onclick = async () => {
     recording = true;
     btn.textContent = '■ Stop';
     btn.classList.add('recording');
+    pauseBtn.hidden = false;
+    pauseBtn.textContent = '❙❙ Pause';
   } else {
+    if (mr.state === 'paused') mr.resume(); // stop while paused loses the tail otherwise
     mr.stop();
     recording = false;
     btn.textContent = '● Record';
     btn.classList.remove('recording');
+    pauseBtn.hidden = true;
     stopMeters();
+  }
+};
+
+const pauseBtn = document.getElementById('pauseBtn');
+let pausedAt = 0;
+pauseBtn.onclick = () => {
+  if (mr.state === 'recording') {
+    mr.pause(); // native MediaRecorder pause — paused audio never enters the file
+    pausedAt = Date.now();
+    pauseBtn.textContent = '▶ Resume';
+    timer.classList.remove('on');
+  } else if (mr.state === 'paused') {
+    mr.resume();
+    startTime += Date.now() - pausedAt; // timer skips the paused stretch
+    pauseBtn.textContent = '❙❙ Pause';
+    timer.classList.add('on');
   }
 };
 
@@ -409,13 +493,14 @@ function labelEditor(r) {
     ? '<span class="lbl-hint">set now — files to Obsidian when transcription finishes; Claude fills blanks</span>'
     : '';
   return `<div class="labels" data-rid="${r.id}">
-    <input class="lbl-sem"   placeholder="semester" value="${escAttr(r.semester)}">
-    <input class="lbl-class" placeholder="class" value="${escAttr(r.class)}">
-    <input class="lbl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
-    <input class="lbl-topic" placeholder="topic" value="${escAttr(r.topic)}">
+    <input class="lbl-sem"   list="dl-sem"   placeholder="semester" value="${escAttr(r.semester)}">
+    <input class="lbl-class" list="dl-class" placeholder="class" value="${escAttr(r.class)}">
+    <input class="lbl-unit"  list="dl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
+    <input class="lbl-topic" list="dl-topic" placeholder="topic" value="${escAttr(r.topic)}">
     <textarea class="lbl-notes" rows="2"
       placeholder="your notes — woven into the AI summary on save">${esc(r.notes || '')}</textarea>
     <button onclick="saveLabels('${r.id}')">${live ? 'Save labels' : 'Save to Obsidian'}</button>
+    <button class="ocr-btn" onclick="ocrNotes('${r.id}', this)" title="Photo or PDF of handwritten notes — transcribed into the notes box">&#128247; Add notes from photo/PDF</button>
     ${hint}
   </div>`;
 }
@@ -446,6 +531,29 @@ async function deleteRec(rid) {
   refresh();
 }
 
+async function ocrNotes(rid, btn) {
+  const picker = document.createElement('input');
+  picker.type = 'file';
+  picker.accept = 'image/*,.pdf';
+  picker.onchange = async () => {
+    const f = picker.files[0];
+    if (!f) return;
+    const old = btn.textContent;
+    btn.disabled = true; btn.textContent = 'transcribing…';
+    try {
+      const resp = await (await fetch(`/ocr?filename=${encodeURIComponent(f.name)}`,
+        { method: 'POST', body: f })).json();
+      if (resp.error) { alert(resp.error); return; }
+      const ta = document.querySelector(`.labels[data-rid="${rid}"] .lbl-notes`);
+      ta.value = (ta.value.trim() ? ta.value.trimEnd() + '\n\n' : '') + resp.text;
+      ta.focus(); // review before save; focus also pauses the 5s refresh wipe
+    } finally {
+      btn.disabled = false; btn.textContent = old;
+    }
+  };
+  picker.click();
+}
+
 async function saveLabels(rid) {
   const box = document.querySelector(`.labels[data-rid="${rid}"]`);
   const resp = await (await fetch(`/label/${rid}`, {
@@ -474,9 +582,10 @@ async function refresh() {
   // ponytail: don't blow away a label field the user is mid-edit on the 5s tick
   if (document.activeElement && document.getElementById('list').contains(document.activeElement)) return;
   const rows = await (await fetch('/recordings')).json();
+  updateDatalists(rows);
   document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
-      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload'))}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
+      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.obsidian_uri ? ` <a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">&#8599; Obsidian</a>` : ''}${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload'))}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
       ${r.status === 'transcribing' ? progressBar(r) : ''}
       ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
@@ -486,6 +595,41 @@ async function refresh() {
       ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
       ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
     </div>`).join('');
+  renderTree(rows);
+}
+
+// google-style suggestions while typing labels: native <datalist>, options = existing labels
+function updateDatalists(rows) {
+  for (const [id, field] of [['dl-sem', 'semester'], ['dl-class', 'class'], ['dl-unit', 'unit'], ['dl-topic', 'topic']]) {
+    let dl = document.getElementById(id);
+    if (!dl) { dl = document.createElement('datalist'); dl.id = id; document.body.appendChild(dl); }
+    const vals = [...new Set(rows.map(r => (r[field] || '').trim()).filter(Boolean))].sort();
+    dl.innerHTML = vals.map(v => `<option value="${escAttr(v)}">`).join('');
+  }
+}
+
+function renderTree(rows) {
+  // semester > class > unit > topics, from filed recordings only
+  const tree = {};
+  for (const r of rows) {
+    if (r.status !== 'done' || !r.semester || !r.class || !r.unit) continue;
+    (((tree[r.semester] ??= {})[r.class] ??= {})[r.unit] ??= []).push(r);
+  }
+  const open = new Set([...document.querySelectorAll('#tree details[open]')].map(d => d.dataset.k));
+  const det = (k, label, inner) =>
+    `<details data-k="${escAttr(k)}"${open.has(k) ? ' open' : ''}><summary>${esc(label)}</summary>${inner}</details>`;
+  document.getElementById('tree').innerHTML = Object.keys(tree).sort().map(sem =>
+    det(sem, sem, Object.keys(tree[sem]).sort().map(cls =>
+      det(sem + '/' + cls, cls, Object.keys(tree[sem][cls]).sort().map(unit =>
+        det(sem + '/' + cls + '/' + unit, unit, tree[sem][cls][unit]
+          .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
+          .map(r => `<div class="topic">${r.obsidian_uri
+              ? `<a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">${esc(r.topic || r.title || 'untitled')}</a>`
+              : esc(r.topic || r.title || 'untitled')}<span class="when">${(r.created_at || '').slice(0, 10)}</span></div>`)
+          .join(''))
+      ).join(''))
+    ).join(''))
+  ).join('');
 }
 
 setInterval(refresh, 5000);
