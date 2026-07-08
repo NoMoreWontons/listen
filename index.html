@@ -422,6 +422,7 @@
   <section class="sessions">
     <span class="deck-label">Recent</span>
     <div id="quizArea"></div>
+    <div id="reviewArea"></div>
     <div id="list"></div>
   </section>
   <div class="side">
@@ -464,6 +465,15 @@
         <button onclick="genQuiz(this)">Generate</button>
       </div>
       <div id="pastQuizzes"></div>
+    </section>
+    <section class="folders" id="review">
+      <span class="deck-label">Review</span>
+      <div class="merge-manual">
+        <select id="rClass" onchange="rClassChanged()"></select>
+        <select id="rUnit"></select>
+        <button onclick="genCards(this)">Make cards</button>
+      </div>
+      <div id="dueCount"></div>
     </section>
   </div>
 </div>
@@ -756,6 +766,7 @@ async function refresh() {
   renderTree(rows);
   renderMerge(rows);
   renderPractice(rows);
+  renderReview(rows);
 }
 
 // google-style suggestions while typing labels: native <datalist>, options = existing labels
@@ -1024,6 +1035,75 @@ async function openQuiz(qid) {
 }
 
 function closeQuiz() { document.getElementById('quizArea').innerHTML = ''; }
+
+// ---- flashcard review: due count re-renders on refresh (focus-guarded);
+// ---- the review session lives in #reviewArea, which refresh() never touches.
+let cardRows = [];
+async function renderReview(rows) {
+  const card = document.getElementById('review');
+  if (document.activeElement && card.contains(document.activeElement)) return;
+  const classes = [...new Set(rows.filter(r => r.status === 'done' && r.class).map(r => r.class))].sort();
+  const sel = document.getElementById('rClass'), cur = sel.value;
+  sel.innerHTML = classes.map(c => `<option value="${escAttr(c)}">${esc(c)}</option>`).join('');
+  if (classes.includes(cur)) sel.value = cur;
+  cardRows = rows; rClassChanged();
+  let due = [];
+  try { const d = await (await fetch('/cards/due')).json(); if (Array.isArray(d)) due = d; } catch {}
+  const el = document.getElementById('dueCount');
+  el.innerHTML = due.length
+    ? `<button class="submit" onclick='startReview(${JSON.stringify(due).replace(/'/g, "&#39;")})'>Review ${due.length} due</button>`
+    : '<p class="gs-note">No cards due.</p>';
+}
+function rClassChanged() {
+  const cls = document.getElementById('rClass').value;
+  const units = [...new Set(cardRows.filter(r => r.status === 'done' && r.class === cls && r.unit).map(r => r.unit))].sort();
+  document.getElementById('rUnit').innerHTML = '<option value="">whole class</option>'
+    + units.map(u => `<option value="${escAttr(u)}">${esc(u)}</option>`).join('');
+}
+async function genCards(btn) {
+  const body = { class: document.getElementById('rClass').value, unit: document.getElementById('rUnit').value };
+  if (!body.class) { alert('record and file some lectures first'); return; }
+  btn.disabled = true; btn.textContent = 'making…';
+  try {
+    const r = await (await fetch('/cards/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })).json();
+    alert(r.error ? r.error : `Made ${r.count} cards.`);
+  } finally { btn.disabled = false; btn.textContent = 'Make cards'; document.activeElement?.blur(); }
+}
+let reviewQueue = [];
+function startReview(due) { reviewQueue = due; showCard(); }
+function showCard() {
+  const area = document.getElementById('reviewArea');
+  if (!reviewQueue.length) { area.innerHTML = '<div class="quiz"><b>Done reviewing.</b> <button onclick="closeReview()">✕</button></div>'; return; }
+  const c = reviewQueue[0];
+  area.innerHTML = `<div class="quiz" data-cid="${c.id}">
+    <div class="quiz-head"><b>${esc(c.class || '')}${c.unit ? ' / ' + esc(c.unit) : ''}</b>
+      <button onclick="closeReview()" title="Close">✕</button></div>
+    <div class="q"><p>${esc(c.front)}</p>
+      <p class="cardback" style="display:none">${esc(c.back)}</p></div>
+    <button class="submit" id="flipBtn" onclick="flipCard()">Show answer</button>
+    <div id="grades" style="display:none">
+      ${['again', 'hard', 'good', 'easy'].map(g => `<button class="submit" onclick="gradeCard('${g}')">${g}</button>`).join(' ')}
+    </div>
+  </div>`;
+  document.getElementById('reviewArea').scrollIntoView({ behavior: 'smooth' });
+}
+function flipCard() {
+  document.querySelector('#reviewArea .cardback').style.display = '';
+  document.getElementById('flipBtn').style.display = 'none';
+  document.getElementById('grades').style.display = '';
+}
+async function gradeCard(grade) {
+  const cid = document.querySelector('#reviewArea .quiz').dataset.cid;
+  try {
+    await fetch(`/cards/${cid}/review`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grade }),
+    });
+  } catch {}
+  reviewQueue.shift(); showCard();
+}
+function closeReview() { document.getElementById('reviewArea').innerHTML = ''; reviewQueue = []; }
 
 setInterval(refresh, 5000);
 refresh();
