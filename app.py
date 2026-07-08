@@ -699,6 +699,136 @@ def assignment_complete(aid: str, payload: dict = Body(...)):
     return {"ok": True}
 
 
+# --- practice quiz / test generator ---
+
+def generate_quiz(rows, kind="quiz"):
+    """One Claude call: mixed MCQ + short-answer questions from the filed
+    notes' summaries. Returns the parsed question list; raises if the model
+    returns unparseable JSON (caller surfaces it as an error)."""
+    n_mcq, n_short = (7, 3) if kind == "quiz" else (14, 6)
+    material = "\n\n".join(
+        f"## {r.get('topic') or r.get('title') or ''}\n{r.get('summary') or ''}"
+        for r in rows if (r.get("summary") or "").strip())
+    msg = claude.messages.create(
+        model="claude-haiku-4-5", max_tokens=6000,
+        messages=[{"role": "user", "content": (
+            f"Create a practice {kind} from these college lecture notes: "
+            f"{n_mcq} multiple-choice questions and {n_short} short-answer questions. "
+            "Return ONLY a JSON array; each item is one of:\n"
+            '- {"type":"mcq","q":"...","choices":["...","...","...","..."],'
+            '"answer":<0-3 index of the correct choice>,"explanation":"one sentence"}\n'
+            '- {"type":"short","q":"...","answer":"model answer, 1-3 sentences","explanation":""}\n'
+            "Cover the breadth of the material; make wrong choices plausible.\n\n"
+            "Notes:\n" + material)}],
+    )
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+
+def grade_mcq(questions, answers):
+    """Pure MCQ grading: (results, points, mcq_total). results aligns with the
+    zipped prefix of questions/answers; short answers pass through ungraded."""
+    results, pts, total = [], 0, 0
+    for q, a in zip(questions, answers):
+        if q.get("type") == "mcq":
+            total += 1
+            ok = str(a).strip() == str(q.get("answer")).strip()
+            pts += ok
+            results.append({"answer": a, "correct": bool(ok)})
+        else:
+            results.append({"answer": a})
+    return results, pts, total
+
+
+def grade_short(questions, results):
+    """One Claude call grades all short answers; mutates their entries in
+    results with score (0/0.5/1) + feedback. Returns points earned."""
+    shorts = [(i, q, results[i].get("answer")) for i, q in enumerate(questions)
+              if q.get("type") == "short" and i < len(results)]
+    if not shorts:
+        return 0.0
+    listing = "\n\n".join(
+        f"Question {i}: {q.get('q')}\nExpected: {q.get('answer', '')}\n"
+        f"Student answer: {a or '(blank)'}" for i, q, a in shorts)
+    msg = claude.messages.create(
+        model="claude-haiku-4-5", max_tokens=1500,
+        messages=[{"role": "user", "content": (
+            "Grade these short-answer quiz responses. Return ONLY a JSON array with one "
+            'object per question, in order: {"i": <question number>, "score": <0, 0.5 or 1>, '
+            '"feedback": "one sentence"}. Full credit for capturing the idea in the '
+            "student's own words; half for partially right.\n\n" + listing)}],
+    )
+    raw = re.sub(r"^```(?:json)?|```$", "", msg.content[0].text.strip(), flags=re.MULTILINE).strip()
+    try:
+        by_i = {g.get("i"): g for g in json.loads(raw)}
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        by_i = {}
+    pts = 0.0
+    for i, q, a in shorts:
+        g = by_i.get(i) or {"score": 0, "feedback": "grading failed — compare with the model answer"}
+        try:
+            s = min(max(float(g.get("score") or 0), 0.0), 1.0)
+        except (TypeError, ValueError):
+            s = 0.0
+        results[i]["score"] = s
+        results[i]["feedback"] = str(g.get("feedback") or "")
+        pts += s
+    return pts
+
+
+@app.post("/quiz/generate")
+def quiz_generate(payload: dict = Body(...)):
+    sem = (payload.get("semester") or "").strip()
+    cls = (payload.get("class") or "").strip()
+    unit = (payload.get("unit") or "").strip()
+    kind = payload.get("kind") if payload.get("kind") in ("quiz", "test") else "quiz"
+    if not cls:
+        return {"error": "class required"}
+    q = (sb.table("recordings").select("topic,title,summary")
+         .eq("status", "done").eq("class", cls))
+    if sem:
+        q = q.eq("semester", sem)
+    if unit:
+        q = q.eq("unit", unit)
+    rows = q.execute().data
+    if not any((r.get("summary") or "").strip() for r in rows):
+        return {"error": "no filed notes for that scope yet"}
+    try:
+        questions = generate_quiz(rows, kind)
+    except Exception as e:
+        return {"error": f"generation failed: {e}"}
+    return sb.table("quizzes").insert({
+        "kind": kind, "semester": sem or None, "class": cls, "unit": unit or None,
+        "questions": questions,
+    }).execute().data[0]
+
+
+@app.post("/quiz/{qid}/submit")
+def quiz_submit(qid: str, payload: dict = Body(...)):
+    quiz = sb.table("quizzes").select("*").eq("id", qid).single().execute().data
+    questions = quiz["questions"] or []
+    answers = payload.get("answers") or []
+    answers += [None] * (len(questions) - len(answers))  # pad skipped questions
+    results, pts, mcq_total = grade_mcq(questions, answers)
+    pts += grade_short(questions, results)
+    total = mcq_total + sum(1 for q in questions if q.get("type") == "short")
+    score = round(pts / max(total, 1) * 100)
+    sb.table("quizzes").update({"answers": results, "score": score}).eq("id", qid).execute()
+    return {"score": score, "results": results, "questions": questions}
+
+
+@app.get("/quizzes")
+def quizzes():
+    return (sb.table("quizzes").select("id,created_at,kind,semester,class,unit,score")
+            .order("created_at", desc=True).execute().data)
+
+
+@app.get("/quiz/{qid}")
+def quiz_get(qid: str):
+    return sb.table("quizzes").select("*").eq("id", qid).single().execute().data
+
+
 def _doc_block(data):
     """Claude content block for uploaded course material, sniffed from magic
     bytes: PDF -> native document block, pptx/docx (zip) -> extracted text,
