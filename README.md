@@ -20,6 +20,14 @@ the local FastAPI server holds the service key and does all the work. See
    — hand-set labels win; Claude only fills the ones you leave blank. Saving after
    `done` re-files the note.
 6. Raw audio stays local and is auto-deleted after `RETENTION_DAYS`.
+7. **Uploads** beyond live recording: audio files, lecture PDFs/slides (`pdf`),
+   syllabi (`syllabus` — due dates land in an `.ics` you can import), homework
+   (`homework` — PDF or photo, auto-categorized, then link it to a syllabus due
+   date to mark it submitted), and YouTube links (save as a reference note, or
+   transcribe the audio like a lecture).
+8. **Practice quizzes:** generate a 10-question quiz or 20-question test from any
+   class/unit's filed notes — multiple choice graded instantly, short answers
+   graded by Claude. Past quizzes are saved with scores.
 
 **Notion fallback (optional):** if `NOTION_TOKEN` is set, the server polls one Notion
 database for AI meeting-note pages, pulls the transcript, runs the same
@@ -89,7 +97,8 @@ id in `NOTION_DB_ID`.
   on launch). Transcripts live in Supabase + Obsidian.
 - **Checks:** `python test_sweep.py` (retention), `python test_note.py` (Obsidian
   filing), `python test_notion.py` (Notion block flatten), `python test_model_stall.py`
-  (model warm-up).
+  (model warm-up), `python test_hw.py` (upload block sniffing), `python test_quiz.py`
+  (MCQ grading), `python test_yt.py` (YouTube URL gate).
 
 ## Not built yet (deferred)
 

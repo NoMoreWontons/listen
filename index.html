@@ -408,6 +408,7 @@
       <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg,.pdf,.pptx,.docx" hidden>
       <button id="hwBtn" class="upload-btn" title="Upload homework (PDF or photo) — auto-filed, then link it to a due date">&#8686; Homework</button>
       <input type="file" id="hwInput" accept=".pdf,image/*" hidden>
+      <button id="ytBtn" class="upload-btn" title="Add a YouTube video — save the link as a reference note, or transcribe it like a lecture">&#9654; YouTube</button>
     </div>
     <div class="deck-group signal">
       <span class="deck-label">Signal</span>
@@ -625,6 +626,18 @@ fileInput.onchange = () => { uploadFile(fileInput.files[0]); fileInput.value = '
 const hwInput = document.getElementById('hwInput');
 document.getElementById('hwBtn').onclick = () => hwInput.click();
 hwInput.onchange = () => { uploadFile(hwInput.files[0], 'homework'); hwInput.value = ''; };
+document.getElementById('ytBtn').onclick = async () => {
+  const url = prompt('YouTube URL:');
+  if (!url) return;
+  const mode = confirm('Transcribe the video?\nOK = transcribe like a lecture\nCancel = just save the link as a reference note')
+    ? 'transcribe' : 'store';
+  const resp = await (await fetch('/upload_yt', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, mode }),
+  })).json();
+  if (resp.error) alert(resp.error);
+  refresh();
+};
 document.body.addEventListener('dragover', e => e.preventDefault());
 document.body.addEventListener('drop', e => { e.preventDefault(); uploadFile(e.dataTransfer.files[0]); });
 
