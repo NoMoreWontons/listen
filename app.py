@@ -884,9 +884,10 @@ def cards_generate(payload: dict = Body(...)):
         cards = generate_cards(rows)
     except Exception as e:
         return {"error": f"generation failed: {e}"}
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()  # app clock; DB default now() can run ahead of /cards/due's clock, hiding fresh cards
     valid = [
         {"semester": sem or None, "class": cls, "unit": unit or None,
-         "front": c.get("front", ""), "back": c.get("back", "")}
+         "front": c.get("front", ""), "back": c.get("back", ""), "due_at": now}
         for c in cards if c.get("front") and c.get("back")
     ]
     if not valid:
