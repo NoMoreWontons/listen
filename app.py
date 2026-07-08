@@ -884,12 +884,15 @@ def cards_generate(payload: dict = Body(...)):
         cards = generate_cards(rows)
     except Exception as e:
         return {"error": f"generation failed: {e}"}
-    sb.table("cards").insert([
+    valid = [
         {"semester": sem or None, "class": cls, "unit": unit or None,
          "front": c.get("front", ""), "back": c.get("back", "")}
         for c in cards if c.get("front") and c.get("back")
-    ]).execute()
-    return {"count": len(cards)}
+    ]
+    if not valid:
+        return {"error": "no usable cards generated"}
+    sb.table("cards").insert(valid).execute()
+    return {"count": len(valid)}
 
 
 @app.get("/cards/due")

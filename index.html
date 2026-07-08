@@ -1040,7 +1040,7 @@ function closeQuiz() { document.getElementById('quizArea').innerHTML = ''; }
 
 // ---- flashcard review: due count re-renders on refresh (focus-guarded);
 // ---- the review session lives in #reviewArea, which refresh() never touches.
-let cardRows = [];
+let cardRows = [], cardsDue = [];
 async function renderReview(rows) {
   const card = document.getElementById('review');
   if (document.activeElement && card.contains(document.activeElement)) return;
@@ -1051,9 +1051,10 @@ async function renderReview(rows) {
   cardRows = rows; rClassChanged();
   let due = [];
   try { const d = await (await fetch('/cards/due')).json(); if (Array.isArray(d)) due = d; } catch {}
+  cardsDue = due;  // snapshot for startReview() — avoids serialising cards into an onclick attribute
   const el = document.getElementById('dueCount');
   el.innerHTML = due.length
-    ? `<button class="submit" onclick='startReview(${JSON.stringify(due).replace(/'/g, "&#39;")})'>Review ${due.length} due</button>`
+    ? `<button class="submit" onclick="startReview()">Review ${due.length} due</button>`
     : '<p class="gs-note">No cards due.</p>';
 }
 function rClassChanged() {
@@ -1081,7 +1082,7 @@ function dlCheat() {
   window.location = '/cheatsheet?' + qs;
 }
 let reviewQueue = [];
-function startReview(due) { reviewQueue = due; showCard(); }
+function startReview() { reviewQueue = cardsDue.slice(); showCard(); }
 function showCard() {
   const area = document.getElementById('reviewArea');
   if (!reviewQueue.length) { area.innerHTML = '<div class="quiz"><b>Done reviewing.</b> <button onclick="closeReview()">✕</button></div>'; return; }
