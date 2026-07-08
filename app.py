@@ -914,6 +914,40 @@ def cards_review(cid: str, payload: dict = Body(...)):
     return {"due_at": due, "interval": interval}
 
 
+def build_cards_ics(due_dates, stamp):
+    """All-day VEVENTs, one per distinct due-date, summarising how many cards
+    are due. Pure/testable. due_dates: list of 'YYYY-MM-DD' strings."""
+    from collections import Counter
+    counts = Counter(d for d in due_dates if d)
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//listen//EN"]
+    for date in sorted(counts):
+        n = counts[date]
+        noun = "flashcard" if n == 1 else "flashcards"
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:cards-{date}@listen",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART;VALUE=DATE:{date.replace('-', '')}",
+            f"SUMMARY:{_ics_escape(f'{n} {noun} due')}",
+            "CATEGORIES:flashcards",
+            "END:VEVENT",
+        ]
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+@app.get("/cards_due.ics")
+def cards_due_ics():
+    """Upcoming flashcard due-dates as a calendar feed (today onward)."""
+    today = datetime.date.today().isoformat()
+    rows = (sb.table("cards").select("due_at").gte("due_at", today)
+            .execute().data)
+    dates = [(r.get("due_at") or "")[:10] for r in rows]
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return Response(build_cards_ics(dates, stamp), media_type="text/calendar",
+                    headers={"Content-Disposition": 'attachment; filename="cards_due.ics"'})
+
+
 # --- cheat-sheet export (one-page markdown) ---
 
 def build_cheatsheet(rows, cls, unit):
