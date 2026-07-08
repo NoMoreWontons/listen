@@ -67,3 +67,19 @@ create table if not exists quizzes (
   answers jsonb,                         -- graded per-question results, null until submitted
   score numeric                          -- 0-100, null until submitted
 );
+
+-- Flashcards with SM-2 spaced-repetition scheduling.
+create table if not exists cards (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz default now(),
+  semester text,
+  class text not null,
+  unit text,                              -- null = whole class
+  front text not null,                    -- prompt (term / question)
+  back text not null,                     -- answer
+  due_at timestamptz default now(),       -- when next due
+  interval int default 0,                 -- days to next review
+  reps int default 0,                     -- consecutive successful reviews
+  ease numeric default 2.5                -- SM-2 ease factor (floor 1.3)
+);
+alter table cards enable row level security;   -- match quizzes/recordings; app uses the service key

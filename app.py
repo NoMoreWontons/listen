@@ -829,6 +829,91 @@ def quiz_get(qid: str):
     return sb.table("quizzes").select("*").eq("id", qid).single().execute().data
 
 
+# --- flashcards / spaced repetition (SM-2) ---
+
+_GRADE_Q = {"again": 0, "hard": 3, "good": 4, "easy": 5}
+
+def sm2(interval, reps, ease, quality):
+    """Classic SuperMemo-2 update. Returns (interval_days, reps, ease).
+    quality<3 is a lapse (reset reps+interval); ease floors at 1.3."""
+    if quality < 3:
+        reps, interval = 0, 1
+    else:
+        interval = 1 if reps == 0 else 6 if reps == 1 else round(interval * ease)
+        reps += 1
+    ease = max(1.3, ease + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02)))
+    return interval, reps, ease
+
+
+def generate_cards(rows, n=15):
+    """One Claude call: front/back flashcards from filed-note summaries.
+    Mirrors generate_quiz. Raises on unparseable JSON (caller surfaces it)."""
+    material = "\n\n".join(
+        f"## {r.get('topic') or r.get('title') or ''}\n{r.get('summary') or ''}"
+        for r in rows if (r.get("summary") or "").strip())
+    msg = claude.messages.create(
+        model="claude-haiku-4-5", max_tokens=4000,
+        messages=[{"role": "user", "content": (
+            f"Create {n} study flashcards from these college lecture notes. "
+            "Return ONLY a JSON array; each item is "
+            '{"front":"a term or question","back":"the answer, 1-2 sentences"}. '
+            "Cover the breadth of the material; keep each side concise.\n\n"
+            "Notes:\n" + material)}],
+    )
+    raw = re.sub(r"^```(?:json)?|```$", "", msg.content[0].text.strip(), flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+
+@app.post("/cards/generate")
+def cards_generate(payload: dict = Body(...)):
+    sem = (payload.get("semester") or "").strip()
+    cls = (payload.get("class") or "").strip()
+    unit = (payload.get("unit") or "").strip()
+    if not cls:
+        return {"error": "class required"}
+    q = (sb.table("recordings").select("topic,title,summary")
+         .eq("status", "done").eq("class", cls))
+    if sem:
+        q = q.eq("semester", sem)
+    if unit:
+        q = q.eq("unit", unit)
+    rows = q.execute().data
+    if not any((r.get("summary") or "").strip() for r in rows):
+        return {"error": "no filed notes for that scope yet"}
+    try:
+        cards = generate_cards(rows)
+    except Exception as e:
+        return {"error": f"generation failed: {e}"}
+    sb.table("cards").insert([
+        {"semester": sem or None, "class": cls, "unit": unit or None,
+         "front": c.get("front", ""), "back": c.get("back", "")}
+        for c in cards if c.get("front") and c.get("back")
+    ]).execute()
+    return {"count": len(cards)}
+
+
+@app.get("/cards/due")
+def cards_due():
+    """Cards whose due_at has passed, soonest first — the review queue."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return (sb.table("cards").select("*").lte("due_at", now)
+            .order("due_at").execute().data)
+
+
+@app.post("/cards/{cid}/review")
+def cards_review(cid: str, payload: dict = Body(...)):
+    quality = _GRADE_Q.get(payload.get("grade"), 4)
+    card = sb.table("cards").select("interval,reps,ease").eq("id", cid).single().execute().data
+    interval, reps, ease = sm2(card["interval"] or 0, card["reps"] or 0,
+                               float(card["ease"] or 2.5), quality)
+    due = (datetime.datetime.now(datetime.timezone.utc)
+           + datetime.timedelta(days=interval)).isoformat()
+    sb.table("cards").update(
+        {"interval": interval, "reps": reps, "ease": ease, "due_at": due}
+    ).eq("id", cid).execute()
+    return {"due_at": due, "interval": interval}
+
+
 # --- YouTube intake: reference link or full transcription ---
 
 def _is_yt(url):
