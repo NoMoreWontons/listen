@@ -732,8 +732,10 @@ async function refresh() {
   // ponytail: don't blow away a label field the user is mid-edit on the 5s tick
   if (document.activeElement && document.getElementById('list').contains(document.activeElement)) return;
   const rows = await (await fetch('/recordings')).json();
-  openAssignments = rows.some(r => r.source === 'homework' && r.status === 'done')
-    ? await (await fetch('/assignments_open')).json() : [];
+  openAssignments = [];  // never let a failed fetch (e.g. migration not yet applied) be non-array — hwLinker.filter would throw and blank the list
+  if (rows.some(r => r.source === 'homework' && r.status === 'done')) {
+    try { const a = await (await fetch('/assignments_open')).json(); if (Array.isArray(a)) openAssignments = a; } catch {}
+  }
   updateDatalists(rows);
   const openK = new Set([...document.querySelectorAll('#list details[open]')].map(d => d.dataset.k).filter(Boolean));
   document.getElementById('list').innerHTML = rows.map(r => `
