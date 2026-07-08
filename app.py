@@ -8,7 +8,7 @@ import pathlib
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, Request, Body
+from fastapi import FastAPI, Request, Body, Query
 from fastapi.responses import FileResponse, Response
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -912,6 +912,37 @@ def cards_review(cid: str, payload: dict = Body(...)):
         {"interval": interval, "reps": reps, "ease": ease, "due_at": due}
     ).eq("id", cid).execute()
     return {"due_at": due, "interval": interval}
+
+
+# --- cheat-sheet export (one-page markdown) ---
+
+def build_cheatsheet(rows, cls, unit):
+    """One markdown study sheet from filed-note summaries. Pure/testable."""
+    head = f"# {cls}" + (f" — {unit}" if unit else "")
+    body = "\n\n".join(
+        f"## {r.get('topic') or r.get('title') or 'Untitled'}\n\n{(r.get('summary') or '').strip()}"
+        for r in rows if (r.get("summary") or "").strip())
+    return f"{head}\n\n{body}\n"
+
+
+@app.get("/cheatsheet")
+def cheatsheet(class_: str = Query("", alias="class"), unit: str = "", semester: str = ""):
+    cls = class_.strip()
+    sem = semester.strip()
+    unit = unit.strip()
+    if not cls:
+        return Response("class required", media_type="text/plain", status_code=400)
+    q = (sb.table("recordings").select("topic,title,summary")
+         .eq("status", "done").eq("class", cls))
+    if sem:
+        q = q.eq("semester", sem)
+    if unit:
+        q = q.eq("unit", unit)
+    rows = q.execute().data
+    md = build_cheatsheet(rows, cls, unit)
+    fname = _slug(f"{cls} {unit}".strip()) + " cheatsheet.md"
+    return Response(md, media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 # --- YouTube intake: reference link or full transcription ---

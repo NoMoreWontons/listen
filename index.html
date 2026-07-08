@@ -472,6 +472,7 @@
         <select id="rClass" onchange="rClassChanged()"></select>
         <select id="rUnit"></select>
         <button onclick="genCards(this)">Make cards</button>
+        <button onclick="dlCheat()">Cheat sheet</button>
       </div>
       <div id="dueCount"></div>
     </section>
@@ -1070,6 +1071,13 @@ async function genCards(btn) {
     })).json();
     alert(r.error ? r.error : `Made ${r.count} cards.`);
   } finally { btn.disabled = false; btn.textContent = 'Make cards'; document.activeElement?.blur(); }
+}
+function dlCheat() {
+  const cls = document.getElementById('rClass').value;
+  const unit = document.getElementById('rUnit').value;
+  if (!cls) { alert('pick a class'); return; }
+  const qs = new URLSearchParams({ class: cls, unit }).toString();
+  window.location = '/cheatsheet?' + qs;
 }
 let reviewQueue = [];
 function startReview(due) { reviewQueue = due; showCard(); }
