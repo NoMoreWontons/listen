@@ -213,6 +213,26 @@
     border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
   }
 
+  /* ---- practice quizzes ---- */
+  .pq-row { display: flex; justify-content: space-between; gap: .5rem; padding: .4rem 0;
+    border-bottom: 1px solid #efe9db; font-size: .82rem; cursor: pointer; }
+  .pq-row:hover { background: #f1ecdf; }
+  .pq-score { font-family: var(--font-mono); font-size: .72rem; color: var(--ink-soft); }
+  .quiz { background: var(--card); border: 1px solid var(--card-edge);
+    border-radius: var(--radius-card); padding: 1rem 1.15rem; margin: 0 0 .85rem; }
+  .quiz .q { margin: .8rem 0; }
+  .quiz .q p { margin: 0 0 .35rem; font-weight: 600; }
+  .quiz label { display: block; font-size: .88rem; padding: .15rem 0; cursor: pointer; }
+  .quiz textarea { width: 100%; padding: .35rem .5rem; font-size: .82rem; font-family: inherit;
+    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; resize: vertical; }
+  .quiz .verdict { font-size: .8rem; margin: .25rem 0 0; }
+  .quiz .verdict.good { color: #226e5b; }
+  .quiz .verdict.bad { color: #8f2323; }
+  .quiz .quiz-head { display: flex; justify-content: space-between; align-items: baseline; }
+  .quiz .quiz-head button { border: none; background: none; cursor: pointer; color: var(--ink-soft); }
+  .quiz button.submit { padding: .35rem .8rem; font-size: .78rem; border: 0; border-radius: 6px;
+    cursor: pointer; background: var(--amber); color: #3a2c00; font-weight: 600; }
+
   /* ---- graph color settings ---- */
   #graphCard summary::before { content: "🎨 "; }
   #graphCard summary { cursor: pointer; }
@@ -400,6 +420,7 @@
 <div class="main">
   <section class="sessions">
     <span class="deck-label">Recent</span>
+    <div id="quizArea"></div>
     <div id="list"></div>
   </section>
   <div class="side">
@@ -429,6 +450,19 @@
         <p class="gs-note">Semester hubs stay white. Fades scale with hue warmth — warm colors calm down more.</p>
         <button onclick="saveGraphSettings(this)">Save &amp; recolor</button>
       </details>
+    </section>
+    <section class="folders" id="practice">
+      <span class="deck-label">Practice</span>
+      <div class="merge-manual">
+        <select id="pClass" onchange="pClassChanged()"></select>
+        <select id="pUnit"></select>
+        <select id="pKind">
+          <option value="quiz">Quiz — 10 q</option>
+          <option value="test">Test — 20 q</option>
+        </select>
+        <button onclick="genQuiz(this)">Generate</button>
+      </div>
+      <div id="pastQuizzes"></div>
     </section>
   </div>
 </div>
@@ -706,6 +740,7 @@ async function refresh() {
     if (openK.has(d.dataset.k)) d.open = true;
   renderTree(rows);
   renderMerge(rows);
+  renderPractice(rows);
 }
 
 // google-style suggestions while typing labels: native <datalist>, options = existing labels
@@ -851,6 +886,129 @@ async function saveGraphSettings(btn) {
   } finally { btn.disabled = false; }
 }
 loadGraphSettings();
+
+// ---- practice quizzes: selects + past list re-render on refresh (focus-guarded);
+// ---- the quiz being taken lives in #quizArea, which refresh() never touches.
+let quizRows = [];
+
+function renderPractice(rows) {
+  const card = document.getElementById('practice');
+  if (document.activeElement && card.contains(document.activeElement)) return;
+  const classes = [...new Set(rows.filter(r => r.status === 'done' && r.class).map(r => r.class))].sort();
+  const sel = document.getElementById('pClass');
+  const cur = sel.value;
+  sel.innerHTML = classes.map(c => `<option value="${escAttr(c)}">${esc(c)}</option>`).join('');
+  if (classes.includes(cur)) sel.value = cur;
+  quizRows = rows;
+  pClassChanged();
+  loadPastQuizzes();
+}
+
+function pClassChanged() {
+  const cls = document.getElementById('pClass').value;
+  const units = [...new Set(quizRows.filter(r => r.status === 'done' && r.class === cls && r.unit)
+    .map(r => r.unit))].sort();
+  document.getElementById('pUnit').innerHTML = '<option value="">whole class</option>'
+    + units.map(u => `<option value="${escAttr(u)}">${esc(u)}</option>`).join('');
+}
+
+let pastLoaded = 0;
+async function loadPastQuizzes() {
+  if (Date.now() - pastLoaded < 30000) return; // past list barely changes — poll it gently
+  pastLoaded = Date.now();
+  const qs = await (await fetch('/quizzes')).json();
+  document.getElementById('pastQuizzes').innerHTML = qs.map(q => `
+    <div class="pq-row" onclick="openQuiz('${q.id}')">
+      <span>${esc(q.kind)} · ${esc(q.class || '')}${q.unit ? ' / ' + esc(q.unit) : ''}</span>
+      <span class="pq-score">${q.score === null ? 'unfinished' : q.score + '%'} · ${(q.created_at || '').slice(0, 10)}</span>
+    </div>`).join('');
+}
+
+async function genQuiz(btn) {
+  const body = {
+    class: document.getElementById('pClass').value,
+    unit: document.getElementById('pUnit').value,
+    kind: document.getElementById('pKind').value,
+  };
+  if (!body.class) { alert('record and file some lectures first'); return; }
+  btn.disabled = true; btn.textContent = 'generating…';
+  try {
+    const q = await (await fetch('/quiz/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json();
+    if (q.error) { alert(q.error); return; }
+    pastLoaded = 0;
+    renderQuizForm(q);
+  } finally { btn.disabled = false; btn.textContent = 'Generate'; document.activeElement?.blur(); }
+}
+
+function renderQuizForm(q) {
+  document.getElementById('quizArea').innerHTML = `<div class="quiz" data-qid="${q.id}">
+    <div class="quiz-head"><b>${esc(q.kind)} — ${esc(q.class || '')}${q.unit ? ' / ' + esc(q.unit) : ''}</b>
+      <button onclick="closeQuiz()" title="Close">&#10005;</button></div>
+    ${q.questions.map((qq, i) => `<div class="q" data-i="${i}">
+      <p>${i + 1}. ${esc(qq.q)}</p>
+      ${qq.type === 'mcq'
+        ? qq.choices.map((c, ci) => `<label><input type="radio" name="q${i}" value="${ci}"> ${esc(c)}</label>`).join('')
+        : `<textarea rows="2" placeholder="your answer"></textarea>`}
+    </div>`).join('')}
+    <button class="submit" onclick="submitQuiz(this, '${q.id}')">Submit</button>
+  </div>`;
+  document.getElementById('quizArea').scrollIntoView({ behavior: 'smooth' });
+}
+
+async function submitQuiz(btn, qid) {
+  const quiz = document.querySelector(`.quiz[data-qid="${qid}"]`);
+  const answers = [...quiz.querySelectorAll('.q')].map(div => {
+    const r = div.querySelector('input[type="radio"]:checked');
+    if (r) return +r.value;
+    const t = div.querySelector('textarea');
+    return t ? t.value : null;
+  });
+  btn.disabled = true; btn.textContent = 'grading…';
+  try {
+    const g = await (await fetch(`/quiz/${qid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers }),
+    })).json();
+    pastLoaded = 0;
+    renderQuizResults(qid, g.questions, g.results, g.score);
+  } finally { btn.disabled = false; }
+}
+
+function renderQuizResults(qid, questions, results, score) {
+  document.getElementById('quizArea').innerHTML = `<div class="quiz" data-qid="${qid}">
+    <div class="quiz-head"><b>Score: ${score}%</b>
+      <button onclick="closeQuiz()" title="Close">&#10005;</button></div>
+    ${questions.map((qq, i) => {
+      const r = results[i] || {};
+      let verdict;
+      if (qq.type === 'mcq') {
+        const ok = r.correct;
+        verdict = `<p class="verdict ${ok ? 'good' : 'bad'}">${ok ? '✓ correct' :
+          `✗ ${r.answer === null || r.answer === undefined || r.answer === '' ? 'skipped' : 'you picked: ' + esc(String(qq.choices[r.answer] ?? r.answer))} — answer: ${esc(String(qq.choices[qq.answer] ?? qq.answer))}`}
+          ${qq.explanation ? '<br>' + esc(qq.explanation) : ''}</p>`;
+      } else {
+        const s = r.score ?? 0;
+        verdict = `<p class="verdict ${s >= 1 ? 'good' : 'bad'}">${s >= 1 ? '✓' : s > 0 ? '½' : '✗'} ${esc(r.feedback || '')}
+          <br>Model answer: ${esc(qq.answer || '')}</p>
+          <p class="verdict">You wrote: ${esc(String(r.answer || '(blank)'))}</p>`;
+      }
+      return `<div class="q"><p>${i + 1}. ${esc(qq.q)}</p>${verdict}</div>`;
+    }).join('')}
+  </div>`;
+}
+
+async function openQuiz(qid) {
+  const q = await (await fetch('/quiz/' + qid)).json();
+  document.activeElement?.blur();
+  if (q.answers) renderQuizResults(qid, q.questions, q.answers, q.score);
+  else renderQuizForm(q);
+  document.getElementById('quizArea').scrollIntoView({ behavior: 'smooth' });
+}
+
+function closeQuiz() { document.getElementById('quizArea').innerHTML = ''; }
 
 setInterval(refresh, 5000);
 refresh();
