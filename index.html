@@ -386,6 +386,8 @@
       <span class="deck-label">Upload</span>
       <button id="uploadBtn" class="upload-btn" title="Upload audio, PDF, PowerPoint, or Word (or drop it anywhere on the page)">&#8686; Audio / Docs</button>
       <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg,.pdf,.pptx,.docx" hidden>
+      <button id="hwBtn" class="upload-btn" title="Upload homework (PDF or photo) — auto-filed, then link it to a due date">&#8686; Homework</button>
+      <input type="file" id="hwInput" accept=".pdf,image/*" hidden>
     </div>
     <div class="deck-group signal">
       <span class="deck-label">Signal</span>
@@ -434,6 +436,7 @@
 <script>
 let mr, rid, recording = false;
 let audioCtx, analyser, rafId, timerId, startTime;
+let openAssignments = [];
 const btn = document.getElementById('btn');
 const timer = document.getElementById('timer');
 const mic = document.getElementById('mic');
@@ -585,13 +588,16 @@ function labelEditor(r) {
 const fileInput = document.getElementById('fileInput');
 document.getElementById('uploadBtn').onclick = () => fileInput.click();
 fileInput.onchange = () => { uploadFile(fileInput.files[0]); fileInput.value = ''; };
+const hwInput = document.getElementById('hwInput');
+document.getElementById('hwBtn').onclick = () => hwInput.click();
+hwInput.onchange = () => { uploadFile(hwInput.files[0], 'homework'); hwInput.value = ''; };
 document.body.addEventListener('dragover', e => e.preventDefault());
 document.body.addEventListener('drop', e => { e.preventDefault(); uploadFile(e.dataTransfer.files[0]); });
 
-async function uploadFile(f) {
+async function uploadFile(f, forceKind) {
   if (!f) return;
-  let kind = 'audio';
-  if (/\.(pdf|pptx|docx)$/i.test(f.name)) {
+  let kind = forceKind || 'audio';
+  if (!forceKind && /\.(pdf|pptx|docx)$/i.test(f.name)) {
     kind = confirm('Is this a syllabus?\nOK = syllabus (extract due dates to calendar)\nCancel = lecture material') ? 'syllabus' : 'pdf';
   }
   const resp = await (await fetch(`/upload?kind=${kind}&filename=${encodeURIComponent(f.name)}`,
@@ -648,6 +654,26 @@ async function saveLabels(rid) {
   refresh();
 }
 
+// homework card: pick which due date this upload fulfills (soonest first = default)
+function hwLinker(r) {
+  const opts = openAssignments.filter(a => !r.class || !a.klass || a.klass === r.class);
+  if (!opts.length) return '';
+  return `<div class="merge-manual"><span class="merge-into">fulfills</span>
+    <select id="hw-${r.id}">${opts.map(a =>
+      `<option value="${escAttr(a.id)}">${esc(a.title)} — due ${esc(a.due_on)}</option>`).join('')}</select>
+    <button onclick="linkHw('${r.id}')">Mark submitted</button></div>`;
+}
+
+async function linkHw(rid) {
+  const aid = document.getElementById('hw-' + rid).value;
+  await fetch(`/assignments/${aid}/complete`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ recording_id: rid }),
+  });
+  document.activeElement?.blur(); // clicked button holds focus in #list — guard would skip re-render
+  refresh();
+}
+
 function progressBar(r) {
   const label = STAGE_LABEL[r.stage] || r.stage || 'working';
   const known = r.progress !== null && r.progress !== undefined;
@@ -659,6 +685,8 @@ async function refresh() {
   // ponytail: don't blow away a label field the user is mid-edit on the 5s tick
   if (document.activeElement && document.getElementById('list').contains(document.activeElement)) return;
   const rows = await (await fetch('/recordings')).json();
+  openAssignments = rows.some(r => r.source === 'homework' && r.status === 'done')
+    ? await (await fetch('/assignments_open')).json() : [];
   updateDatalists(rows);
   const openK = new Set([...document.querySelectorAll('#list details[open]')].map(d => d.dataset.k).filter(Boolean));
   document.getElementById('list').innerHTML = rows.map(r => `
@@ -668,6 +696,7 @@ async function refresh() {
       ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
       ${r.status !== 'error' ? labelEditor(r) : ''}
+      ${r.source === 'homework' && r.status === 'done' ? hwLinker(r) : ''}
       ${r.status === 'done' && r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
       ${r.source === 'syllabus' && r.status === 'done' ? `<p><a href="/assignments/${r.id}.ics">&#128197; Download due dates (.ics) — import into Google Calendar</a></p>` : ''}
       ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
