@@ -829,6 +829,67 @@ def quiz_get(qid: str):
     return sb.table("quizzes").select("*").eq("id", qid).single().execute().data
 
 
+# --- YouTube intake: reference link or full transcription ---
+
+def _is_yt(url):
+    return bool(re.match(r"https?://(www\.)?(youtube\.com|youtu\.be)/", url or ""))
+
+
+def _yt_title(url):
+    """Video title via YouTube's public oEmbed endpoint — no API key."""
+    r = httpx.get("https://www.youtube.com/oembed",
+                  params={"url": url, "format": "json"}, timeout=15)
+    r.raise_for_status()
+    return r.json().get("title") or url
+
+
+def _yt_process(rid, url):
+    """Download bestaudio with yt-dlp, then hand off to the normal whisper
+    pipeline. yt-dlp picks the extension; rename to the .webm path process()
+    expects (ffmpeg sniffs the real container from content)."""
+    try:
+        import yt_dlp
+        opts = {"format": "bestaudio", "quiet": True, "noprogress": True,
+                "outtmpl": str(AUDIO_DIR / f"{rid}.%(ext)s")}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        for f in AUDIO_DIR.glob(f"{rid}.*"):
+            if f.suffix != ".webm":
+                f.rename(audio_path(rid))
+        process(rid)
+    except Exception as e:
+        _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]")
+
+
+@app.post("/upload_yt")
+def upload_yt(payload: dict = Body(...)):
+    """mode='store': file the link as a supplemental reference note (label it
+    via the editor to send it to Obsidian). mode='transcribe': download the
+    audio and run the whisper pipeline like any recording."""
+    url = (payload.get("url") or "").strip()
+    mode = payload.get("mode") if payload.get("mode") in ("store", "transcribe") else "store"
+    if not _is_yt(url):
+        return {"error": "not a YouTube URL"}
+    try:
+        title = _yt_title(url)
+    except Exception:
+        title = url  # oEmbed down/video private — keep the raw link as the title
+    if mode == "store":
+        row = sb.table("recordings").insert({
+            "title": title, "status": "done", "source": "youtube",
+            "transcript": f"Supplemental video: [{title}]({url})",
+            "summary": f"- Reference video — [{title}]({url})",
+        }).execute().data[0]
+        return {"id": row["id"]}
+    row = sb.table("recordings").insert({
+        "title": title, "status": "transcribing", "source": "youtube",
+        "notes": f"Source video: {url}",  # analyze() weaves the link into the summary
+    }).execute().data[0]
+    _set(row["id"], stage="loading_model")
+    threading.Thread(target=_yt_process, args=(row["id"], url), daemon=True).start()
+    return {"id": row["id"]}
+
+
 def _doc_block(data):
     """Claude content block for uploaded course material, sniffed from magic
     bytes: PDF -> native document block, pptx/docx (zip) -> extracted text,
