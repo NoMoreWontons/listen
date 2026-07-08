@@ -418,6 +418,56 @@ def label(rid: str, payload: dict = Body(...)):
     return {"ok": error is None, "obsidian_path": path, "error": error}
 
 
+@app.post("/merge_units")
+def merge_units(payload: dict = Body(...)):
+    """Merges one unit into another within a semester/class: relabels every
+    matching recording and re-files its note (write_note moves it), then
+    removes the old unit's hub note and folder if that emptied it."""
+    sem, cls = payload["semester"], payload["class"]
+    src, dst = payload["from_unit"], payload["to_unit"]
+    if not all([sem, cls, src, dst]) or src == dst:
+        return {"ok": False, "error": "bad merge args"}
+    rows = (sb.table("recordings").select("*").eq("semester", sem)
+            .eq("class", cls).eq("unit", src).execute().data)
+    for row in rows:
+        row["unit"] = dst
+        _set(row["id"], unit=dst)
+        path = write_note(row)  # None for rows without a transcript
+        _set(row["id"], obsidian_path=path)
+    old_dir = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(src)
+    try:
+        hub = old_dir / f"{_slug(src)}.md"
+        if hub.exists():
+            hub.unlink()
+        old_dir.rmdir()  # only succeeds if empty
+        write_graph_config()
+    except OSError:
+        pass  # folder still has user files — leave it
+    return {"ok": True, "moved": len(rows)}
+
+
+def office_text(data, ext=None):
+    """pptx/docx are zips of XML — pull the text runs with stdlib only.
+    ponytail: regex over Office XML, no python-pptx/docx dep; loses tables and
+    layout but the Claude pass restructures to markdown anyway."""
+    import io, re, zipfile
+    z = zipfile.ZipFile(io.BytesIO(data))
+    if ext is None:  # sniff from zip contents when the caller only has bytes
+        ext = "docx" if "word/document.xml" in z.namelist() else "pptx"
+    if ext == "docx":
+        names, tag = ["word/document.xml"], "w:t"
+    else:  # pptx: one xml per slide, sort numerically so slide10 follows slide9
+        names = sorted((n for n in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                       key=lambda n: int(re.search(r"\d+", n).group()))
+        tag = "a:t"
+    parts = []
+    for n in names:
+        xml = z.read(n).decode("utf-8", "replace")
+        parts.append("\n".join(m for m in re.findall(rf"<{tag}[^>]*>([^<]*)</{tag}>", xml) if m.strip()))
+    import html
+    return html.unescape("\n\n".join(parts))
+
+
 @app.post("/ocr")
 async def ocr(request: Request, filename: str = ""):
     """Photo/PDF of handwritten or printed notes -> markdown text for the notes
@@ -434,8 +484,15 @@ async def ocr(request: Request, filename: str = ""):
     elif ext == "pdf":
         block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
                                                 "data": base64.b64encode(data).decode()}}
+    elif ext in ("txt", "md"):
+        return {"text": data.decode("utf-8", "replace").strip()}  # already text — no Claude needed
+    elif ext in ("pptx", "docx"):
+        try:
+            block = {"type": "text", "text": office_text(data, ext)}
+        except Exception:
+            return {"error": f"couldn't read that .{ext} file — is it corrupt?"}
     else:
-        return {"error": f"unsupported file type '.{ext}' — use jpg/png/gif/webp/pdf"}
+        return {"error": f"unsupported file type '.{ext}' — use jpg/png/gif/webp/pdf/pptx/docx/txt/md"}
     try:
         msg = claude.messages.create(
             model="claude-haiku-4-5", max_tokens=3000,
@@ -630,6 +687,12 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False):
     key_points, assignments, tokens_in, tokens_out); assignments is [] unless
     syllabus=True."""
     import base64
+    if pdf_bytes[:4] == b"%PDF":
+        doc_block = {"type": "document",
+                     "source": {"type": "base64", "media_type": "application/pdf",
+                                "data": base64.b64encode(pdf_bytes).decode()}}
+    else:  # pptx/docx (zip magic) — extracted text stands in for the document
+        doc_block = {"type": "text", "text": "The document's extracted text:\n\n" + office_text(pdf_bytes)}
     notes_part = (
         "\nThe student took their own notes on this material. Integrate them "
         "into the summary, giving weight to anything they flagged:\n"
@@ -647,9 +710,7 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False):
         messages=[{
             "role": "user",
             "content": [
-                {"type": "document",
-                 "source": {"type": "base64", "media_type": "application/pdf",
-                            "data": base64.b64encode(pdf_bytes).decode()}},
+                doc_block,
                 {"type": "text", "text": (
                     "This is course material from a college class (lecture slides, "
                     "handout, syllabus, or reading). Return ONLY a JSON object with keys: "
@@ -657,7 +718,8 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False):
                     + (", assignments" if syllabus else "") + ".\n"
                     "- class: the course subject (e.g. 'Biology', 'US History')\n"
                     "- unit: the broader unit/module this material belongs to\n"
-                    "- topic: the specific topic of THIS document (used as the note title)\n"
+                    "- topic: the specific topic of THIS document, 5 words max "
+                    "(used as the note title)\n"
                     "- semester: the term if stated in the document (e.g. 'Fall 26'), else \"\"\n"
                     "- key_points: the document's content distilled as thorough markdown "
                     "notes (this stands in for a transcript)\n"
@@ -709,7 +771,8 @@ def analyze(transcript, notes=""):
                     "Return ONLY a JSON object with keys: class, unit, topic, summary.\n"
                     "- class: the course subject (e.g. 'Biology', 'US History')\n"
                     "- unit: the broader unit/module this lecture belongs to\n"
-                    "- topic: the specific topic of THIS lecture (used as the note title)\n"
+                    "- topic: the specific topic of THIS lecture, 5 words max "
+                    "(used as the note title)\n"
                     "- summary: markdown. First, concise key points and any action items "
                     "as a bullet list — built from the LECTURER's material; ignore student "
                     "chatter unless the lecturer engages it. Then, if any student questions "
@@ -772,6 +835,7 @@ def _note_md(row):
     return (
         f"---\n{front}\n---\n\n"
         f"# {row.get('topic') or row.get('title') or 'Lecture'}\n\n"
+        # strict hierarchy: topic links unit only; unit links class, class links semester
         f"Unit: [[{sem}/{cls}/{unit}/{unit}|{unit}]]\n\n"
         f"## Summary\n\n{row.get('summary') or ''}\n\n"
         f"## Transcript\n\n{row.get('transcript') or ''}\n"
@@ -827,17 +891,42 @@ def ensure_hubs(row):
             f"# {unit}\n\n{desc}\n\nClass: [[{sem}/{cls}/{cls}|{cls}]]\n", encoding="utf-8")
 
 
-def _rgb(h, s, l):
+def _rgb(h, s, v):
     import colorsys
-    r, g, b = colorsys.hls_to_rgb(h % 1.0, l, s)
+    r, g, b = colorsys.hsv_to_rgb(h % 1.0, min(max(s, 0), 1), min(max(v, 0), 1))
     return (int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255)
 
 
+GRAPH_SETTINGS_FILE = pathlib.Path(__file__).with_name("graph_settings.json")
+GRAPH_DEFAULTS = {                 # all fractions of 1; the app UI shows them as %
+    "class_drop_min": 0.20, "class_drop_max": 0.30,  # class hubs: S/V faded this much off full
+    "unit_drop_min": 0.10, "unit_drop_max": 0.30, "unit_hue_shift": 0.10,
+    "topic_drop_min": 0.10, "topic_drop_max": 0.20, "topic_hue_shift": 0.05,
+}
+
+
+def graph_settings():
+    try:
+        saved = json.loads(GRAPH_SETTINGS_FILE.read_text(encoding="utf-8"))
+        return {**GRAPH_DEFAULTS,
+                **{k: min(max(float(saved[k]), 0.0), 1.0) for k in GRAPH_DEFAULTS if k in saved}}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return dict(GRAPH_DEFAULTS)
+
+
 def write_graph_config():
-    """Regenerates Obsidian graph color groups from the vault's folder tree:
-    each semester and class gets its own hue; units are tones of their class
-    hue; topic notes a lighter tone of their unit. Only the colorGroups key of
-    .obsidian/graph.json is touched — other graph settings stay."""
+    """Regenerates Obsidian graph color groups from the vault's folder tree.
+    Semester hubs are white; each class gets its own evenly spaced hue at the
+    configured S/V; unit hubs fade S and V by unit_drop (scaled by hue warmth —
+    warm colors read as more prominent, so they fade harder) with a small hue
+    spread; topic notes fade again off their unit. Knobs come from
+    graph_settings.json (editable in the app's Graph colors card). Only the
+    colorGroups key of .obsidian/graph.json is touched — other settings stay."""
+    import math, zlib
+    st = graph_settings()
+    warmth = lambda h: (math.cos((h % 1.0 - 1 / 12) * 2 * math.pi) + 1) / 2  # 1 at red-orange, 0 at azure
+    drop = lambda lo, hi, h: 1 - (lo + (hi - lo) * warmth(h))
+    jitter = lambda name, rng: ((zlib.crc32(name.encode()) % 2001) / 1000 - 1) * rng  # stable ±rng
     groups = []
     sems = sorted(d for d in OBSIDIAN_VAULT.iterdir()
                   if d.is_dir() and not d.name.startswith("."))
@@ -846,20 +935,25 @@ def write_graph_config():
     n = max(len(classes), 1)
     for i, (sem, c) in enumerate(classes):
         hue = i / n
+        fc = drop(st["class_drop_min"], st["class_drop_max"], hue)  # class S/V, faded off full
         units = sorted(p for p in c.iterdir() if p.is_dir())
-        m = max(len(units), 1)
+        m = len(units)
         for j, u in enumerate(units):
-            tone = 0.28 + 0.22 * j / m       # unit hubs: darker tones of the class hue
+            hu = hue + st["unit_hue_shift"] * (2 * j / (m - 1) - 1 if m > 1 else 0)
+            f = drop(st["unit_drop_min"], st["unit_drop_max"], hue)
+            su, vu = fc * f, fc * f
             rel = f"{sem.name}/{c.name}/{u.name}"
             groups.append({"query": f'path:"{rel}/{u.name}.md"',
-                           "color": {"a": 1, "rgb": _rgb(hue, 0.75, tone)}})
-            groups.append({"query": f'path:"{rel}"',  # topic notes: lighter tone of the unit
-                           "color": {"a": 1, "rgb": _rgb(hue, 0.60, tone + 0.30)}})
+                           "color": {"a": 1, "rgb": _rgb(hu, su, vu)}})
+            ft = drop(st["topic_drop_min"], st["topic_drop_max"], hu)
+            groups.append({"query": f'path:"{rel}"',  # topic notes: another fade off the unit
+                           "color": {"a": 1, "rgb": _rgb(hu + jitter(u.name, st["topic_hue_shift"]),
+                                                         su * ft, vu * ft)}})
         groups.append({"query": f'path:"{sem.name}/{c.name}"',  # class hub + strays
-                       "color": {"a": 1, "rgb": _rgb(hue, 0.90, 0.50)}})
-    for i, sem in enumerate(sems):  # semesters: their own evenly spaced hues, muted
-        groups.append({"query": f'path:"{sem.name}"',
-                       "color": {"a": 1, "rgb": _rgb(i / max(len(sems), 1) + 0.05, 0.35, 0.55)}})
+                       "color": {"a": 1, "rgb": _rgb(hue, fc, fc)}})
+    for sem in sems:
+        groups.append({"query": f'path:"{sem.name}"',  # semester hubs: white
+                       "color": {"a": 1, "rgb": 0xFFFFFF}})
     cfg_p = OBSIDIAN_VAULT / ".obsidian" / "graph.json"
     try:
         cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
@@ -868,6 +962,26 @@ def write_graph_config():
     cfg["colorGroups"] = groups
     cfg_p.parent.mkdir(parents=True, exist_ok=True)
     cfg_p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+@app.get("/graph_settings")
+def get_graph_settings():
+    return graph_settings()
+
+
+@app.post("/graph_settings")
+async def set_graph_settings(request: Request):
+    posted = await request.json()
+    st = graph_settings()
+    for k in GRAPH_DEFAULTS:
+        if k in posted:
+            try:
+                st[k] = min(max(float(posted[k]), 0.0), 1.0)
+            except (TypeError, ValueError):
+                pass
+    GRAPH_SETTINGS_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    write_graph_config()
+    return {"ok": True, **st}
 
 
 def write_note(row):

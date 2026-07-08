@@ -187,6 +187,55 @@
   a.obs { color: inherit; text-decoration: underline dotted; }
   a.obs:hover { text-decoration: underline; }
 
+  /* ---- unit merge panel ---- */
+  .side { display: grid; gap: 1.5rem; align-content: start; }
+  .merge-hint { margin: 0 0 .25rem; font-size: .78rem; color: var(--ink-soft); }
+  .merge-sugg {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: .3rem .6rem; padding: .5rem 0; border-bottom: 1px solid #efe9db; font-size: .85rem;
+  }
+  .merge-sugg em { font-style: normal; font-weight: 600; }
+  .merge-cls {
+    font-family: var(--font-mono); font-size: .68rem;
+    color: var(--ink-soft); margin-left: .45rem;
+  }
+  .merge-actions { display: flex; gap: .35rem; }
+  .merge-sugg button, .merge-manual button {
+    font-family: var(--font-display); font-weight: 600; font-size: .72rem;
+    padding: .3rem .75rem; border: 1px solid var(--card-edge); border-radius: 999px;
+    background: #fffdf8; color: var(--ink); cursor: pointer; white-space: nowrap;
+  }
+  .merge-sugg button:hover, .merge-manual button:hover { background: #f1ecdf; }
+  .merge-manual { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .8rem; }
+  .merge-into { color: var(--ink-soft); }
+  .merge-manual select {
+    flex: 1; min-width: 8rem; max-width: 13rem; font-size: .8rem; padding: .3rem .4rem;
+    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
+  }
+
+  /* ---- graph color settings ---- */
+  #graphCard summary::before { content: "🎨 "; }
+  #graphCard summary { cursor: pointer; }
+  #graphCard .deck-label { display: inline; margin: 0; color: var(--ink-soft); opacity: 1; }
+  #gsLevel {
+    margin: .7rem 0 .3rem; font-size: .8rem; padding: .3rem .4rem;
+    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
+  }
+  .gs-row { display: flex; align-items: center; gap: .6rem; margin: .3rem 0; font-size: .8rem; }
+  .gs-row label { flex: 0 0 9.5rem; }
+  .gs-row input[type="range"] { flex: 1; min-width: 0; accent-color: #837c6c; }
+  .gs-val {
+    flex: 0 0 3.2rem; text-align: right;
+    font-family: var(--font-mono); font-size: .72rem; color: var(--ink-soft);
+  }
+  .gs-note { margin: 0 0 .6rem; font-size: .72rem; color: var(--ink-soft); }
+  #graphCard button {
+    font-family: var(--font-display); font-weight: 600; font-size: .72rem;
+    padding: .3rem .75rem; border: 1px solid var(--card-edge); border-radius: 999px;
+    background: #fffdf8; color: var(--ink); cursor: pointer;
+  }
+  #graphCard button:hover { background: #f1ecdf; }
+
   /* ---- folder tree ---- */
   .folders {
     background: var(--card);
@@ -335,8 +384,8 @@
     </div>
     <div class="deck-group">
       <span class="deck-label">Upload</span>
-      <button id="uploadBtn" class="upload-btn" title="Upload audio or a PDF (or drop it anywhere on the page)">&#8686; Audio / PDF</button>
-      <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg,.pdf" hidden>
+      <button id="uploadBtn" class="upload-btn" title="Upload audio, PDF, PowerPoint, or Word (or drop it anywhere on the page)">&#8686; Audio / Docs</button>
+      <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg,.pdf,.pptx,.docx" hidden>
     </div>
     <div class="deck-group signal">
       <span class="deck-label">Signal</span>
@@ -351,10 +400,35 @@
     <span class="deck-label">Recent</span>
     <div id="list"></div>
   </section>
-  <section class="folders">
-    <span class="deck-label">Library</span>
-    <div id="tree"></div>
-  </section>
+  <div class="side">
+    <section class="folders">
+      <span class="deck-label">Library</span>
+      <div id="tree"></div>
+    </section>
+    <section class="folders" id="merge" hidden></section>
+    <section class="folders" id="graphCard">
+      <details>
+        <summary class="deck-label">Graph colors</summary>
+        <select id="gsLevel" onchange="gsShowLevel()">
+          <option value="class">Class hubs</option>
+          <option value="unit">Unit hubs</option>
+          <option value="topic">Topic notes</option>
+        </select>
+        <div class="gs-sliders">
+          <div class="gs-row" data-level="class"><label>Fade min (cool hues)</label><input type="range" id="gs_class_drop_min" min="0" max="100" oninput="gsVal(this)"><span class="gs-val"></span></div>
+          <div class="gs-row" data-level="class"><label>Fade max (warm hues)</label><input type="range" id="gs_class_drop_max" min="0" max="100" oninput="gsVal(this)"><span class="gs-val"></span></div>
+          <div class="gs-row" data-level="unit"><label>Fade min (cool hues)</label><input type="range" id="gs_unit_drop_min" min="0" max="100" oninput="gsVal(this)"><span class="gs-val"></span></div>
+          <div class="gs-row" data-level="unit"><label>Fade max (warm hues)</label><input type="range" id="gs_unit_drop_max" min="0" max="100" oninput="gsVal(this)"><span class="gs-val"></span></div>
+          <div class="gs-row" data-level="unit"><label>Hue shift &plusmn;</label><input type="range" id="gs_unit_hue_shift" min="0" max="100" oninput="gsVal(this)"><span class="gs-val"></span></div>
+          <div class="gs-row" data-level="topic"><label>Fade min (cool hues)</label><input type="range" id="gs_topic_drop_min" min="0" max="100" oninput="gsVal(this)"><span class="gs-val"></span></div>
+          <div class="gs-row" data-level="topic"><label>Fade max (warm hues)</label><input type="range" id="gs_topic_drop_max" min="0" max="100" oninput="gsVal(this)"><span class="gs-val"></span></div>
+          <div class="gs-row" data-level="topic"><label>Hue shift &plusmn;</label><input type="range" id="gs_topic_hue_shift" min="0" max="100" oninput="gsVal(this)"><span class="gs-val"></span></div>
+        </div>
+        <p class="gs-note">Semester hubs stay white. Fades scale with hue warmth — warm colors calm down more.</p>
+        <button onclick="saveGraphSettings(this)">Save &amp; recolor</button>
+      </details>
+    </section>
+  </div>
 </div>
 
 <script>
@@ -489,20 +563,23 @@ const STAGE_LABEL = { loading_model: 'loading model', transcribing: 'transcribin
 
 function labelEditor(r) {
   const live = r.status !== 'done';
+  const filed = !!r.obsidian_uri;
   const hint = live
     ? '<span class="lbl-hint">set now — files to Obsidian when transcription finishes; Claude fills blanks</span>'
     : '';
-  return `<div class="labels" data-rid="${r.id}">
+  const editor = `<div class="labels" data-rid="${r.id}">
     <input class="lbl-sem"   list="dl-sem"   placeholder="semester" value="${escAttr(r.semester)}">
     <input class="lbl-class" list="dl-class" placeholder="class" value="${escAttr(r.class)}">
     <input class="lbl-unit"  list="dl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
     <input class="lbl-topic" list="dl-topic" placeholder="topic" value="${escAttr(r.topic)}">
     <textarea class="lbl-notes" rows="2"
       placeholder="your notes — woven into the AI summary on save">${esc(r.notes || '')}</textarea>
-    <button onclick="saveLabels('${r.id}')">${live ? 'Save labels' : 'Save to Obsidian'}</button>
-    <button class="ocr-btn" onclick="ocrNotes('${r.id}', this)" title="Photo or PDF of handwritten notes — transcribed into the notes box">&#128247; Add notes from photo/PDF</button>
+    <button onclick="saveLabels('${r.id}')">${filed ? 'Update note' : live ? 'Save labels' : 'Save to Obsidian'}</button>
+    <button class="ocr-btn" onclick="ocrNotes('${r.id}', this)" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the notes box">&#128247; Add notes from file</button>
     ${hint}
   </div>`;
+  // filed already -> tuck the editor away; relabelling moves the note
+  return filed ? `<details class="labels-done" data-k="${r.id}-labels"><summary>Edit labels / note</summary>${editor}</details>` : editor;
 }
 
 const fileInput = document.getElementById('fileInput');
@@ -514,7 +591,7 @@ document.body.addEventListener('drop', e => { e.preventDefault(); uploadFile(e.d
 async function uploadFile(f) {
   if (!f) return;
   let kind = 'audio';
-  if (f.name.toLowerCase().endsWith('.pdf')) {
+  if (/\.(pdf|pptx|docx)$/i.test(f.name)) {
     kind = confirm('Is this a syllabus?\nOK = syllabus (extract due dates to calendar)\nCancel = lecture material') ? 'syllabus' : 'pdf';
   }
   const resp = await (await fetch(`/upload?kind=${kind}&filename=${encodeURIComponent(f.name)}`,
@@ -534,7 +611,7 @@ async function deleteRec(rid) {
 async function ocrNotes(rid, btn) {
   const picker = document.createElement('input');
   picker.type = 'file';
-  picker.accept = 'image/*,.pdf';
+  picker.accept = 'image/*,.pdf,.pptx,.docx,.txt,.md';
   picker.onchange = async () => {
     const f = picker.files[0];
     if (!f) return;
@@ -583,6 +660,7 @@ async function refresh() {
   if (document.activeElement && document.getElementById('list').contains(document.activeElement)) return;
   const rows = await (await fetch('/recordings')).json();
   updateDatalists(rows);
+  const openK = new Set([...document.querySelectorAll('#list details[open]')].map(d => d.dataset.k).filter(Boolean));
   document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
       <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.obsidian_uri ? ` <a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">&#8599; Obsidian</a>` : ''}${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload'))}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
@@ -595,7 +673,10 @@ async function refresh() {
       ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
       ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
     </div>`).join('');
+  for (const d of document.querySelectorAll('#list details[data-k]'))
+    if (openK.has(d.dataset.k)) d.open = true;
   renderTree(rows);
+  renderMerge(rows);
 }
 
 // google-style suggestions while typing labels: native <datalist>, options = existing labels
@@ -631,6 +712,116 @@ function renderTree(rows) {
     ).join(''))
   ).join('');
 }
+
+// ---- unit merge panel: suggests near-duplicate units, lets the user merge any two ----
+function renderMerge(rows) {
+  const panel = document.getElementById('merge');
+  if (document.activeElement && panel.contains(document.activeElement)) return; // mid-pick on the 5s tick
+  const units = {};                       // "sem||cls" -> Set of unit names
+  for (const r of rows) {
+    if (r.status !== 'done' || !r.semester || !r.class || !r.unit) continue;
+    (units[r.semester + '||' + r.class] ??= new Set()).add(r.unit);
+  }
+  const words = u => new Set(u.toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 4).map(w => w.replace(/s$/, '')));
+  const sugg = [];
+  const opts = [];                        // every sem||cls||unit, for the manual selects
+  for (const [k, set] of Object.entries(units)) {
+    const us = [...set].sort();
+    for (const u of us) opts.push(k + '||' + u);
+    for (let i = 0; i < us.length; i++)
+      for (let j = i + 1; j < us.length; j++)
+        if ([...words(us[i])].some(w => words(us[j]).has(w)))
+          sugg.push({ k, a: us[i], b: us[j] });
+  }
+  if (opts.length < 2) { panel.hidden = true; panel.innerHTML = ''; return; }
+  panel.hidden = false;
+  const cls = k => k.split('||')[1];
+  panel.innerHTML = `
+    <span class="deck-label">Merge units</span>
+    ${sugg.length ? '<p class="merge-hint">Possible duplicates:</p>' : ''}
+    ${sugg.map(s => `<div class="merge-sugg">
+      <span><em>${esc(s.a)}</em> &harr; <em>${esc(s.b)}</em><span class="merge-cls">${esc(cls(s.k))}</span></span>
+      <span class="merge-actions">
+        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.a)}" data-to="${escAttr(s.b)}">keep &ldquo;${esc(s.b)}&rdquo;</button>
+        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.b)}" data-to="${escAttr(s.a)}">keep &ldquo;${esc(s.a)}&rdquo;</button>
+      </span>
+    </div>`).join('')}
+    <div class="merge-manual">
+      <select id="mergeFrom" onchange="mergeFromChanged()">${opts.map(o =>
+        `<option value="${escAttr(o)}">${esc(cls(o) + ' / ' + o.split('||')[2])}</option>`).join('')}</select>
+      <span class="merge-into">into</span>
+      <select id="mergeTo"></select>
+      <button onclick="manualMerge()">Merge</button>
+    </div>`;
+  mergeFromChanged();
+}
+
+// delegated: apostrophes in unit names ("Newton's Laws") break inline onclick strings
+document.getElementById('merge').addEventListener('click', e => {
+  const b = e.target.closest('button[data-from]');
+  if (b) doMerge(b.dataset.k, b.dataset.from, b.dataset.to);
+});
+
+function mergeFromChanged() {
+  const from = document.getElementById('mergeFrom').value;
+  const [sem, cls, unit] = from.split('||');
+  const to = document.getElementById('mergeTo');
+  to.innerHTML = [...document.getElementById('mergeFrom').options]
+    .map(o => o.value).filter(v => v !== from && v.startsWith(sem + '||' + cls + '||'))
+    .map(v => `<option value="${escAttr(v)}">${esc(v.split('||')[2])}</option>`).join('');
+}
+
+async function doMerge(k, from, to) {
+  const [semester, klass] = k.split('||');
+  if (!confirm(`Merge unit "${from}" into "${to}" (${klass})? Notes move; the old unit folder is removed.`)) return;
+  const resp = await (await fetch('/merge_units', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ semester, class: klass, from_unit: from, to_unit: to }),
+  })).json();
+  if (!resp.ok) alert(resp.error || 'merge failed');
+  document.activeElement?.blur(); // clicked button holds focus in the panel — guard would skip the re-render
+  await refresh();
+}
+
+function manualMerge() {
+  const from = document.getElementById('mergeFrom').value;
+  const to = document.getElementById('mergeTo').value;
+  if (!to) return;
+  const [sem, cls, unit] = from.split('||');
+  doMerge(sem + '||' + cls, unit, to.split('||')[2]);
+}
+
+// ---- graph color settings card ----
+const GS_KEYS = ['class_drop_min', 'class_drop_max', 'unit_drop_min', 'unit_drop_max', 'unit_hue_shift',
+                 'topic_drop_min', 'topic_drop_max', 'topic_hue_shift'];
+async function loadGraphSettings() {
+  const s = await (await fetch('/graph_settings')).json();
+  for (const k of GS_KEYS) {
+    const el = document.getElementById('gs_' + k);
+    el.value = Math.round(s[k] * 100);
+    gsVal(el);
+  }
+  gsShowLevel();
+}
+function gsVal(input) { input.nextElementSibling.textContent = input.value + '%'; }
+function gsShowLevel() {
+  const level = document.getElementById('gsLevel').value;
+  for (const row of document.querySelectorAll('.gs-row'))
+    row.hidden = row.dataset.level !== level;
+}
+async function saveGraphSettings(btn) {
+  const body = {};
+  for (const k of GS_KEYS) body[k] = (+document.getElementById('gs_' + k).value || 0) / 100;
+  btn.disabled = true;
+  try {
+    const r = await (await fetch('/graph_settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json();
+    if (!r.ok) alert('save failed');
+  } finally { btn.disabled = false; }
+}
+loadGraphSettings();
 
 setInterval(refresh, 5000);
 refresh();
