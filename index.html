@@ -456,7 +456,8 @@
     <section class="folders" id="practice">
       <span class="deck-label">Practice</span>
       <div class="merge-manual">
-        <select id="pClass" onchange="pClassChanged()"></select>
+        <select id="pSem" onchange="pScope()" title="Filter by semester"></select>
+        <select id="pClass" onchange="pScope()"></select>
         <select id="pUnit"></select>
         <select id="pKind">
           <option value="quiz">Quiz — 10 q</option>
@@ -469,7 +470,8 @@
     <section class="folders" id="review">
       <span class="deck-label">Review</span>
       <div class="merge-manual">
-        <select id="rClass" onchange="rClassChanged()"></select>
+        <select id="rSem" onchange="rScope()" title="Filter by semester"></select>
+        <select id="rClass" onchange="rScope()"></select>
         <select id="rUnit"></select>
         <button onclick="genCards(this)">Make cards</button>
         <button onclick="dlCheat()">Cheat sheet</button>
@@ -919,25 +921,39 @@ loadGraphSettings();
 // ---- the quiz being taken lives in #quizArea, which refresh() never touches.
 let quizRows = [];
 
+// Fill a semester>class>unit cascade of <select>s from filed rows.
+// Blank semester = all semesters; blank unit = whole class. Preserves current picks.
+function fillScope(rows, semSel, clsSel, unitSel) {
+  const done = rows.filter(r => r.status === 'done' && r.class);
+  const uniq = arr => [...new Set(arr)].sort();
+  const opt = (v, label) => `<option value="${escAttr(v)}">${esc(label ?? v)}</option>`;
+
+  const sems = uniq(done.filter(r => r.semester).map(r => r.semester));
+  const semCur = semSel.value;
+  semSel.innerHTML = opt('', 'All semesters') + sems.map(s => opt(s)).join('');
+  if (sems.includes(semCur)) semSel.value = semCur;
+
+  const sem = semSel.value;
+  const inSem = done.filter(r => !sem || r.semester === sem);
+  const classes = uniq(inSem.map(r => r.class));
+  const clsCur = clsSel.value;
+  clsSel.innerHTML = classes.map(c => opt(c)).join('');
+  if (classes.includes(clsCur)) clsSel.value = clsCur;
+
+  const cls = clsSel.value;
+  const units = uniq(inSem.filter(r => r.class === cls && r.unit).map(r => r.unit));
+  unitSel.innerHTML = opt('', 'whole class') + units.map(u => opt(u)).join('');
+}
+
 function renderPractice(rows) {
   const card = document.getElementById('practice');
   if (document.activeElement && card.contains(document.activeElement)) return;
-  const classes = [...new Set(rows.filter(r => r.status === 'done' && r.class).map(r => r.class))].sort();
-  const sel = document.getElementById('pClass');
-  const cur = sel.value;
-  sel.innerHTML = classes.map(c => `<option value="${escAttr(c)}">${esc(c)}</option>`).join('');
-  if (classes.includes(cur)) sel.value = cur;
   quizRows = rows;
-  pClassChanged();
+  fillScope(rows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'));
   loadPastQuizzes();
 }
-
-function pClassChanged() {
-  const cls = document.getElementById('pClass').value;
-  const units = [...new Set(quizRows.filter(r => r.status === 'done' && r.class === cls && r.unit)
-    .map(r => r.unit))].sort();
-  document.getElementById('pUnit').innerHTML = '<option value="">whole class</option>'
-    + units.map(u => `<option value="${escAttr(u)}">${esc(u)}</option>`).join('');
+function pScope() {
+  fillScope(quizRows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'));
 }
 
 let pastLoaded = 0;
@@ -954,6 +970,7 @@ async function loadPastQuizzes() {
 
 async function genQuiz(btn) {
   const body = {
+    semester: document.getElementById('pSem').value,
     class: document.getElementById('pClass').value,
     unit: document.getElementById('pUnit').value,
     kind: document.getElementById('pKind').value,
@@ -1044,11 +1061,8 @@ let cardRows = [], cardsDue = [];
 async function renderReview(rows) {
   const card = document.getElementById('review');
   if (document.activeElement && card.contains(document.activeElement)) return;
-  const classes = [...new Set(rows.filter(r => r.status === 'done' && r.class).map(r => r.class))].sort();
-  const sel = document.getElementById('rClass'), cur = sel.value;
-  sel.innerHTML = classes.map(c => `<option value="${escAttr(c)}">${esc(c)}</option>`).join('');
-  if (classes.includes(cur)) sel.value = cur;
-  cardRows = rows; rClassChanged();
+  cardRows = rows;
+  fillScope(rows, document.getElementById('rSem'), document.getElementById('rClass'), document.getElementById('rUnit'));
   let due = [];
   try { const d = await (await fetch('/cards/due')).json(); if (Array.isArray(d)) due = d; } catch {}
   cardsDue = due;  // snapshot for startReview() — avoids serialising cards into an onclick attribute
@@ -1057,14 +1071,15 @@ async function renderReview(rows) {
     ? `<button class="submit" onclick="startReview()">Review ${due.length} due</button>`
     : '<p class="gs-note">No cards due.</p>';
 }
-function rClassChanged() {
-  const cls = document.getElementById('rClass').value;
-  const units = [...new Set(cardRows.filter(r => r.status === 'done' && r.class === cls && r.unit).map(r => r.unit))].sort();
-  document.getElementById('rUnit').innerHTML = '<option value="">whole class</option>'
-    + units.map(u => `<option value="${escAttr(u)}">${esc(u)}</option>`).join('');
+function rScope() {
+  fillScope(cardRows, document.getElementById('rSem'), document.getElementById('rClass'), document.getElementById('rUnit'));
 }
 async function genCards(btn) {
-  const body = { class: document.getElementById('rClass').value, unit: document.getElementById('rUnit').value };
+  const body = {
+    semester: document.getElementById('rSem').value,
+    class: document.getElementById('rClass').value,
+    unit: document.getElementById('rUnit').value,
+  };
   if (!body.class) { alert('record and file some lectures first'); return; }
   btn.disabled = true; btn.textContent = 'making…';
   try {
@@ -1076,9 +1091,12 @@ async function genCards(btn) {
 }
 function dlCheat() {
   const cls = document.getElementById('rClass').value;
-  const unit = document.getElementById('rUnit').value;
   if (!cls) { alert('pick a class'); return; }
-  const qs = new URLSearchParams({ class: cls, unit }).toString();
+  const qs = new URLSearchParams({
+    semester: document.getElementById('rSem').value,
+    class: cls,
+    unit: document.getElementById('rUnit').value,
+  }).toString();
   window.location = '/cheatsheet?' + qs;
 }
 let reviewQueue = [];
