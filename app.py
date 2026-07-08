@@ -344,7 +344,7 @@ async def upload(request: Request, kind: str = "audio", filename: str = ""):
     Raw request body (like /chunk) — multipart would drag in python-multipart."""
     data = await request.body()
     title = pathlib.Path(filename).stem or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    if kind not in ("audio", "pdf", "syllabus"):
+    if kind not in ("audio", "pdf", "syllabus", "homework"):
         return {"error": f"unknown kind '{kind}'"}
     source = "upload_audio" if kind == "audio" else kind
     row = sb.table("recordings").insert(
@@ -681,18 +681,50 @@ def assignments_ics(rid: str):
                     headers={"Content-Disposition": f'attachment; filename="{rid}.ics"'})
 
 
+@app.get("/assignments_open")
+def assignments_open():
+    """Open (not yet submitted) assignments, soonest due first — the homework
+    card's link dropdown."""
+    return (sb.table("assignments").select("*").eq("status", "open")
+            .order("due_on").execute().data)
+
+
+@app.post("/assignments/{aid}/complete")
+def assignment_complete(aid: str, payload: dict = Body(...)):
+    """Mark an assignment submitted, remembering which uploaded homework
+    recording fulfilled it."""
+    sb.table("assignments").update(
+        {"status": "submitted", "homework_id": payload.get("recording_id")}
+    ).eq("id", aid).execute()
+    return {"ok": True}
+
+
+def _doc_block(data):
+    """Claude content block for uploaded course material, sniffed from magic
+    bytes: PDF -> native document block, pptx/docx (zip) -> extracted text,
+    jpeg/png/gif/webp photo (e.g. homework snapshot) -> image block."""
+    import base64
+    if data[:4] == b"%PDF":
+        return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                               "data": base64.b64encode(data).decode()}}
+    if data[:2] == b"PK":  # pptx/docx are zips — extracted text stands in for the document
+        return {"type": "text", "text": "The document's extracted text:\n\n" + office_text(data)}
+    media = ("image/jpeg" if data[:2] == b"\xff\xd8" else
+             "image/png" if data[:4] == b"\x89PNG" else
+             "image/gif" if data[:4] in (b"GIF8",) else
+             "image/webp" if data[:4] == b"RIFF" and data[8:12] == b"WEBP" else None)
+    if media:
+        return {"type": "image", "source": {"type": "base64", "media_type": media,
+                                            "data": base64.b64encode(data).decode()}}
+    raise ValueError("unsupported file type — upload a PDF, pptx, docx, or a jpg/png/gif/webp photo")
+
+
 def analyze_pdf(pdf_bytes, notes="", syllabus=False):
     """One Claude call on a PDF (native document block — no OCR dependency,
     scanned pages included). Returns (summary, semester, class, unit, topic,
     key_points, assignments, tokens_in, tokens_out); assignments is [] unless
     syllabus=True."""
-    import base64
-    if pdf_bytes[:4] == b"%PDF":
-        doc_block = {"type": "document",
-                     "source": {"type": "base64", "media_type": "application/pdf",
-                                "data": base64.b64encode(pdf_bytes).decode()}}
-    else:  # pptx/docx (zip magic) — extracted text stands in for the document
-        doc_block = {"type": "text", "text": "The document's extracted text:\n\n" + office_text(pdf_bytes)}
+    doc_block = _doc_block(pdf_bytes)
     notes_part = (
         "\nThe student took their own notes on this material. Integrate them "
         "into the summary, giving weight to anything they flagged:\n"

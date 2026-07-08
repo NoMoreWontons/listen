@@ -22,7 +22,7 @@ create table recordings (
 create unique index if not exists recordings_notion_id_key
   on recordings (notion_id) where notion_id is not null;
 
--- source also takes 'upload_audio' | 'pdf' | 'syllabus' for uploaded files.
+-- source also takes 'upload_audio' | 'pdf' | 'syllabus' | 'homework' | 'youtube' for uploads.
 
 -- Syllabus due dates. gcal_event_id unused until Calendar API sync (Approach B).
 create table if not exists assignments (
@@ -51,3 +51,19 @@ create table if not exists assignments (
 --   add column if not exists source text default 'local',
 --   add column if not exists notion_id text,
 --   add column if not exists notes text;
+
+-- Homework uploads link to a due date; quizzes store generated practice sets.
+alter table assignments add column if not exists status text default 'open';       -- open | submitted
+alter table assignments add column if not exists homework_id uuid references recordings(id) on delete set null;
+
+create table if not exists quizzes (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz default now(),
+  kind text default 'quiz',              -- quiz (10 q) | test (20 q)
+  semester text,
+  class text not null,
+  unit text,                             -- null = whole class
+  questions jsonb not null,              -- [{type:'mcq'|'short', q, choices?, answer, explanation}]
+  answers jsonb,                         -- graded per-question results, null until submitted
+  score numeric                          -- 0-100, null until submitted
+);
