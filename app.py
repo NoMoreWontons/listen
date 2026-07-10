@@ -1241,7 +1241,7 @@ def analyze(transcript, notes=""):
     ) if (notes or "").strip() else ""
     msg = claude.messages.create(
         model="claude-haiku-4-5",
-        max_tokens=1500,
+        max_tokens=6000,  # multi-segment replies carry one full summary per topic
         messages=[
             {
                 "role": "user",
@@ -1249,10 +1249,16 @@ def analyze(transcript, notes=""):
                     "This is a college lecture transcript from a single microphone — "
                     "speakers are not labelled. Infer who is speaking from content: "
                     "the lecturer teaches; students ask questions or answer prompts.\n"
-                    "A lecture is normally ONE topic — treat it as a single segment "
-                    "unless it clearly moves through multiple distinct topics, each "
-                    "substantial enough to stand as its own note (don't split off a "
-                    "two-minute aside).\n"
+                    "First, check whether the lecture moves between distinct topics: "
+                    "a new segment starts when the lecturer finishes one concept and "
+                    "moves to a genuinely different one that a student would file as "
+                    "its own note (e.g. 'derivatives of inverse functions' then "
+                    "'applications of derivatives'). Segments are CONCEPTS, not "
+                    "examples: several worked problems, asides, or recaps on the same "
+                    "concept all belong to one segment, and a run of small topics that "
+                    "share a theme is ONE segment covering that theme (e.g. assorted "
+                    "application problems = one 'Applications of Derivatives' segment). "
+                    "Most lectures are 1 segment, sometimes 2 — NEVER more than 3.\n"
                     "Return ONLY a JSON object with key: segments — an array of one "
                     "object per topic segment, each with keys class, unit, topic, "
                     "summary.\n"
