@@ -3,7 +3,7 @@ create table recordings (
   id uuid primary key default gen_random_uuid(),
   title text,
   created_at timestamptz default now(),
-  status text not null default 'recording',  -- recording | transcribing | done | error
+  status text not null default 'recording',  -- recording | transcribing | done | error | split_pending
   transcript text,
   summary text,
   stage text,        -- loading_model | transcribing | summarizing, null when not in progress
@@ -17,7 +17,8 @@ create table recordings (
   obsidian_path text,  -- absolute path of the written .md note, null until filed
   source text default 'local',  -- 'local' (whisper) or 'notion' (AI meeting notes)
   notion_id text,      -- source Notion page id, dedup key for the poller
-  notes text           -- user's own notes, integrated into the Claude summary
+  notes text,          -- user's own notes, integrated into the Claude summary
+  pending_segments jsonb  -- proposed [{class,unit,topic,summary}, ...] while status='split_pending'
 );
 create unique index if not exists recordings_notion_id_key
   on recordings (notion_id) where notion_id is not null;
@@ -83,3 +84,8 @@ create table if not exists cards (
   ease numeric default 2.5                -- SM-2 ease factor (floor 1.3)
 );
 alter table cards enable row level security;   -- match quizzes/recordings; app uses the service key
+
+-- Multi-topic split: a lecture that covers several distinct topics proposes
+-- one segment per topic and waits (status='split_pending') for the user to
+-- approve/decline via POST /split before filing.
+alter table recordings add column if not exists pending_segments jsonb;

@@ -344,10 +344,23 @@
     color: var(--ink-soft); font-size: .85rem; padding: .1rem .3rem;
   }
   .rec .del:hover { color: #a8331f; }
-  .status[data-s="recording"]    { background: #fbe4e0; color: #a8331f; }
-  .status[data-s="transcribing"] { background: #f7e8cf; color: #93670f; }
-  .status[data-s="done"]         { background: #dcf0ea; color: #226e5b; }
-  .status[data-s="error"]        { background: #f4d9d9; color: #8f2323; }
+  .status[data-s="recording"]     { background: #fbe4e0; color: #a8331f; }
+  .status[data-s="transcribing"]  { background: #f7e8cf; color: #93670f; }
+  .status[data-s="done"]          { background: #dcf0ea; color: #226e5b; }
+  .status[data-s="error"]         { background: #f4d9d9; color: #8f2323; }
+  .status[data-s="split_pending"] { background: #f7e0b8; color: #8a5a10; }
+
+  .split-seg { padding: .5rem 0; border-bottom: 1px solid #efe9db; font-size: .85rem; }
+  .split-seg:last-of-type { border-bottom: none; }
+  .split-seg p { margin: .2rem 0 0; color: var(--ink-soft); font-size: .8rem; }
+  .split-actions { display: flex; gap: .5rem; margin-top: .7rem; }
+  .split-actions button {
+    font-family: var(--font-display); font-weight: 600; font-size: .78rem;
+    padding: .35rem .8rem; border: 0; border-radius: 6px; cursor: pointer;
+    background: var(--amber); color: #3a2c00;
+  }
+  .split-actions button:last-child { background: #e9e4d6; color: var(--ink); }
+  .split-actions button:disabled { opacity: .6; cursor: default; }
 
   .progress { margin-top: .65rem; }
   .bar { height: 6px; border-radius: 999px; background: #e9e4d6; overflow: hidden; }
@@ -640,6 +653,33 @@ function labelEditor(r) {
   return filed ? `<details class="labels-done" data-k="${r.id}-labels"><summary>Edit labels / note</summary>${editor}</details>` : editor;
 }
 
+function splitCard(r) {
+  const segs = r.pending_segments || [];
+  const preview = s => esc((s.summary || '').slice(0, 120)) + ((s.summary || '').length > 120 ? '…' : '');
+  return `<div class="split-card" data-rid="${r.id}">
+    <p class="lbl-hint">This recording covers multiple topics — file as separate notes?</p>
+    ${segs.map(s => `<div class="split-seg">
+      <b>${esc(s.topic || '')}</b> — ${esc(s.class || '')} / ${esc(s.unit || '')}
+      <p>${preview(s)}</p>
+    </div>`).join('')}
+    <div class="split-actions">
+      <button onclick="doSplit('${r.id}', true, this)">Split into ${segs.length} notes</button>
+      <button onclick="doSplit('${r.id}', false, this)">Keep as one</button>
+    </div>
+  </div>`;
+}
+
+async function doSplit(rid, approve, btn) {
+  for (const b of btn.parentElement.querySelectorAll('button')) b.disabled = true;
+  const resp = await (await fetch(`/split/${rid}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ approve }),
+  })).json();
+  if (resp.error) alert(resp.error);
+  document.activeElement?.blur(); // clicked button holds focus in #list — guard would skip the re-render
+  refresh();
+}
+
 const fileInput = document.getElementById('fileInput');
 document.getElementById('uploadBtn').onclick = () => fileInput.click();
 fileInput.onchange = () => { uploadFile(fileInput.files[0]); fileInput.value = ''; };
@@ -764,7 +804,7 @@ async function refresh() {
       ${r.status === 'transcribing' ? progressBar(r) : ''}
       ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
-      ${r.status !== 'error' ? labelEditor(r) : ''}
+      ${r.status === 'split_pending' ? splitCard(r) : r.status !== 'error' ? labelEditor(r) : ''}
       ${r.source === 'homework' && r.status === 'done' ? hwLinker(r) : ''}
       ${r.status === 'done' && r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
       ${r.source === 'syllabus' && r.status === 'done' ? `<p><a href="/assignments/${r.id}.ics">&#128197; Download due dates (.ics) — import into Google Calendar</a></p>` : ''}
