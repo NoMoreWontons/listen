@@ -410,7 +410,9 @@ def label(rid: str, payload: dict = Body(...)):
             and notes.strip() != (old.get("notes") or "").strip()):
         try:
             segments, tokens_in, tokens_out = analyze(old["transcript"], notes)
-            _set(rid, summary=segments[0]["summary"], tokens_in=tokens_in, tokens_out=tokens_out)
+            # row is already filed — a multi-segment reply here just folds into one summary
+            summary = segments[0]["summary"] if len(segments) == 1 else _segments_summary(segments)
+            _set(rid, summary=summary, tokens_in=tokens_in, tokens_out=tokens_out)
         except Exception as e:
             error = f"notes saved, but re-summarize failed: {e}"
     row = sb.table("recordings").select("*").eq("id", rid).single().execute().data
@@ -659,6 +661,7 @@ def split(rid: str, payload: dict = Body(...)):
 
     for seg in segments[1:]:
         new_row = sb.table("recordings").insert({
+            "title": seg.get("topic", ""),  # list header shows title; new rows have no recording title
             "created_at": row.get("created_at"), "semester": row.get("semester"),
             "source": row.get("source"), "transcript": row.get("transcript"),
             "status": "done", "class": seg.get("class", ""), "unit": seg.get("unit", ""),
