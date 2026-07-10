@@ -100,6 +100,12 @@
 
   #controls { display: flex; align-items: center; gap: 1rem; }
 
+  /* universal click/hover feedback for every button; specific rules below still win on color */
+  button { transition: transform .1s ease, filter .15s ease; }
+  button:hover { filter: brightness(1.15); }
+  button:active { transform: translateY(1px) scale(.98); filter: brightness(.95); }
+  @media (prefers-reduced-motion: reduce) { button:active { transform: none; } }
+
   button#btn, button.upload-btn {
     font-family: var(--font-display);
     font-weight: 600;
