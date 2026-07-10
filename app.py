@@ -380,7 +380,8 @@ def recordings():
     rows = (
         sb.table("recordings")
         .select("id,title,created_at,status,transcript,summary,stage,progress,"
-                "tokens_in,tokens_out,semester,class,unit,topic,obsidian_path,source,notes")
+                "tokens_in,tokens_out,semester,class,unit,topic,obsidian_path,source,notes,"
+                "pending_segments")
         .order("created_at", desc=True)
         .execute()
         .data
@@ -408,8 +409,8 @@ def label(rid: str, payload: dict = Body(...)):
             and (old.get("transcript") or "").strip()
             and notes.strip() != (old.get("notes") or "").strip()):
         try:
-            summary, *_, tokens_in, tokens_out = analyze(old["transcript"], notes)
-            _set(rid, summary=summary, tokens_in=tokens_in, tokens_out=tokens_out)
+            segments, tokens_in, tokens_out = analyze(old["transcript"], notes)
+            _set(rid, summary=segments[0]["summary"], tokens_in=tokens_in, tokens_out=tokens_out)
         except Exception as e:
             error = f"notes saved, but re-summarize failed: {e}"
     row = sb.table("recordings").select("*").eq("id", rid).single().execute().data
@@ -566,22 +567,37 @@ def process(rid):
 
 def finalize(rid, transcript, created_at=None):
     """Shared tail for any transcript source (whisper, upload, or Notion):
-    summarize + label with Claude, write the row done, file the Obsidian note.
+    summarize + label with Claude, then either write the row done and file
+    the Obsidian note (single topic), or park it split_pending with the
+    proposed segments for the user to confirm via /split (multiple topics).
     The row's own source value is preserved."""
     _set(rid, stage="summarizing", progress=100)
     # honor labels/notes the user set live/before stop; Claude only fills the blanks
     pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source")
            .eq("id", rid).single().execute().data or {})
     keep = lambda k, v: (pre.get(k) or "").strip() or v
-    summary, cls, unit, topic, tokens_in, tokens_out = analyze(transcript, pre.get("notes") or "")
+    segments, tokens_in, tokens_out = analyze(transcript, pre.get("notes") or "")
 
     created_at = created_at or datetime.datetime.now().isoformat()
+
+    if len(segments) > 1:
+        pre_class = (pre.get("class") or "").strip()
+        if pre_class:  # user already told us the class — it applies to every segment
+            for seg in segments:
+                seg["class"] = pre_class
+        _set(rid, status="split_pending", stage=None, progress=None,
+             transcript=transcript, tokens_in=tokens_in, tokens_out=tokens_out,
+             semester=keep("semester", _semester(created_at)),
+             pending_segments=segments, source=pre.get("source") or "local")
+        return
+
+    seg = segments[0]
     fields = {
         "status": "done", "stage": None, "progress": None,
-        "transcript": transcript, "summary": summary,
+        "transcript": transcript, "summary": seg["summary"],
         "semester": keep("semester", _semester(created_at)),
-        "class": keep("class", cls), "unit": keep("unit", unit),
-        "topic": keep("topic", topic),
+        "class": keep("class", seg["class"]), "unit": keep("unit", seg["unit"]),
+        "topic": keep("topic", seg["topic"]),
         "tokens_in": tokens_in, "tokens_out": tokens_out,
         "source": pre.get("source") or "local",
     }
@@ -592,6 +608,68 @@ def finalize(rid, transcript, created_at=None):
     path = write_note(row)
     if path:
         _set(rid, obsidian_path=path)
+
+
+def _segments_summary(segments):
+    """Concatenates segment summaries under '## <topic>' headers — the
+    'keep as one' note shape for a lecture that proposed a split but the user
+    declined it. Pure/testable, mirrors build_cheatsheet's style."""
+    return "\n\n".join(f"## {s.get('topic', '')}\n\n{s.get('summary', '')}" for s in segments)
+
+
+@app.post("/split/{rid}")
+def split(rid: str, payload: dict = Body(...)):
+    """User's answer to a multi-topic split proposal (see finalize()).
+    approve=true: the original row becomes segment 1 (updated in place, keeps
+    its audio file); each further segment is inserted as a new row sharing
+    created_at/semester/source/transcript, with its own class/unit/topic/
+    summary, status='done'. Every row gets its own Obsidian note.
+    approve=false: file one note, today's shape — labels from segment 1,
+    summaries concatenated under '## <topic>' headers. Either way,
+    pending_segments is cleared."""
+    rows = sb.table("recordings").select("*").eq("id", rid).execute().data
+    row = rows[0] if rows else None
+    if not row or row.get("status") != "split_pending":
+        return {"error": "not pending"}
+    segments = row.get("pending_segments") or []
+    seg0 = segments[0] if segments else {}
+
+    if not payload.get("approve"):
+        fields = {
+            "status": "done", "class": seg0.get("class", ""), "unit": seg0.get("unit", ""),
+            "topic": seg0.get("topic", ""), "summary": _segments_summary(segments),
+            "pending_segments": None,
+        }
+        _set(rid, **fields)
+        path = write_note({**row, **fields})
+        if path:
+            _set(rid, obsidian_path=path)
+        return {"ok": True, "rows": [rid]}
+
+    fields0 = {
+        "status": "done", "class": seg0.get("class", ""), "unit": seg0.get("unit", ""),
+        "topic": seg0.get("topic", ""), "summary": seg0.get("summary", ""),
+        "pending_segments": None,
+    }
+    _set(rid, **fields0)
+    path = write_note({**row, **fields0})
+    if path:
+        _set(rid, obsidian_path=path)
+    ids = [rid]
+
+    for seg in segments[1:]:
+        new_row = sb.table("recordings").insert({
+            "created_at": row.get("created_at"), "semester": row.get("semester"),
+            "source": row.get("source"), "transcript": row.get("transcript"),
+            "status": "done", "class": seg.get("class", ""), "unit": seg.get("unit", ""),
+            "topic": seg.get("topic", ""), "summary": seg.get("summary", ""),
+        }).execute().data[0]
+        path = write_note(new_row)
+        if path:
+            _set(new_row["id"], obsidian_path=path)
+        ids.append(new_row["id"])
+
+    return {"ok": True, "rows": ids}
 
 
 def process_pdf(rid):
@@ -1123,13 +1201,36 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False):
     return (*parts, msg.usage.input_tokens, msg.usage.output_tokens)
 
 
+def _parse_segments(raw):
+    """Parses analyze()'s {"segments": [...]} JSON reply into a list of
+    {class, unit, topic, summary} dicts. Pure — no network/DB — so it's
+    directly testable. Falls back to one segment holding the raw text as the
+    summary, Unsorted/Untitled labels, if the JSON is unparseable or empty —
+    mirrors the pre-split single-object fallback."""
+    try:
+        segments = json.loads(raw).get("segments") or []
+        if not segments:
+            raise ValueError("empty segments")
+        return [
+            {"class": s.get("class", ""), "unit": s.get("unit", ""),
+             "topic": s.get("topic", ""), "summary": s.get("summary", "")}
+            for s in segments
+        ]
+    except (json.JSONDecodeError, AttributeError, ValueError):
+        # ponytail: model ignored the JSON ask — keep its text as the summary,
+        # drop into an Unsorted bucket the user can re-file from the UI.
+        return [{"class": "Unsorted", "unit": "Unsorted", "topic": "Untitled", "summary": raw}]
+
+
 def analyze(transcript, notes=""):
-    """One Claude call: summary + college-lecture labels (class/unit/topic).
-    User notes, when present, are woven into the summary rather than kept
-    as a separate section. Returns (summary, class, unit, topic, tokens_in,
-    tokens_out)."""
+    """One Claude call: splits the lecture into topic segments — almost always
+    just one — and produces college-lecture labels (class/unit/topic) +
+    summary per segment. User notes, when present, are woven into the summary
+    rather than kept as a separate section. Returns (segments, tokens_in,
+    tokens_out); segments is a non-empty list of {class, unit, topic, summary}
+    dicts."""
     if not transcript:
-        return "", "", "", "", 0, 0
+        return [{"class": "", "unit": "", "topic": "", "summary": ""}], 0, 0
     notes_part = (
         "\nThe student took their own notes during this lecture. Integrate them "
         "into the summary, giving weight to anything they flagged:\n"
@@ -1145,17 +1246,24 @@ def analyze(transcript, notes=""):
                     "This is a college lecture transcript from a single microphone — "
                     "speakers are not labelled. Infer who is speaking from content: "
                     "the lecturer teaches; students ask questions or answer prompts.\n"
-                    "Return ONLY a JSON object with keys: class, unit, topic, summary.\n"
+                    "A lecture is normally ONE topic — treat it as a single segment "
+                    "unless it clearly moves through multiple distinct topics, each "
+                    "substantial enough to stand as its own note (don't split off a "
+                    "two-minute aside).\n"
+                    "Return ONLY a JSON object with key: segments — an array of one "
+                    "object per topic segment, each with keys class, unit, topic, "
+                    "summary.\n"
                     "- class: the course subject (e.g. 'Biology', 'US History')\n"
-                    "- unit: the broader unit/module this lecture belongs to\n"
-                    "- topic: the specific topic of THIS lecture, 5 words max "
+                    "- unit: the broader unit/module this segment belongs to\n"
+                    "- topic: the specific topic of THIS segment, 5 words max "
                     "(used as the note title)\n"
                     "- summary: markdown. First, concise key points and any action items "
                     "as a bullet list — built from the LECTURER's material; ignore student "
                     "chatter unless the lecturer engages it. Then, if any student questions "
-                    "or lecturer prompts occurred, append a '## Questions & answers' section: "
-                    "one bullet per exchange, '**Q:** …' then '**A:** …' with the lecturer's "
-                    "response (or '*unanswered*'). Omit the section if there were none.\n"
+                    "or lecturer prompts occurred during this segment, append a "
+                    "'## Questions & answers' section: one bullet per exchange, '**Q:** …' "
+                    "then '**A:** …' with the lecturer's response (or '*unanswered*'). Omit "
+                    "the section if there were none.\n"
                     + notes_part + "\nTranscript:\n" + transcript
                 ),
             }
@@ -1163,15 +1271,8 @@ def analyze(transcript, notes=""):
     )
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
-    try:
-        d = json.loads(raw)
-        summary = d.get("summary", "")
-        cls, unit, topic = d.get("class", ""), d.get("unit", ""), d.get("topic", "")
-    except (json.JSONDecodeError, AttributeError):
-        # ponytail: model ignored the JSON ask — keep its text as the summary,
-        # drop into an Unsorted bucket the user can re-file from the UI.
-        summary, cls, unit, topic = raw, "Unsorted", "Unsorted", "Untitled"
-    return summary, cls, unit, topic, msg.usage.input_tokens, msg.usage.output_tokens
+    segments = _parse_segments(raw)
+    return segments, msg.usage.input_tokens, msg.usage.output_tokens
 
 
 def _semester(iso_date):
