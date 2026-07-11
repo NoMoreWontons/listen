@@ -449,6 +449,25 @@ def merge_units(payload: dict = Body(...)):
     return {"ok": True, "moved": len(rows)}
 
 
+@app.post("/merge_topics")
+def merge_topics(payload: dict = Body(...)):
+    """Merges one topic into another within a semester/class/unit: relabels
+    every matching recording and re-files its note (write_note moves the file
+    off the old topic name; same-named notes disambiguate with a rid suffix)."""
+    sem, cls, unit = payload["semester"], payload["class"], payload["unit"]
+    src, dst = payload["from_topic"], payload["to_topic"]
+    if not all([sem, cls, unit, src, dst]) or src == dst:
+        return {"ok": False, "error": "bad merge args"}
+    rows = (sb.table("recordings").select("*").eq("semester", sem)
+            .eq("class", cls).eq("unit", unit).eq("topic", src).execute().data)
+    for row in rows:
+        row["topic"] = dst
+        _set(row["id"], topic=dst)
+        path = write_note(row)  # None for rows without a transcript
+        _set(row["id"], obsidian_path=path)
+    return {"ok": True, "moved": len(rows)}
+
+
 def office_text(data, ext=None):
     """pptx/docx are zips of XML — pull the text runs with stdlib only.
     ponytail: regex over Office XML, no python-pptx/docx dep; loses tables and
@@ -580,13 +599,18 @@ def finalize(rid, transcript, created_at=None):
     keep = lambda k, v: (pre.get(k) or "").strip() or v
     segments, tokens_in, tokens_out = analyze(transcript, pre.get("notes") or "")
 
+    pre_class = (pre.get("class") or "").strip()
+    if pre_class:  # user already told us the class — it applies to every segment
+        for seg in segments:
+            seg["class"] = pre_class
+    # snap to existing labels so 'part 2' lectures land in the same unit/topic
+    done = (sb.table("recordings").select("class,unit,topic")
+            .eq("status", "done").execute().data)
+    segments = _snap_labels(segments, done)
+
     created_at = created_at or datetime.datetime.now().isoformat()
 
     if len(segments) > 1:
-        pre_class = (pre.get("class") or "").strip()
-        if pre_class:  # user already told us the class — it applies to every segment
-            for seg in segments:
-                seg["class"] = pre_class
         _set(rid, status="split_pending", stage=None, progress=None,
              transcript=transcript, tokens_in=tokens_in, tokens_out=tokens_out,
              semester=keep("semester", _semester(created_at)),
@@ -1223,6 +1247,48 @@ def _parse_segments(raw):
         # ponytail: model ignored the JSON ask — keep its text as the summary,
         # drop into an Unsorted bucket the user can re-file from the UI.
         return [{"class": "Unsorted", "unit": "Unsorted", "topic": "Untitled", "summary": raw}]
+
+
+def _norm_words(s):
+    """Lowercase word set for fuzzy label matching: drops tiny words,
+    strips a trailing 's' so 'Derivatives' matches 'derivative'."""
+    return {w.rstrip("s") for w in re.findall(r"[a-z0-9]+", (s or "").lower()) if len(w) >= 3}
+
+
+def _closest(name, existing):
+    """The existing label whose word set best overlaps name's (Jaccard),
+    or None when nothing clears the bar — exact matches trivially win."""
+    w = _norm_words(name)
+    best, score = None, 0.0
+    for e in existing:
+        ew = _norm_words(e)
+        j = len(w & ew) / len(w | ew) if (w or ew) else 0.0
+        if j > score:
+            best, score = e, j
+    return best if score >= 0.6 else None
+
+
+def _snap_labels(segments, rows):
+    """Snaps each segment's class/unit/topic to the closest existing label
+    (rows = done recordings' class/unit/topic dicts), so a lecture continuing
+    a topic in another session files into the same folders/note name instead
+    of a near-duplicate ('Implicit Differentiation Part 2' -> 'Implicit
+    Differentiation'). Pure — testable without DB. Mutates and returns
+    segments."""
+    for seg in segments:
+        c = _closest(seg.get("class"), {r["class"] for r in rows if r.get("class")})
+        if c:
+            seg["class"] = c
+        u = _closest(seg.get("unit"), {r["unit"] for r in rows
+                                       if r.get("class") == seg["class"] and r.get("unit")})
+        if u:
+            seg["unit"] = u
+        t = _closest(seg.get("topic"), {r["topic"] for r in rows
+                                        if r.get("class") == seg["class"]
+                                        and r.get("unit") == seg["unit"] and r.get("topic")})
+        if t:
+            seg["topic"] = t
+    return segments
 
 
 def analyze(transcript, notes=""):
