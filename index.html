@@ -870,7 +870,7 @@ function renderTree(rows) {
   const topicHtml = (r, sem, cls, unit) => {
     // drag/merge only wired for rows that actually carry a topic label
     const attrs = r.topic
-      ? `draggable="true" data-kind="topic" data-k="${escAttr(sem + '||' + cls + '||' + unit)}" data-name="${escAttr(r.topic)}"`
+      ? `draggable="true" data-kind="topic" data-k="${escAttr(sem + '||' + cls)}" data-name="${escAttr(unit + '||' + r.topic)}"`
       : '';
     const label = r.obsidian_uri
       ? `<a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">${esc(r.topic || r.title || 'untitled')}</a>`
@@ -923,7 +923,7 @@ treeEl.addEventListener('drop', e => {
   if (!canDrop(dragItem, target)) return;
   e.preventDefault();
   e.stopPropagation(); // don't let the page-level file-drop handler also fire
-  doMerge(dragItem.k, dragItem.name, target.name);
+  doMerge(dragItem.kind, dragItem.k, dragItem.name, target.name);
 });
 treeEl.addEventListener('dragend', () => {
   // fires on both a completed drop and a cancelled drag — always clear
@@ -957,13 +957,15 @@ function setMergeLevel(l) {
 function renderMerge(rows) {
   const panel = document.getElementById('merge');
   if (document.activeElement && panel.contains(document.activeElement)) return; // mid-pick on the 5s tick
-  const groups = {};   // labels above the merge level ("sem||cls" or "sem||cls||unit") -> Set of names at it
+  const groups = {};   // "sem||cls" -> Set of unit names (unit level) or "unit||topic" composites (topic level, class-wide)
   for (const r of rows) {
     if (r.status !== 'done' || !r.semester || !r.class || !r.unit) continue;
     if (mergeLevel === 'unit') (groups[r.semester + '||' + r.class] ??= new Set()).add(r.unit);
-    else if (r.topic) (groups[r.semester + '||' + r.class + '||' + r.unit] ??= new Set()).add(r.topic);
+    else if (r.topic) (groups[r.semester + '||' + r.class] ??= new Set()).add(r.unit + '||' + r.topic);
   }
   const words = u => new Set(u.toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 4).map(w => w.replace(/s$/, '')));
+  const cmp = u => mergeLevel === 'topic' ? u.split('||')[1] : u;         // dupe-compare on topic name only, ignore unit
+  const dn = u => mergeLevel === 'topic' ? u.split('||').join(' / ') : u; // display: "unit / topic" or plain unit
   const sugg = [];
   const opts = [];                        // every full key, for the manual selects
   for (const [k, set] of Object.entries(groups)) {
@@ -971,7 +973,7 @@ function renderMerge(rows) {
     for (const u of us) opts.push(k + '||' + u);
     for (let i = 0; i < us.length; i++)
       for (let j = i + 1; j < us.length; j++)
-        if ([...words(us[i])].some(w => words(us[j]).has(w)))
+        if ([...words(cmp(us[i]))].some(w => words(cmp(us[j])).has(w)))
           sugg.push({ k, a: us[i], b: us[j] });
   }
   const ctx = k => k.split('||').slice(1).join(' / ');  // context label without the semester
@@ -982,13 +984,13 @@ function renderMerge(rows) {
       <button class="${mergeLevel === 'unit' ? 'on' : ''}" onclick="setMergeLevel('unit')">Units</button>
       <button class="${mergeLevel === 'topic' ? 'on' : ''}" onclick="setMergeLevel('topic')">Topics</button>
     </div>
-    ${opts.length < 2 ? `<p class="merge-hint">Nothing to merge — need two ${mergeLevel}s under the same ${mergeLevel === 'unit' ? 'class' : 'unit'}.</p>` : `
+    ${opts.length < 2 ? `<p class="merge-hint">Nothing to merge — need two ${mergeLevel}s under the same class.</p>` : `
     ${sugg.length ? '<p class="merge-hint">Possible duplicates:</p>' : ''}
     ${sugg.map(s => `<div class="merge-sugg">
-      <span><em>${esc(s.a)}</em> &harr; <em>${esc(s.b)}</em><span class="merge-cls">${esc(ctx(s.k))}</span></span>
+      <span><em>${esc(dn(s.a))}</em> &harr; <em>${esc(dn(s.b))}</em><span class="merge-cls">${esc(ctx(s.k))}</span></span>
       <span class="merge-actions">
-        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.a)}" data-to="${escAttr(s.b)}">keep &ldquo;${esc(s.b)}&rdquo;</button>
-        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.b)}" data-to="${escAttr(s.a)}">keep &ldquo;${esc(s.a)}&rdquo;</button>
+        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.a)}" data-to="${escAttr(s.b)}">keep &ldquo;${esc(dn(s.b))}&rdquo;</button>
+        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.b)}" data-to="${escAttr(s.a)}">keep &ldquo;${esc(dn(s.a))}&rdquo;</button>
       </span>
     </div>`).join('')}
     <div class="merge-manual">
@@ -1004,25 +1006,33 @@ function renderMerge(rows) {
 // delegated: apostrophes in unit names ("Newton's Laws") break inline onclick strings
 document.getElementById('merge').addEventListener('click', e => {
   const b = e.target.closest('button[data-from]');
-  if (b) doMerge(b.dataset.k, b.dataset.from, b.dataset.to);
+  if (b) doMerge(mergeLevel, b.dataset.k, b.dataset.from, b.dataset.to);
 });
 
 function mergeFromChanged() {
   const from = document.getElementById('mergeFrom').value;
-  const k = from.split('||').slice(0, -1).join('||');   // siblings share everything above the level
+  const n = mergeLevel === 'unit' ? 1 : 2;   // topic values carry an extra unit segment ("unit||topic")
+  const scope = v => v.split('||').slice(0, -n).join('||');  // siblings share everything above this
+  const name = v => v.split('||').slice(-n).join(' / ');
+  const k = scope(from);
   const to = document.getElementById('mergeTo');
   to.innerHTML = [...document.getElementById('mergeFrom').options]
-    .map(o => o.value).filter(v => v !== from && v.split('||').slice(0, -1).join('||') === k)
-    .map(v => `<option value="${escAttr(v)}">${esc(v.split('||').pop())}</option>`).join('');
+    .map(o => o.value).filter(v => v !== from && scope(v) === k)
+    .map(v => `<option value="${escAttr(v)}">${esc(name(v))}</option>`).join('');
 }
 
-async function doMerge(k, from, to) {
-  const parts = k.split('||');            // sem||cls (unit merge) or sem||cls||unit (topic merge)
-  const level = parts.length === 2 ? 'unit' : 'topic';
-  if (!confirm(`Merge ${level} "${from}" into "${to}" (${parts.slice(1).join(' / ')})? Notes move${level === 'unit' ? '; the old unit folder is removed' : ''}.`)) return;
-  const body = level === 'unit'
-    ? { semester: parts[0], class: parts[1], from_unit: from, to_unit: to }
-    : { semester: parts[0], class: parts[1], unit: parts[2], from_topic: from, to_topic: to };
+async function doMerge(level, k, from, to) {
+  const [sem, cls] = k.split('||');   // k is always "sem||cls" now — class-scoped for both levels
+  let body, msg;
+  if (level === 'unit') {
+    body = { semester: sem, class: cls, from_unit: from, to_unit: to };
+    msg = `Merge unit "${from}" into "${to}" (${cls})? Notes move; the old unit folder is removed.`;
+  } else {
+    const [fu, ft] = from.split('||'), [tu, tt] = to.split('||');
+    body = { semester: sem, class: cls, from_unit: fu, from_topic: ft, to_unit: tu, to_topic: tt };
+    msg = `Merge topic "${ft}" (${fu}) into "${tt}" (${tu})?`;
+  }
+  if (!confirm(msg)) return;
   const resp = await (await fetch(level === 'unit' ? '/merge_units' : '/merge_topics', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -1036,8 +1046,9 @@ function manualMerge() {
   const from = document.getElementById('mergeFrom').value;
   const to = document.getElementById('mergeTo').value;
   if (!to) return;
+  const n = mergeLevel === 'unit' ? 1 : 2;
   const parts = from.split('||');
-  doMerge(parts.slice(0, -1).join('||'), parts.at(-1), to.split('||').pop());
+  doMerge(mergeLevel, parts.slice(0, -n).join('||'), parts.slice(-n).join('||'), to.split('||').slice(-n).join('||'));
 }
 
 // ---- graph color settings card ----

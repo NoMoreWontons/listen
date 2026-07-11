@@ -1,4 +1,6 @@
-"""Smoke check: write_note files to class/unit/topic and re-files on relabel."""
+"""Smoke check: write_note combines every recording sharing a topic into one
+note, refiles cleanly on relabel/delete, and merge_topics moves labels across
+units. Stubs app.sb with a tiny in-memory fake — no real Supabase/network."""
 import os
 import tempfile
 import pathlib
@@ -9,34 +11,242 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "x")
 
 import app
 
+# ensure_hubs would otherwise make real (fake-keyed) network calls to Claude;
+# write_note swallows its failures, so make them fail fast instead of hanging.
+app.claude.messages.create = lambda **kw: (_ for _ in ()).throw(RuntimeError("no network in tests"))
 
-def test_write_and_refile():
+
+class FakeResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class FakeQuery:
+    """Chainable stand-in for supabase-py's query builder, backed by a shared
+    in-memory list of row dicts. Covers the handful of calls write_note /
+    _group_rows / _refile_group / _set / merge_topics / delete_recording
+    actually make: select/update/delete/eq/neq/order/single/execute."""
+    def __init__(self, rows):
+        self.rows = rows
+        self.filters = []
+        self.mode = "select"
+        self.payload = None
+
+    def select(self, *a, **k):
+        return self
+
+    def update(self, payload):
+        self.mode, self.payload = "update", payload
+        return self
+
+    def delete(self):
+        self.mode = "delete"
+        return self
+
+    def eq(self, k, v):
+        self.filters.append(("eq", k, v))
+        return self
+
+    def neq(self, k, v):
+        self.filters.append(("neq", k, v))
+        return self
+
+    def order(self, *a, **k):
+        return self
+
+    def single(self):
+        return self
+
+    def _match(self, r):
+        for op, k, v in self.filters:
+            if op == "eq" and r.get(k) != v:
+                return False
+            if op == "neq" and r.get(k) == v:
+                return False
+        return True
+
+    def execute(self):
+        matched = [r for r in self.rows if self._match(r)]
+        if self.mode == "update":
+            for r in matched:
+                r.update(self.payload)
+        elif self.mode == "delete":
+            for r in matched:
+                self.rows.remove(r)
+        return FakeResult(matched)
+
+
+class FakeSB:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def table(self, name):
+        assert name == "recordings"
+        return FakeQuery(self.rows)
+
+
+def mkrow(id, topic, created_at, transcript="hello", **kw):
+    row = {
+        "id": id, "title": f"L-{id}", "created_at": created_at,
+        "transcript": transcript, "summary": f"summary {id}",
+        "semester": "Fall 26", "class": "Biology", "unit": "Cells",
+        "topic": topic, "obsidian_path": None, "source": "local",
+    }
+    row.update(kw)
+    return row
+
+
+def test_single_recording():
     with tempfile.TemporaryDirectory() as d:
         app.OBSIDIAN_VAULT = pathlib.Path(d)
-        row = {
-            "id": "abcdef12-0000", "title": "L1", "created_at": "2026-07-04T10:00:00",
-            "transcript": "hello world", "summary": "- point", "semester": "Fall 26",
-            "class": "Biology", "unit": "Cells", "topic": "Mitosis", "obsidian_path": None,
-        }
-        p1 = app.write_note(row)
-        assert p1 == str(pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / "Mitosis.md"), p1
-        assert pathlib.Path(p1).exists()
+        rows = [mkrow("r1", "Mitosis", "2026-07-01T10:00:00")]
+        app.sb = FakeSB(rows)
+        path = app.write_note(rows[0])
+        expected = pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / "Mitosis.md"
+        assert path == str(expected), path
+        text = expected.read_text(encoding="utf-8")
+        assert "## Summary" in text and "## Transcript" in text, text
+        assert "### Summary" not in text, text  # single recording keeps old-style layout
+        assert rows[0]["obsidian_path"] == str(expected)
+    print("ok: single recording -> old-style layout at expected path")
 
-        # relabel -> new path, old file gone
-        row.update(obsidian_path=p1, unit="Division", topic="Meiosis")
-        p2 = app.write_note(row)
-        assert p2 == str(pathlib.Path(d) / "Fall 26" / "Biology" / "Division" / "Meiosis.md"), p2
-        assert pathlib.Path(p2).exists()
-        assert not pathlib.Path(p1).exists(), "stale note should be removed on re-file"
 
-        # empty transcript -> no note
-        assert app.write_note({**row, "transcript": "  "}) is None
+def test_second_recording_joins_topic():
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        rows = [mkrow("r1", "Mitosis", "2026-07-01T10:00:00", transcript="alpha transcript")]
+        app.sb = FakeSB(rows)
+        p1 = app.write_note(rows[0])
 
-        # collision from a different recording -> disambiguated filename
-        other = {**row, "id": "999999-xx", "obsidian_path": None}
-        p3 = app.write_note(other)
-        assert p3 != p2 and pathlib.Path(p3).exists(), p3
-    print("ok: write_note files, re-files, skips empty, disambiguates")
+        rows.append(mkrow("r2", "Mitosis", "2026-07-03T10:00:00", transcript="beta transcript"))
+        p2 = app.write_note(rows[1])
+
+        assert p1 == p2, (p1, p2)
+        text = pathlib.Path(p2).read_text(encoding="utf-8")
+        assert "alpha transcript" in text and "beta transcript" in text, text
+        assert "### Summary" in text, text  # multi-recording layout
+        assert rows[0]["obsidian_path"] == p2
+        assert rows[1]["obsidian_path"] == p2
+    print("ok: second recording on same topic joins one combined file")
+
+
+def test_relabel_away_and_last_one_out():
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        rows = [
+            mkrow("r1", "Mitosis", "2026-07-01T10:00:00", transcript="alpha transcript"),
+            mkrow("r2", "Mitosis", "2026-07-03T10:00:00", transcript="beta transcript"),
+        ]
+        app.sb = FakeSB(rows)
+        app.write_note(rows[0])
+        shared_path = app.write_note(rows[1])
+
+        # relabel r2 away to its own topic
+        rows[1]["topic"] = "Meiosis"
+        new_path = app.write_note(rows[1])
+        assert new_path != shared_path
+        assert pathlib.Path(new_path).exists()
+        assert rows[1]["obsidian_path"] == new_path
+
+        # old combined file survives, rewritten to hold only r1
+        assert pathlib.Path(shared_path).exists(), "shared note should survive while r1 still uses it"
+        old_text = pathlib.Path(shared_path).read_text(encoding="utf-8")
+        assert "alpha transcript" in old_text and "beta transcript" not in old_text, old_text
+        assert "### Summary" not in old_text  # back to single-recording layout
+
+        # the last remaining recording (r1) also leaves
+        rows[0]["topic"] = "Cytokinesis"
+        app.write_note(rows[0])
+        assert not pathlib.Path(shared_path).exists(), "orphaned combined note should be removed"
+    print("ok: relabeling away rewrites the shared note, removes it once empty")
+
+
+def test_empty_transcript_returns_none():
+    app.sb = FakeSB([])
+    row = mkrow("r1", "Mitosis", "2026-07-01T10:00:00", transcript="   ")
+    assert app.write_note(row) is None
+    print("ok: empty transcript -> None")
+
+
+def test_merge_topics_cross_unit():
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        rows = [
+            mkrow("r1", "Mitosis", "2026-07-01T10:00:00", unit="Cells", transcript="alpha"),
+            mkrow("r2", "Mitosis", "2026-07-02T10:00:00", unit="Cells", transcript="beta"),
+        ]
+        app.sb = FakeSB(rows)
+        app.write_note(rows[0])
+        app.write_note(rows[1])
+
+        same = app.merge_topics({
+            "semester": "Fall 26", "class": "Biology",
+            "from_unit": "Cells", "from_topic": "Mitosis",
+            "to_unit": "Cells", "to_topic": "Mitosis",
+        })
+        assert same == {"ok": False, "error": "bad merge args"}, same
+
+        result = app.merge_topics({
+            "semester": "Fall 26", "class": "Biology",
+            "from_unit": "Cells", "from_topic": "Mitosis",
+            "to_unit": "Division", "to_topic": "Cell division",
+        })
+        assert result == {"ok": True, "moved": 2}, result
+        assert rows[0]["unit"] == "Division" and rows[0]["topic"] == "Cell division"
+        assert rows[1]["unit"] == "Division" and rows[1]["topic"] == "Cell division"
+
+        dest = pathlib.Path(d) / "Fall 26" / "Biology" / "Division" / "Cell division.md"
+        assert dest.exists()
+        text = dest.read_text(encoding="utf-8")
+        assert "alpha" in text and "beta" in text, text
+        assert rows[0]["obsidian_path"] == str(dest)
+        assert rows[1]["obsidian_path"] == str(dest)
+    print("ok: merge_topics moves labels cross-unit into one combined note; rejects no-op merge")
+
+
+def test_legacy_rid_suffixed_files_cleaned_up():
+    """Pre-fix vaults have 'Topic (rid6).md' files per recording — one refile
+    of the topic must collapse them into the single combined note."""
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        folder = pathlib.Path(d) / "Fall 26" / "Biology" / "Cells"
+        folder.mkdir(parents=True)
+        s1, s2 = folder / "Mitosis (r1x).md", folder / "Mitosis (r2x).md"
+        s1.write_text("old1", encoding="utf-8")
+        s2.write_text("old2", encoding="utf-8")
+        rows = [
+            mkrow("r1", "Mitosis", "2026-07-01T10:00:00", transcript="alpha", obsidian_path=str(s1)),
+            mkrow("r2", "Mitosis", "2026-07-02T10:00:00", transcript="beta", obsidian_path=str(s2)),
+        ]
+        app.sb = FakeSB(rows)
+        path = app.write_note(rows[0])
+        files = sorted(p.name for p in folder.glob("*.md"))
+        assert files == ["Mitosis.md"], files
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+        assert "alpha" in text and "beta" in text, text
+        assert rows[0]["obsidian_path"] == path and rows[1]["obsidian_path"] == path
+    print("ok: legacy rid-suffixed files collapse into one combined note")
+
+
+def test_delete_recording_rewrites_shared_note():
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        rows = [
+            mkrow("r1", "Mitosis", "2026-07-01T10:00:00", transcript="alpha"),
+            mkrow("r2", "Mitosis", "2026-07-02T10:00:00", transcript="beta"),
+        ]
+        app.sb = FakeSB(rows)
+        app.write_note(rows[0])
+        shared = app.write_note(rows[1])
+
+        app.delete_recording("r1")
+        assert pathlib.Path(shared).exists(), "note should survive while r2 still uses it"
+        text = pathlib.Path(shared).read_text(encoding="utf-8")
+        assert "beta" in text and "alpha" not in text, text
+
+        app.delete_recording("r2")
+        assert not pathlib.Path(shared).exists(), "note should be removed once nobody uses it"
+    print("ok: delete_recording rewrites/removes the shared note as members leave")
 
 
 def test_analyze_integrates_notes():
@@ -63,5 +273,11 @@ def test_analyze_integrates_notes():
 
 
 if __name__ == "__main__":
-    test_write_and_refile()
+    test_single_recording()
+    test_second_recording_joins_topic()
+    test_relabel_away_and_last_one_out()
+    test_empty_transcript_returns_none()
+    test_merge_topics_cross_unit()
+    test_legacy_rid_suffixed_files_cleaned_up()
+    test_delete_recording_rewrites_shared_note()
     test_analyze_integrates_notes()

@@ -421,6 +421,20 @@ def label(rid: str, payload: dict = Body(...)):
     return {"ok": error is None, "obsidian_path": path, "error": error}
 
 
+def _cleanup_unit_dir(sem, cls, unit):
+    """Removes a unit's hub note + folder if relabeling/deleting emptied it —
+    shared tail for merge_units, merge_topics (cross-unit), delete_unit."""
+    old_dir = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(unit)
+    try:
+        hub = old_dir / f"{_slug(unit)}.md"
+        if hub.exists():
+            hub.unlink()
+        old_dir.rmdir()  # only succeeds if empty
+        write_graph_config()
+    except OSError:
+        pass  # folder still has user files — leave it
+
+
 @app.post("/merge_units")
 def merge_units(payload: dict = Body(...)):
     """Merges one unit into another within a semester/class: relabels every
@@ -437,34 +451,33 @@ def merge_units(payload: dict = Body(...)):
         _set(row["id"], unit=dst)
         path = write_note(row)  # None for rows without a transcript
         _set(row["id"], obsidian_path=path)
-    old_dir = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(src)
-    try:
-        hub = old_dir / f"{_slug(src)}.md"
-        if hub.exists():
-            hub.unlink()
-        old_dir.rmdir()  # only succeeds if empty
-        write_graph_config()
-    except OSError:
-        pass  # folder still has user files — leave it
+    _cleanup_unit_dir(sem, cls, src)
     return {"ok": True, "moved": len(rows)}
 
 
 @app.post("/merge_topics")
 def merge_topics(payload: dict = Body(...)):
-    """Merges one topic into another within a semester/class/unit: relabels
-    every matching recording and re-files its note (write_note moves the file
-    off the old topic name; same-named notes disambiguate with a rid suffix)."""
-    sem, cls, unit = payload["semester"], payload["class"], payload["unit"]
-    src, dst = payload["from_topic"], payload["to_topic"]
-    if not all([sem, cls, unit, src, dst]) or src == dst:
+    """Merges one topic into another within a semester/class, optionally
+    across units: relabels every matching recording and re-files its note
+    (write_note combines it into the destination topic's one note — see
+    write_note). Cross-unit merges clean up the vacated unit's hub/folder,
+    same as merge_units."""
+    sem, cls = payload.get("semester"), payload.get("class")
+    from_unit, from_topic = payload.get("from_unit"), payload.get("from_topic")
+    to_unit, to_topic = payload.get("to_unit"), payload.get("to_topic")
+    if not all([sem, cls, from_unit, from_topic, to_unit, to_topic]):
         return {"ok": False, "error": "bad merge args"}
-    rows = (sb.table("recordings").select("*").eq("semester", sem)
-            .eq("class", cls).eq("unit", unit).eq("topic", src).execute().data)
+    if from_unit == to_unit and from_topic == to_topic:
+        return {"ok": False, "error": "bad merge args"}
+    rows = (sb.table("recordings").select("*").eq("semester", sem).eq("class", cls)
+            .eq("unit", from_unit).eq("topic", from_topic).execute().data)
     for row in rows:
-        row["topic"] = dst
-        _set(row["id"], topic=dst)
+        row["unit"], row["topic"] = to_unit, to_topic
+        _set(row["id"], unit=to_unit, topic=to_topic)
         path = write_note(row)  # None for rows without a transcript
         _set(row["id"], obsidian_path=path)
+    if from_unit != to_unit:
+        _cleanup_unit_dir(sem, cls, from_unit)
     return {"ok": True, "moved": len(rows)}
 
 
@@ -532,17 +545,19 @@ async def ocr(request: Request, filename: str = ""):
 
 @app.delete("/recordings/{rid}")
 def delete_recording(rid: str):
-    """Delete the row, its audio/pdf, and the Obsidian note the app wrote."""
-    rows = sb.table("recordings").select("obsidian_path").eq("id", rid).execute().data
+    """Delete the row, its audio/pdf, and its Obsidian note. The note may be a
+    combined file shared with other recordings on the same topic — rewrite it
+    from whoever's left instead of unlinking, unless no one remains."""
+    rows = (sb.table("recordings").select("obsidian_path,semester,class,unit,topic")
+            .eq("id", rid).execute().data)
+    row = rows[0] if rows else {}
     sb.table("recordings").delete().eq("id", rid).execute()
     audio_path(rid).unlink(missing_ok=True)
     pdf_path(rid).unlink(missing_ok=True)
-    note = rows[0].get("obsidian_path") if rows else None
-    if note:
-        p = pathlib.Path(note)
-        # only ever remove the single file this app wrote, and only inside the vault
-        if p.is_relative_to(OBSIDIAN_VAULT):
-            p.unlink(missing_ok=True)
+    if row.get("obsidian_path"):
+        # _refile_group rebuilds from whatever remains under these labels (row
+        # is already gone from the DB), or removes the file — vault check included
+        _refile_group(row.get("semester"), row.get("class"), row.get("unit"), row.get("topic"))
     return {"ok": True}
 
 
@@ -558,15 +573,7 @@ def delete_unit(payload: dict = Body(...)):
             .eq("class", cls).eq("unit", unit).execute().data)
     for row in rows:
         delete_recording(row["id"])
-    old_dir = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(unit)
-    try:
-        hub = old_dir / f"{_slug(unit)}.md"
-        if hub.exists():
-            hub.unlink()
-        old_dir.rmdir()  # only succeeds if empty
-        write_graph_config()
-    except OSError:
-        pass  # folder still has user files — leave it
+    _cleanup_unit_dir(sem, cls, unit)
     return {"ok": True, "deleted": len(rows)}
 
 
@@ -1396,27 +1403,44 @@ def _slug(s):
     return (s or "Untitled")[:80]
 
 
-def _note_md(row):
-    source = row.get("source") or "local"
+def _note_md(rows):
+    """Combined note for every recording sharing one topic (rows: non-empty
+    transcripts, oldest first — see _group_rows). Frontmatter/H1/date come
+    from the earliest recording. A single recording keeps the original
+    Summary/Transcript layout so most notes don't churn; multiple get one
+    dated section per recording."""
+    first = rows[0]
+    source = first.get("source") or "local"
     fm = {
-        "semester": row.get("semester") or "",
-        "class": row.get("class") or "",
-        "unit": row.get("unit") or "",
-        "topic": row.get("topic") or "",
-        "date": (row.get("created_at") or "")[:10],
+        "semester": first.get("semester") or "",
+        "class": first.get("class") or "",
+        "unit": first.get("unit") or "",
+        "topic": first.get("topic") or "",
+        "date": (first.get("created_at") or "")[:10],
         "source": source,
         "tags": f"[lecture, {source}]",  # Obsidian reads this inline-list as tags
     }
     front = "\n".join(f"{k}: {v}" for k, v in fm.items())
-    sem, cls, unit = _slug(row.get("semester")), _slug(row.get("class")), _slug(row.get("unit"))
-    return (
+    sem, cls, unit = _slug(first.get("semester")), _slug(first.get("class")), _slug(first.get("unit"))
+    head = (
         f"---\n{front}\n---\n\n"
-        f"# {row.get('topic') or row.get('title') or 'Lecture'}\n\n"
+        f"# {first.get('topic') or first.get('title') or 'Lecture'}\n\n"
         # strict hierarchy: topic links unit only; unit links class, class links semester
         f"Unit: [[{sem}/{cls}/{unit}/{unit}|{unit}]]\n\n"
-        f"## Summary\n\n{row.get('summary') or ''}\n\n"
-        f"## Transcript\n\n{row.get('transcript') or ''}\n"
     )
+    if len(rows) == 1:
+        return (
+            head
+            + f"## Summary\n\n{first.get('summary') or ''}\n\n"
+            + f"## Transcript\n\n{first.get('transcript') or ''}\n"
+        )
+    body = "\n\n".join(
+        f"## {(r.get('created_at') or '')[:10]} — {r.get('title') or r.get('topic') or 'Lecture'}\n\n"
+        f"### Summary\n\n{r.get('summary') or ''}\n\n"
+        f"### Transcript\n\n{r.get('transcript') or ''}"
+        for r in rows
+    )
+    return head + body + "\n"
 
 
 def _hub_desc(kind, name, context):
@@ -1561,31 +1585,74 @@ async def set_graph_settings(request: Request):
     return {"ok": True, **st}
 
 
+def _group_rows(sem, cls, unit, topic):
+    """Recordings sharing (semester, class, unit, topic) with a non-empty
+    transcript, oldest first — the set of recordings one combined note holds."""
+    rows = (sb.table("recordings").select("*").eq("semester", sem)
+            .eq("class", cls).eq("unit", unit).eq("topic", topic)
+            .order("created_at").execute().data)
+    return [r for r in rows if (r.get("transcript") or "").strip()]
+
+
+def _refile_group(sem, cls, unit, topic):
+    """Builds/rewrites the one combined note file for a (semester, class,
+    unit, topic) label tuple from whatever recordings currently carry it
+    (queried fresh from the DB), syncing each row's obsidian_path. Removes
+    the file instead if the group is now empty. Returns the path (str), or
+    None."""
+    dest = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(unit) / f"{_slug(topic)}.md"
+    group = _group_rows(sem, cls, unit, topic)
+    if not group:
+        if dest.exists() and dest.is_relative_to(OBSIDIAN_VAULT):
+            dest.unlink()
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(_note_md(group), encoding="utf-8")
+    for r in group:
+        old = r.get("obsidian_path")
+        if old == str(dest):
+            continue
+        _set(r["id"], obsidian_path=str(dest))
+        # drop r's old file (e.g. a legacy rid-suffixed note) — but never a
+        # combined file another row still points at (mid-merge sharing)
+        if old:
+            old_p = pathlib.Path(old)
+            if (old_p != dest and old_p.is_relative_to(OBSIDIAN_VAULT) and old_p.exists()
+                    and not (sb.table("recordings").select("id")
+                             .eq("obsidian_path", old).neq("id", r["id"]).execute().data)):
+                old_p.unlink()
+    return str(dest)
+
+
 def write_note(row):
-    """Writes/moves the lecture note to <vault>/<class>/<unit>/<topic>.md.
-    Deletes the note at the row's old obsidian_path if the labels changed the
-    destination. Returns the new absolute path (str), or None if no transcript."""
+    """Writes/rewrites the ONE combined note for row's (semester, class,
+    unit, topic) — every recording sharing that topic lands in the same file
+    (see _refile_group/_note_md); no more per-recording rid-suffixed files.
+    Trusts the DB: callers must _set row's new labels before calling this.
+    If row just moved off a different topic whose note is still shared with
+    other recordings, that note is rewritten from what's left (or removed if
+    row was the last one there). Returns the new path (str), or None if row
+    has no transcript."""
     if not (row.get("transcript") or "").strip():
         return None
-    folder = (
-        OBSIDIAN_VAULT / _slug(row.get("semester"))
-        / _slug(row.get("class")) / _slug(row.get("unit"))
-    )
-    folder.mkdir(parents=True, exist_ok=True)
-    dest = folder / f"{_slug(row.get('topic'))}.md"
+    old = row.get("obsidian_path")  # read before _refile_group can touch this row's own field
+    dest = _refile_group(row.get("semester"), row.get("class"),
+                          row.get("unit"), row.get("topic"))
 
-    old = row.get("obsidian_path")
-    old_p = pathlib.Path(old) if old else None
-    # a different recording already owns this filename -> disambiguate with rid
-    if dest.exists() and (old_p is None or old_p.resolve() != dest.resolve()):
-        dest = folder / f"{_slug(row.get('topic'))} ({row['id'][:6]}).md"
-    if old_p and old_p != dest and old_p.exists():
-        old_p.unlink()  # labels moved the note; drop the stale file
+    if old and old != dest:
+        others = (sb.table("recordings").select("semester,class,unit,topic")
+                  .eq("obsidian_path", old).neq("id", row["id"]).execute().data)
+        if others:
+            o = others[0]
+            _refile_group(o.get("semester"), o.get("class"), o.get("unit"), o.get("topic"))
+        else:
+            old_p = pathlib.Path(old)
+            if old_p.is_relative_to(OBSIDIAN_VAULT) and old_p.exists():
+                old_p.unlink()
 
-    dest.write_text(_note_md(row), encoding="utf-8")
     try:
         ensure_hubs(row)
         write_graph_config()
     except Exception as e:
         print(f"[listen] hub notes/graph config failed (note itself is written): {e}")
-    return str(dest)
+    return dest
