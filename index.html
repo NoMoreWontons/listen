@@ -303,6 +303,15 @@
     color: var(--ink-soft);
     margin-left: .4rem;
   }
+  .tree-del {
+    float: right; border: none; background: none; cursor: pointer;
+    color: var(--ink-soft); font-size: .78rem; padding: 0 .3rem; opacity: 0;
+  }
+  .folders summary:hover .tree-del, .folders .topic:hover .tree-del { opacity: 1; }
+  .tree-del:hover { color: #a8331f; }
+  .folders summary.drag-over, .folders .topic.drag-over {
+    background: #f7e8cf; outline: 2px dashed #93670f; outline-offset: -2px;
+  }
   #tree:empty::before {
     content: "Nothing filed yet — finished recordings appear here by semester / class / unit.";
     display: block;
@@ -837,7 +846,17 @@ function updateDatalists(rows) {
   }
 }
 
+// ---- tree drag-drop merge: drag a unit summary or topic div onto a sibling of the
+// same kind to merge (reuses doMerge, same confirm). dragItem/treeDragging are module-level
+// since dataTransfer payloads are unreliable for same-page drags in some browsers.
+let dragItem = null;      // {kind: 'unit'|'topic', k, name} of the node being dragged
+let treeDragging = false; // sat true from dragstart to dragend — pauses renderTree mid-drag
+function canDrop(drag, target) {
+  return !!drag && !!target && drag.kind === target.kind && drag.k === target.k && drag.name !== target.name;
+}
+
 function renderTree(rows) {
+  if (treeDragging) return; // a rewrite here would yank the dragged node out from under the drag
   // semester > class > unit > topics, from filed recordings only
   const tree = {};
   for (const r of rows) {
@@ -847,19 +866,86 @@ function renderTree(rows) {
   const open = new Set([...document.querySelectorAll('#tree details[open]')].map(d => d.dataset.k));
   const det = (k, label, inner) =>
     `<details data-k="${escAttr(k)}"${open.has(k) ? ' open' : ''}><summary>${esc(label)}</summary>${inner}</details>`;
+
+  const topicHtml = (r, sem, cls, unit) => {
+    // drag/merge only wired for rows that actually carry a topic label
+    const attrs = r.topic
+      ? `draggable="true" data-kind="topic" data-k="${escAttr(sem + '||' + cls + '||' + unit)}" data-name="${escAttr(r.topic)}"`
+      : '';
+    const label = r.obsidian_uri
+      ? `<a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">${esc(r.topic || r.title || 'untitled')}</a>`
+      : esc(r.topic || r.title || 'untitled');
+    return `<div class="topic" data-rid="${escAttr(r.id)}" ${attrs}>${label}<span class="when">${(r.created_at || '').slice(0, 10)}</span>`
+      + `<button class="tree-del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button></div>`;
+  };
+
+  const unitHtml = (sem, cls, unit, recs) => {
+    const inner = recs.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
+      .map(r => topicHtml(r, sem, cls, unit)).join('');
+    const k = sem + '/' + cls + '/' + unit;
+    return `<details data-k="${escAttr(k)}"${open.has(k) ? ' open' : ''}>`
+      + `<summary draggable="true" data-kind="unit" data-k="${escAttr(sem + '||' + cls)}" data-name="${escAttr(unit)}">${esc(unit)}`
+      + `<button class="tree-del" title="Delete unit" data-unit-del data-sem="${escAttr(sem)}" data-cls="${escAttr(cls)}" `
+      + `data-unit="${escAttr(unit)}" data-count="${recs.length}">&#10005;</button></summary>${inner}</details>`;
+  };
+
   document.getElementById('tree').innerHTML = Object.keys(tree).sort().map(sem =>
     det(sem, sem, Object.keys(tree[sem]).sort().map(cls =>
-      det(sem + '/' + cls, cls, Object.keys(tree[sem][cls]).sort().map(unit =>
-        det(sem + '/' + cls + '/' + unit, unit, tree[sem][cls][unit]
-          .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
-          .map(r => `<div class="topic">${r.obsidian_uri
-              ? `<a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">${esc(r.topic || r.title || 'untitled')}</a>`
-              : esc(r.topic || r.title || 'untitled')}<span class="when">${(r.created_at || '').slice(0, 10)}</span></div>`)
-          .join(''))
-      ).join(''))
+      det(sem + '/' + cls, cls, Object.keys(tree[sem][cls]).sort()
+        .map(unit => unitHtml(sem, cls, unit, tree[sem][cls][unit])).join(''))
     ).join(''))
   ).join('');
 }
+
+// delegated: #tree's innerHTML is rewritten every refresh, so listeners live on the container.
+// apostrophes in unit/topic names ("Newton's Laws") break inline onclick — data attrs + delegation.
+const treeEl = document.getElementById('tree');
+treeEl.addEventListener('dragstart', e => {
+  const el = e.target.closest('[data-kind]');
+  if (!el) return;
+  dragItem = { kind: el.dataset.kind, k: el.dataset.k, name: el.dataset.name };
+  treeDragging = true;
+});
+treeEl.addEventListener('dragover', e => {
+  const el = e.target.closest('[data-kind]');
+  if (!el || !canDrop(dragItem, { kind: el.dataset.kind, k: el.dataset.k, name: el.dataset.name })) return;
+  e.preventDefault(); // required to allow a drop
+  el.classList.add('drag-over');
+});
+treeEl.addEventListener('dragleave', e => {
+  const el = e.target.closest('[data-kind]');
+  if (el) el.classList.remove('drag-over');
+});
+treeEl.addEventListener('drop', e => {
+  const el = e.target.closest('[data-kind]');
+  if (el) el.classList.remove('drag-over');
+  const target = el && { kind: el.dataset.kind, k: el.dataset.k, name: el.dataset.name };
+  if (!canDrop(dragItem, target)) return;
+  e.preventDefault();
+  e.stopPropagation(); // don't let the page-level file-drop handler also fire
+  doMerge(dragItem.k, dragItem.name, target.name);
+});
+treeEl.addEventListener('dragend', () => {
+  // fires on both a completed drop and a cancelled drag — always clear
+  treeDragging = false;
+  dragItem = null;
+  for (const el of treeEl.querySelectorAll('.drag-over')) el.classList.remove('drag-over');
+});
+treeEl.addEventListener('click', async e => {
+  const b = e.target.closest('[data-unit-del]');
+  if (!b) return;
+  e.preventDefault();
+  e.stopPropagation(); // don't toggle the <details>
+  const { sem, cls, unit, count } = b.dataset;
+  if (!confirm(`Delete unit "${unit}" and its ${count} notes? Recordings, audio, and Obsidian notes are removed. This cannot be undone.`)) return;
+  const resp = await (await fetch('/delete_unit', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ semester: sem, class: cls, unit }),
+  })).json();
+  if (!resp.ok) alert(resp.error || 'delete failed');
+  document.activeElement?.blur();
+  refresh();
+});
 
 // ---- merge panel: units or topics — suggests near-duplicates, lets the user merge any two ----
 let mergeLevel = 'unit';

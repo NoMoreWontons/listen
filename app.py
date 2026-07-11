@@ -546,6 +546,30 @@ def delete_recording(rid: str):
     return {"ok": True}
 
 
+@app.post("/delete_unit")
+def delete_unit(payload: dict = Body(...)):
+    """Deletes every recording filed under a unit (row + audio/pdf + note,
+    via delete_recording), then removes the unit's hub note + folder if that
+    emptied it — same tail as merge_units."""
+    sem, cls, unit = payload.get("semester"), payload.get("class"), payload.get("unit")
+    if not all([sem, cls, unit]):
+        return {"ok": False, "error": "bad args"}
+    rows = (sb.table("recordings").select("id").eq("semester", sem)
+            .eq("class", cls).eq("unit", unit).execute().data)
+    for row in rows:
+        delete_recording(row["id"])
+    old_dir = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(unit)
+    try:
+        hub = old_dir / f"{_slug(unit)}.md"
+        if hub.exists():
+            hub.unlink()
+        old_dir.rmdir()  # only succeeds if empty
+        write_graph_config()
+    except OSError:
+        pass  # folder still has user files — leave it
+    return {"ok": True, "deleted": len(rows)}
+
+
 def _set(rid, **fields):
     sb.table("recordings").update(fields).eq("id", rid).execute()
 
