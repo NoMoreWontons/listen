@@ -867,7 +867,9 @@ function renderTree(rows) {
   const det = (k, label, inner) =>
     `<details data-k="${escAttr(k)}"${open.has(k) ? ' open' : ''}><summary>${esc(label)}</summary>${inner}</details>`;
 
-  const topicHtml = (r, sem, cls, unit) => {
+  const topicHtml = (rs, sem, cls, unit) => {
+    // rs: all recordings sharing one topic (backend writes one combined note per topic) — or a single topicless row
+    const r = rs.at(-1);  // latest (rs sorted by created_at); rows in a group share one obsidian_uri
     // drag/merge only wired for rows that actually carry a topic label
     const attrs = r.topic
       ? `draggable="true" data-kind="topic" data-k="${escAttr(sem + '||' + cls)}" data-name="${escAttr(unit + '||' + r.topic)}"`
@@ -875,13 +877,20 @@ function renderTree(rows) {
     const label = r.obsidian_uri
       ? `<a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">${esc(r.topic || r.title || 'untitled')}</a>`
       : esc(r.topic || r.title || 'untitled');
-    return `<div class="topic" data-rid="${escAttr(r.id)}" ${attrs}>${label}<span class="when">${(r.created_at || '').slice(0, 10)}</span>`
-      + `<button class="tree-del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button></div>`;
+    const del = rs.length > 1
+      ? `<button class="tree-del" title="Delete all ${rs.length} recordings" data-topic-del data-rids="${rs.map(x => x.id).join(',')}">&#10005;</button>`
+      : `<button class="tree-del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>`;
+    return `<div class="topic" data-rid="${escAttr(r.id)}" ${attrs}>${label}<span class="when">${rs.length > 1 ? '&times;' + rs.length + ' &middot; ' : ''}${(r.created_at || '').slice(0, 10)}</span>${del}</div>`;
   };
 
   const unitHtml = (sem, cls, unit, recs) => {
-    const inner = recs.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
-      .map(r => topicHtml(r, sem, cls, unit)).join('');
+    recs.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+    const byTopic = {}, groups = [];  // one group per distinct topic; topicless rows stay solo
+    for (const r of recs) {
+      if (r.topic && byTopic[r.topic]) byTopic[r.topic].push(r);
+      else groups.push(r.topic ? (byTopic[r.topic] = [r]) : [r]);
+    }
+    const inner = groups.map(g => topicHtml(g, sem, cls, unit)).join('');
     const k = sem + '/' + cls + '/' + unit;
     return `<details data-k="${escAttr(k)}"${open.has(k) ? ' open' : ''}>`
       + `<summary draggable="true" data-kind="unit" data-k="${escAttr(sem + '||' + cls)}" data-name="${escAttr(unit)}">${esc(unit)}`
@@ -932,6 +941,12 @@ treeEl.addEventListener('dragend', () => {
   for (const el of treeEl.querySelectorAll('.drag-over')) el.classList.remove('drag-over');
 });
 treeEl.addEventListener('click', async e => {
+  const t = e.target.closest('[data-topic-del]');
+  if (t) {
+    e.preventDefault();
+    e.stopPropagation();
+    return deleteTopic(t.dataset.rids.split(','));
+  }
   const b = e.target.closest('[data-unit-del]');
   if (!b) return;
   e.preventDefault();
@@ -946,6 +961,14 @@ treeEl.addEventListener('click', async e => {
   document.activeElement?.blur();
   refresh();
 });
+
+async function deleteTopic(rids) {
+  if (!confirm(`Delete ${rids.length} recordings under this topic (audio + notes)? This cannot be undone.`)) return;
+  // sequential — the backend rewrites the shared combined note on each delete
+  for (const rid of rids) await fetch(`/recordings/${rid}`, { method: 'DELETE' });
+  document.activeElement?.blur();
+  refresh();
+}
 
 // ---- merge panel: units or topics — suggests near-duplicates, lets the user merge any two ----
 let mergeLevel = 'unit';
