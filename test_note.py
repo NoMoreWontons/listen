@@ -278,6 +278,33 @@ def test_analyze_integrates_notes():
     print("ok: analyze feeds user notes + lecture date into the prompt, parses exams")
 
 
+def test_analyze_pdf_homework_prompt():
+    captured = {}
+
+    class FakeMsg:
+        content = [type("T", (), {
+            "text": '{"class":"C","unit":"U","topic":"T","semester":"",'
+                    '"key_points":"### Problem 1","summary":"- overview"}'})()]
+        usage = type("U", (), {"input_tokens": 1, "output_tokens": 2})()
+
+    def fake_create(**kw):
+        captured.clear()
+        captured.update(kw)
+        return FakeMsg()
+
+    app.claude.messages.create = fake_create
+    app.analyze_pdf(b"%PDF-fake", homework=True)
+    prompt = captured["messages"][0]["content"][1]["text"]
+    assert "homework assignment" in prompt, prompt
+    assert "### Problem" in prompt, prompt
+    assert "**Answer:**" in prompt, prompt
+    app.analyze_pdf(b"%PDF-fake")  # default keeps the course-material framing
+    prompt = captured["messages"][0]["content"][1]["text"]
+    assert "course material" in prompt, prompt
+    assert "Worked examples" in prompt, prompt
+    print("ok: analyze_pdf homework flag swaps in the per-problem write-up prompt")
+
+
 def test_parse_exams_defensive():
     assert app._parse_exams('{"segments":[]}') == []  # missing key
     assert app._parse_exams('{"exams":"not a list"}') == []  # wrong type
@@ -338,6 +365,7 @@ if __name__ == "__main__":
     test_legacy_rid_suffixed_files_cleaned_up()
     test_delete_recording_rewrites_shared_note()
     test_analyze_integrates_notes()
+    test_analyze_pdf_homework_prompt()
     test_parse_exams_defensive()
     test_write_exam_note_links_matching_units()
     test_write_exam_note_undated_no_format_overwrites()

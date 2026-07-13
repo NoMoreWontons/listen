@@ -796,7 +796,8 @@ def process_pdf(rid):
                .eq("id", rid).single().execute().data or {})
         syllabus = pre.get("source") == "syllabus"
         summary, sem, cls, unit, topic, key_points, assignments, tokens_in, tokens_out = analyze_pdf(
-            pdf_path(rid).read_bytes(), pre.get("notes") or "", syllabus=syllabus)
+            pdf_path(rid).read_bytes(), pre.get("notes") or "", syllabus=syllabus,
+            homework=pre.get("source") == "homework")
         keep = lambda k, v: (pre.get(k) or "").strip() or v
         created_at = pre.get("created_at") or datetime.datetime.now().isoformat()
         # precedence: user label > SEMESTER_OVERRIDE > semester stated in the
@@ -1260,11 +1261,12 @@ def _doc_block(data):
     raise ValueError("unsupported file type — upload a PDF, pptx, docx, or a jpg/png/gif/webp photo")
 
 
-def analyze_pdf(pdf_bytes, notes="", syllabus=False):
+def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
     """One Claude call on a PDF (native document block — no OCR dependency,
     scanned pages included). Returns (summary, semester, class, unit, topic,
     key_points, assignments, tokens_in, tokens_out); assignments is [] unless
-    syllabus=True."""
+    syllabus=True. homework=True swaps the distill-the-slides framing for a
+    readable per-problem write-up."""
     doc_block = _doc_block(pdf_bytes)
     notes_part = (
         "\nThe student took their own notes on this material. Integrate them "
@@ -1280,6 +1282,24 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False):
         "format (free text, e.g. '50 multiple choice, closed book') and topics "
         "(array of strings) when the document states them; omit otherwise.\n"
     ) if syllabus else ""
+    content_part = (
+        "- key_points: the assignment rewritten as clean, readable markdown "
+        "(this stands in for a transcript): one '### Problem <number or short "
+        "name>' section per problem, each with the full problem statement, the "
+        "student's work if visible, a step-by-step solution, and a final "
+        "'**Answer:**' line (LaTeX $...$ for math)\n"
+        "- summary: a short plain-English overview — what the assignment covers, "
+        "which concepts it practices, and anything incomplete or worth "
+        "revisiting, as a markdown bullet list\n"
+    ) if homework else (
+        "- key_points: the document's content distilled as thorough markdown "
+        "notes (this stands in for a transcript)\n"
+        "- summary: concise key points and any action items, as a markdown "
+        "bullet list. If the document works through example problems, append "
+        "a '## Worked examples' section: one '### <short problem name>' per "
+        "problem with the problem statement, key solution steps, and final "
+        "answer (LaTeX $...$ for math); omit if none\n"
+    )
     msg = claude.messages.create(
         model="claude-haiku-4-5",
         max_tokens=3000,
@@ -1288,8 +1308,12 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False):
             "content": [
                 doc_block,
                 {"type": "text", "text": (
-                    "This is course material from a college class (lecture slides, "
-                    "handout, syllabus, or reading). Return ONLY a JSON object with keys: "
+                    ("This is a homework assignment from a college class (typed or "
+                     "a photo of handwritten work). "
+                     if homework else
+                     "This is course material from a college class (lecture slides, "
+                     "handout, syllabus, or reading). ")
+                    + "Return ONLY a JSON object with keys: "
                     "class, unit, topic, semester, key_points, summary"
                     + (", assignments" if syllabus else "") + ".\n"
                     "- class: the course subject (e.g. 'Biology', 'US History')\n"
@@ -1297,14 +1321,7 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False):
                     "- topic: the specific topic of THIS document, 5 words max "
                     "(used as the note title)\n"
                     "- semester: the term if stated in the document (e.g. 'Fall 26'), else \"\"\n"
-                    "- key_points: the document's content distilled as thorough markdown "
-                    "notes (this stands in for a transcript)\n"
-                    "- summary: concise key points and any action items, as a markdown "
-                    "bullet list. If the document works through example problems, append "
-                    "a '## Worked examples' section: one '### <short problem name>' per "
-                    "problem with the problem statement, key solution steps, and final "
-                    "answer (LaTeX $...$ for math); omit if none\n"
-                    + syllabus_part + notes_part
+                    + content_part + syllabus_part + notes_part
                 )},
             ],
         }],
