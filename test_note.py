@@ -303,6 +303,7 @@ def test_write_exam_note_links_matching_units():
         assert "class: Biology" in text and "kind: exam" in text and "tags: [exam]" in text, text
         assert "# Midterm 1" in text, text
         assert "**Date:** 2026-10-01" in text, text
+        assert "Class: [[Fall 26/Biology/Biology|Biology]]" in text, text  # graph anchor
         assert "**Format:** 50 multiple choice, no calculator" in text, text
         assert "- [[Fall 26/Biology/Cells/Cells|Cells]]" in text, text  # matches existing unit
         assert "- Genetics" in text, text  # no matching folder -> plain bullet

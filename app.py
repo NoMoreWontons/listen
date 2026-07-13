@@ -1794,7 +1794,10 @@ def write_exam_note(sem, cls, exam):
 
     fm = {"class": cls, "kind": kind, "date": due or "TBA", "tags": "[exam]"}
     front = "\n".join(f"{k}: {v}" for k, v in fm.items())
-    body = f"---\n{front}\n---\n\n# {title}\n\n**Date:** {due or 'TBA'}\n"
+    # Class wikilink keeps the exam attached to its class hub in the graph —
+    # without it an exam with no matching Covers links free-floats.
+    body = (f"---\n{front}\n---\n\n# {title}\n\n**Date:** {due or 'TBA'}\n"
+            f"\nClass: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]\n")
     if fmt:
         body += f"\n**Format:** {fmt}\n"
     if topics:
