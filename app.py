@@ -279,9 +279,16 @@ def sweep_old_audio(directory=AUDIO_DIR, days=RETENTION_DAYS):
 def resume_stuck():
     # ponytail: a prior crash/hang can leave rows stuck in "transcribing"
     # with their audio still on disk — restart resolves the hang, so retry them.
-    stuck = sb.table("recordings").select("id").eq("status", "transcribing").execute().data
+    # Rows stuck in "recording" mean the PC/browser died mid-lecture before
+    # /stop: the 10s chunk uploads mean the audio up to the crash is already
+    # on disk, so treat the crash as the stop and transcribe what we have
+    # (ffmpeg tolerates the truncated final chunk). The server is single-user
+    # and just started, so no recording can actually be live right now.
+    stuck = (sb.table("recordings").select("id")
+             .in_("status", ["transcribing", "recording"]).execute().data)
     for row in stuck:
         if audio_path(row["id"]).exists():
+            _set(row["id"], status="transcribing")
             threading.Thread(target=process, args=(row["id"],), daemon=True).start()
 
 

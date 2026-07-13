@@ -9,7 +9,36 @@ os.environ.setdefault("SUPABASE_URL", "http://localhost")
 os.environ.setdefault("SUPABASE_SERVICE_KEY", "x")
 os.environ.setdefault("ANTHROPIC_API_KEY", "x")
 
+import app
 from app import sweep_old_audio
+
+
+def test_resume_stuck_recovers_crashed_recordings():
+    """A row stuck in 'recording' (PC died before /stop) with audio on disk
+    gets flipped to transcribing and processed; rows with no audio are left."""
+    with tempfile.TemporaryDirectory() as d:
+        app.AUDIO_DIR = pathlib.Path(d)
+        (app.AUDIO_DIR / "crashed.webm").write_bytes(b"x")
+
+        class FakeTable:
+            def select(self, *a): return self
+            def in_(self, col, vals):
+                assert "recording" in vals and "transcribing" in vals
+                return self
+            def execute(self):
+                return type("R", (), {"data": [{"id": "crashed"}, {"id": "no-audio"}]})()
+        app.sb = type("SB", (), {"table": lambda self, n: FakeTable()})()
+
+        updated, processed = [], []
+        app._set = lambda rid, **kw: updated.append((rid, kw))
+        app.threading.Thread = lambda target, args, daemon: type(
+            "T", (), {"start": lambda self: processed.append(args[0])})()
+
+        app.resume_stuck()
+
+        assert updated == [("crashed", {"status": "transcribing"})], updated
+        assert processed == ["crashed"], processed
+    print("ok: resume_stuck recovers crashed recordings, skips rows with no audio")
 
 
 def test_sweep_deletes_only_old():
@@ -30,4 +59,5 @@ def test_sweep_deletes_only_old():
 
 
 if __name__ == "__main__":
+    test_resume_stuck_recovers_crashed_recordings()
     test_sweep_deletes_only_old()
