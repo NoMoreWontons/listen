@@ -268,6 +268,8 @@ def test_analyze_integrates_notes():
     prompt = captured["messages"][0]["content"]
     assert "watch slide 12" in prompt, prompt
     assert "2026-09-20" in prompt, prompt  # lecture date lets the model resolve relative dates
+    assert "recap is NEVER its own segment" in prompt, prompt
+    assert "Review of last class" in prompt, prompt
     assert segments[0]["summary"] == "S", segments
     assert exams == [{"title": "Midterm", "due_date": "2026-10-01", "kind": "exam"}], exams
     app.analyze("lecture body")  # no notes, no created_at -> no notes/date preamble
