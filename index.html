@@ -121,8 +121,17 @@
     transition: transform .12s ease, background .2s ease, box-shadow .2s ease;
   }
   button#btn:hover, button.upload-btn:hover { background: #423e37; }
-  button#txBtn.tx-paused { background: #6b5416; border-color: #9a7c22; }
-  button#txBtn.tx-paused:hover { background: #7d6420; }
+  button.tx-pause {
+    font-size: .8rem;
+    padding: .15rem .6rem;
+    margin-left: .5rem;
+    border-radius: 999px;
+    border: 1px solid #55504a;
+    background: #38352f;
+    color: var(--ink-on-panel);
+    cursor: pointer;
+  }
+  button.tx-pause.tx-paused { background: #6b5416; border-color: #9a7c22; }
   button#btn:active, button.upload-btn:active { transform: translateY(1px); }
   button#btn:focus-visible {
     outline: 2px solid var(--live);
@@ -448,10 +457,6 @@
       <input type="file" id="hwInput" accept=".pdf,image/*" hidden>
       <button id="ytBtn" class="upload-btn" title="Add a YouTube video — save the link as a reference note, or transcribe it like a lecture">&#9654; YouTube</button>
     </div>
-    <div class="deck-group">
-      <span class="deck-label">Transcribe</span>
-      <button id="txBtn" class="upload-btn" title="Pause/resume transcription to save battery — decoding freezes mid-file and resumes exactly where it left off">&#9208; Pause</button>
-    </div>
     <div class="deck-group signal">
       <span class="deck-label">Signal</span>
       <span id="mic" class="mic"></span>
@@ -704,16 +709,14 @@ async function doSplit(rid, approve, btn) {
 }
 
 const fileInput = document.getElementById('fileInput');
-// battery saver: server-wide whisper pause; state lives server-side so a
-// reloaded tab paints the real state, not a stale default.
-const txBtn = document.getElementById('txBtn');
-function paintTx(paused) {
-  txBtn.innerHTML = paused ? '&#9654; Resume' : '&#9208; Pause';
-  txBtn.classList.toggle('tx-paused', paused);
+// battery saver: per-recording whisper pause; state lives server-side so a
+// reloaded tab paints the real state on the next refresh tick.
+async function togglePause(rid) {
+  await fetch('/transcribe/pause/' + rid, { method: 'POST' });
+  // the clicked button still holds focus inside #list, which makes refresh() skip
+  document.activeElement.blur();
+  refresh();
 }
-txBtn.onclick = async () =>
-  paintTx((await (await fetch('/transcribe/pause', { method: 'POST' })).json()).paused);
-fetch('/transcribe/pause').then(r => r.json()).then(d => paintTx(d.paused));
 
 document.getElementById('uploadBtn').onclick = () => fileInput.click();
 fileInput.onchange = () => { uploadFile(fileInput.files[0]); fileInput.value = ''; };
@@ -816,10 +819,13 @@ async function linkHw(rid) {
 }
 
 function progressBar(r) {
-  const label = STAGE_LABEL[r.stage] || r.stage || 'working';
+  const label = r.paused ? 'paused' : STAGE_LABEL[r.stage] || r.stage || 'working';
   const known = r.progress !== null && r.progress !== undefined;
-  const fill = known ? `<div class="bar-fill" style="width:${r.progress}%"></div>` : '<div class="bar-fill indeterminate"></div>';
-  return `<div class="progress"><div class="bar">${fill}</div><span class="progress-label">${esc(label)}${known ? ' — ' + r.progress + '%' : '…'}</span></div>`;
+  const fill = known ? `<div class="bar-fill" style="width:${r.progress}%"></div>`
+    : r.paused ? '<div class="bar-fill" style="width:0%"></div>'  // frozen, not pulsing
+    : '<div class="bar-fill indeterminate"></div>';
+  const pauseBtn = `<button class="tx-pause${r.paused ? ' tx-paused' : ''}" onclick="togglePause('${r.id}')" title="${r.paused ? 'Resume transcription' : 'Pause transcription to save battery — resumes exactly where it left off'}">${r.paused ? '&#9654; Resume' : '&#9208; Pause'}</button>`;
+  return `<div class="progress"><div class="bar">${fill}</div><span class="progress-label">${esc(label)}${known ? ' — ' + r.progress + '%' : '…'}</span>${pauseBtn}</div>`;
 }
 
 async function refresh() {

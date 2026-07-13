@@ -56,11 +56,19 @@ _model_progress = {"pct": None}  # download %, set by the tqdm hook below
 # ponytail: CTranslate2 isn't safe for concurrent transcribe() calls on one
 # model instance — reuse this lock to serialize them too, not just loading.
 _transcribe_lock = threading.Lock()
-# Battery saver: cleared = paused. process() checks this between whisper
-# segments (the generator decodes lazily, so blocking here stops the CPU/GPU
-# burn); nothing is lost — decoding just resumes where it left off.
-_transcribe_gate = threading.Event()
-_transcribe_gate.set()
+# Battery saver: one gate per recording, cleared = paused. process() checks
+# its gate between whisper segments (the generator decodes lazily, so blocking
+# there stops the CPU/GPU burn); decoding resumes where it left off. Entries
+# are popped when process() ends, so a restart always comes up unpaused.
+# ponytail: a row paused mid-decode holds _transcribe_lock, so rows queued
+# behind it wait too — single-user, whisper is serialized anyway.
+_transcribe_gates = {}
+
+
+def _gate(rid):
+    e = threading.Event()
+    e.set()
+    return _transcribe_gates.setdefault(rid, e)
 
 
 def _download_progress_tqdm():
@@ -350,21 +358,17 @@ def stop(rid: str):
     return {"ok": True}
 
 
-@app.post("/transcribe/pause")
-def transcribe_pause():
-    """Battery saver toggle: pauses/resumes ALL whisper decoding server-wide.
-    In-flight transcriptions block between segments and pick up where they
-    left off on resume — nothing is lost or restarted."""
-    if _transcribe_gate.is_set():
-        _transcribe_gate.clear()
+@app.post("/transcribe/pause/{rid}")
+def transcribe_pause(rid: str):
+    """Battery saver toggle for one recording: its whisper decode blocks
+    between segments and picks up where it left off on resume — nothing is
+    lost or restarted."""
+    g = _gate(rid)
+    if g.is_set():
+        g.clear()
     else:
-        _transcribe_gate.set()
-    return {"paused": not _transcribe_gate.is_set()}
-
-
-@app.get("/transcribe/pause")
-def transcribe_paused():
-    return {"paused": not _transcribe_gate.is_set()}
+        g.set()
+    return {"paused": not g.is_set()}
 
 
 @app.post("/upload")
@@ -417,6 +421,8 @@ def recordings():
     )
     for r in rows:
         r["obsidian_uri"] = _obsidian_uri(r.get("obsidian_path"))
+        g = _transcribe_gates.get(r["id"])
+        r["paused"] = bool(g) and not g.is_set()
     return rows
 
 
@@ -624,7 +630,7 @@ def _report_model_progress(rid, stop_event):
 
 def process(rid):
     try:
-        _transcribe_gate.wait()  # paused -> don't even start the model load
+        _gate(rid).wait()  # paused -> don't even start the model load
         _set(rid, stage="loading_model", progress=_model_progress["pct"])
         stop = threading.Event()
         threading.Thread(target=_report_model_progress, args=(rid, stop), daemon=True).start()
@@ -639,7 +645,7 @@ def process(rid):
             duration = max(info.duration, 1)
             parts, last_pct = [], -1
             for seg in segments:
-                _transcribe_gate.wait()  # paused -> block before decoding further
+                _gate(rid).wait()  # paused -> block before decoding further
                 parts.append(seg.text)
                 pct = min(99, int(seg.end / duration * 100) // 5 * 5)
                 if pct != last_pct:
@@ -649,6 +655,8 @@ def process(rid):
         finalize(rid, transcript)
     except Exception as e:
         _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]")
+    finally:
+        _transcribe_gates.pop(rid, None)  # restart/finish always comes up unpaused
 
 
 def finalize(rid, transcript, created_at=None):

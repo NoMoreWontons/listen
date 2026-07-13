@@ -42,15 +42,15 @@ def test_resume_stuck_recovers_crashed_recordings():
 
 
 def test_transcribe_pause_toggle():
-    """POST toggles the gate; GET reports without toggling; workers waiting on
-    the gate actually block while paused and wake on resume."""
-    assert app.transcribe_paused() == {"paused": False}
-    assert app.transcribe_pause() == {"paused": True}
-    assert app.transcribe_paused() == {"paused": True}
-    assert not app._transcribe_gate.wait(timeout=0.05), "gate should block while paused"
-    assert app.transcribe_pause() == {"paused": False}
-    assert app._transcribe_gate.wait(timeout=0.05), "gate should open on resume"
-    print("ok: transcribe pause toggles and gates waiting workers")
+    """POST toggles one recording's gate; other recordings stay unaffected;
+    a paused gate actually blocks and wakes on resume."""
+    assert app.transcribe_pause("a") == {"paused": True}
+    assert not app._gate("a").wait(timeout=0.05), "paused gate should block"
+    assert app._gate("b").wait(timeout=0.05), "other recordings stay running"
+    assert app.transcribe_pause("a") == {"paused": False}
+    assert app._gate("a").wait(timeout=0.05), "gate should open on resume"
+    app._transcribe_gates.clear()
+    print("ok: per-recording pause toggles and gates only that recording")
 
 
 def test_sweep_deletes_only_old():
