@@ -41,6 +41,18 @@ def test_resume_stuck_recovers_crashed_recordings():
     print("ok: resume_stuck recovers crashed recordings, skips rows with no audio")
 
 
+def test_transcribe_pause_toggle():
+    """POST toggles the gate; GET reports without toggling; workers waiting on
+    the gate actually block while paused and wake on resume."""
+    assert app.transcribe_paused() == {"paused": False}
+    assert app.transcribe_pause() == {"paused": True}
+    assert app.transcribe_paused() == {"paused": True}
+    assert not app._transcribe_gate.wait(timeout=0.05), "gate should block while paused"
+    assert app.transcribe_pause() == {"paused": False}
+    assert app._transcribe_gate.wait(timeout=0.05), "gate should open on resume"
+    print("ok: transcribe pause toggles and gates waiting workers")
+
+
 def test_sweep_deletes_only_old():
     with tempfile.TemporaryDirectory() as d:
         d = pathlib.Path(d)
@@ -60,4 +72,5 @@ def test_sweep_deletes_only_old():
 
 if __name__ == "__main__":
     test_resume_stuck_recovers_crashed_recordings()
+    test_transcribe_pause_toggle()
     test_sweep_deletes_only_old()

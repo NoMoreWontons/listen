@@ -56,6 +56,11 @@ _model_progress = {"pct": None}  # download %, set by the tqdm hook below
 # ponytail: CTranslate2 isn't safe for concurrent transcribe() calls on one
 # model instance — reuse this lock to serialize them too, not just loading.
 _transcribe_lock = threading.Lock()
+# Battery saver: cleared = paused. process() checks this between whisper
+# segments (the generator decodes lazily, so blocking here stops the CPU/GPU
+# burn); nothing is lost — decoding just resumes where it left off.
+_transcribe_gate = threading.Event()
+_transcribe_gate.set()
 
 
 def _download_progress_tqdm():
@@ -345,6 +350,23 @@ def stop(rid: str):
     return {"ok": True}
 
 
+@app.post("/transcribe/pause")
+def transcribe_pause():
+    """Battery saver toggle: pauses/resumes ALL whisper decoding server-wide.
+    In-flight transcriptions block between segments and pick up where they
+    left off on resume — nothing is lost or restarted."""
+    if _transcribe_gate.is_set():
+        _transcribe_gate.clear()
+    else:
+        _transcribe_gate.set()
+    return {"paused": not _transcribe_gate.is_set()}
+
+
+@app.get("/transcribe/pause")
+def transcribe_paused():
+    return {"paused": not _transcribe_gate.is_set()}
+
+
 @app.post("/upload")
 async def upload(request: Request, kind: str = "audio", filename: str = ""):
     """Uploaded course material joins the same pipeline as a live recording.
@@ -602,6 +624,7 @@ def _report_model_progress(rid, stop_event):
 
 def process(rid):
     try:
+        _transcribe_gate.wait()  # paused -> don't even start the model load
         _set(rid, stage="loading_model", progress=_model_progress["pct"])
         stop = threading.Event()
         threading.Thread(target=_report_model_progress, args=(rid, stop), daemon=True).start()
@@ -616,6 +639,7 @@ def process(rid):
             duration = max(info.duration, 1)
             parts, last_pct = [], -1
             for seg in segments:
+                _transcribe_gate.wait()  # paused -> block before decoding further
                 parts.append(seg.text)
                 pct = min(99, int(seg.end / duration * 100) // 5 * 5)
                 if pct != last_pct:

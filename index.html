@@ -121,6 +121,8 @@
     transition: transform .12s ease, background .2s ease, box-shadow .2s ease;
   }
   button#btn:hover, button.upload-btn:hover { background: #423e37; }
+  button#txBtn.tx-paused { background: #6b5416; border-color: #9a7c22; }
+  button#txBtn.tx-paused:hover { background: #7d6420; }
   button#btn:active, button.upload-btn:active { transform: translateY(1px); }
   button#btn:focus-visible {
     outline: 2px solid var(--live);
@@ -446,6 +448,10 @@
       <input type="file" id="hwInput" accept=".pdf,image/*" hidden>
       <button id="ytBtn" class="upload-btn" title="Add a YouTube video — save the link as a reference note, or transcribe it like a lecture">&#9654; YouTube</button>
     </div>
+    <div class="deck-group">
+      <span class="deck-label">Transcribe</span>
+      <button id="txBtn" class="upload-btn" title="Pause/resume transcription to save battery — decoding freezes mid-file and resumes exactly where it left off">&#9208; Pause</button>
+    </div>
     <div class="deck-group signal">
       <span class="deck-label">Signal</span>
       <span id="mic" class="mic"></span>
@@ -698,6 +704,17 @@ async function doSplit(rid, approve, btn) {
 }
 
 const fileInput = document.getElementById('fileInput');
+// battery saver: server-wide whisper pause; state lives server-side so a
+// reloaded tab paints the real state, not a stale default.
+const txBtn = document.getElementById('txBtn');
+function paintTx(paused) {
+  txBtn.innerHTML = paused ? '&#9654; Resume' : '&#9208; Pause';
+  txBtn.classList.toggle('tx-paused', paused);
+}
+txBtn.onclick = async () =>
+  paintTx((await (await fetch('/transcribe/pause', { method: 'POST' })).json()).paused);
+fetch('/transcribe/pause').then(r => r.json()).then(d => paintTx(d.paused));
+
 document.getElementById('uploadBtn').onclick = () => fileInput.click();
 fileInput.onchange = () => { uploadFile(fileInput.files[0]); fileInput.value = ''; };
 const hwInput = document.getElementById('hwInput');
