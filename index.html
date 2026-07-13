@@ -747,6 +747,8 @@ async function uploadFile(f, forceKind) {
   const resp = await (await fetch(`/upload?kind=${kind}&filename=${encodeURIComponent(f.name)}`,
     { method: 'POST', body: f })).json();
   if (resp.error) alert(resp.error);
+  // focus may still sit inside #list (same trap as deleteRec) — blur or refresh() skips
+  document.activeElement.blur();
   refresh();
 }
 
