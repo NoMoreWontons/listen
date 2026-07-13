@@ -398,7 +398,7 @@ def label(rid: str, payload: dict = Body(...)):
     recording, then re-file the Obsidian note (write_note moves it off the old
     path). Notes are saved before the Claude call so a failed re-summarize
     never loses them."""
-    old = (sb.table("recordings").select("status,transcript,notes")
+    old = (sb.table("recordings").select("status,transcript,notes,created_at")
            .eq("id", rid).single().execute().data or {})
     notes = payload.get("notes", "")
     _set(rid, **{"semester": payload.get("semester", ""), "class": payload.get("klass", ""),
@@ -409,7 +409,10 @@ def label(rid: str, payload: dict = Body(...)):
             and (old.get("transcript") or "").strip()
             and notes.strip() != (old.get("notes") or "").strip()):
         try:
-            segments, tokens_in, tokens_out = analyze(old["transcript"], notes)
+            # exams intentionally dropped here — re-summarize doesn't re-run the
+            # calendar/vault exam pipeline (finalize()'s job on first pass only)
+            segments, _exams, tokens_in, tokens_out = analyze(
+                old["transcript"], notes, old.get("created_at"))
             # row is already filed — a multi-segment reply here just folds into one summary
             summary = segments[0]["summary"] if len(segments) == 1 else _segments_summary(segments)
             _set(rid, summary=summary, tokens_in=tokens_in, tokens_out=tokens_out)
@@ -628,7 +631,8 @@ def finalize(rid, transcript, created_at=None):
     pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source")
            .eq("id", rid).single().execute().data or {})
     keep = lambda k, v: (pre.get(k) or "").strip() or v
-    segments, tokens_in, tokens_out = analyze(transcript, pre.get("notes") or "")
+    created_at = created_at or datetime.datetime.now().isoformat()
+    segments, exams, tokens_in, tokens_out = analyze(transcript, pre.get("notes") or "", created_at)
 
     pre_class = (pre.get("class") or "").strip()
     if pre_class:  # user already told us the class — it applies to every segment
@@ -639,13 +643,22 @@ def finalize(rid, transcript, created_at=None):
             .eq("status", "done").execute().data)
     segments = _snap_labels(segments, done)
 
-    created_at = created_at or datetime.datetime.now().isoformat()
-
     if len(segments) > 1:
+        semester = keep("semester", _semester(created_at))
         _set(rid, status="split_pending", stage=None, progress=None,
              transcript=transcript, tokens_in=tokens_in, tokens_out=tokens_out,
-             semester=keep("semester", _semester(created_at)),
+             semester=semester,
              pending_segments=segments, source=pre.get("source") or "local")
+        if exams:
+            # exams are lecture-level, not per-segment, and split labels aren't
+            # confirmed yet — file under the best guess now (pre_class, else
+            # segment 1's class). save_assignments upserts on (klass,title) and
+            # write_exam_note overwrites by slug, so a later /split relabel
+            # just re-files instead of duplicating.
+            klass = pre_class or segments[0]["class"]
+            save_assignments(rid, klass, exams)
+            for exam in exams:
+                write_exam_note(semester, klass, exam)
         return
 
     seg = segments[0]
@@ -665,6 +678,11 @@ def finalize(rid, transcript, created_at=None):
     path = write_note(row)
     if path:
         _set(rid, obsidian_path=path)
+
+    if exams:
+        save_assignments(rid, fields["class"], exams)  # dated ones only -> calendar
+        for exam in exams:  # dated or not -> vault note either way
+            write_exam_note(fields["semester"], fields["class"], exam)
 
 
 def _segments_summary(segments):
@@ -761,6 +779,9 @@ def process_pdf(rid):
                     "\n\n### Due dates\n\n| Due | What | Kind |\n|---|---|---|\n"
                     + "\n".join(f"| {a['due_on']} | {a['title']} | {a['kind']} |" for a in saved)
                 )
+            for a in assignments or []:
+                if a.get("kind") in ("exam", "quiz"):
+                    write_exam_note(fields["semester"], fields["class"], a)
         _set(rid, **fields)
         row = {"id": rid, "created_at": created_at, "source": pre.get("source"), **fields}
         path = write_note(row)
@@ -1213,9 +1234,12 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False):
     ) if (notes or "").strip() else ""
     syllabus_part = (
         "- assignments: an array of every dated deliverable in the document, each "
-        "{title, due_date, kind}. due_date is 'YYYY-MM-DD' (resolve relative dates "
-        "like 'Week 3' from dates stated in the document; omit items with no "
-        "resolvable date). kind is one of: assignment, exam, quiz, project.\n"
+        "{title, due_date, kind, format, topics}. due_date is 'YYYY-MM-DD' (resolve "
+        "relative dates like 'Week 3' from dates stated in the document; omit items "
+        "with no resolvable date). kind is one of: assignment, exam, quiz, project. "
+        "format and topics are optional — for exam/quiz rows especially, include "
+        "format (free text, e.g. '50 multiple choice, closed book') and topics "
+        "(array of strings) when the document states them; omit otherwise.\n"
     ) if syllabus else ""
     msg = claude.messages.create(
         model="claude-haiku-4-5",
@@ -1326,20 +1350,40 @@ def _snap_labels(segments, rows):
     return segments
 
 
-def analyze(transcript, notes=""):
+def _parse_exams(raw):
+    """Parses analyze()'s {"exams": [...]} JSON reply defensively — missing
+    key, non-list, or unparseable JSON all fall back to no exams detected.
+    Pure — no network/DB — so it's directly testable."""
+    try:
+        exams = json.loads(raw).get("exams")
+        return exams if isinstance(exams, list) else []
+    except (json.JSONDecodeError, AttributeError):
+        return []
+
+
+def analyze(transcript, notes="", created_at=None):
     """One Claude call: splits the lecture into topic segments — almost always
     just one — and produces college-lecture labels (class/unit/topic) +
-    summary per segment. User notes, when present, are woven into the summary
-    rather than kept as a separate section. Returns (segments, tokens_in,
-    tokens_out); segments is a non-empty list of {class, unit, topic, summary}
-    dicts."""
+    summary per segment, plus any announced upcoming exams/quizzes. User
+    notes, when present, are woven into the summary rather than kept as a
+    separate section. created_at (the recording's date) lets the model
+    resolve relative dates lecturers say out loud ('next Friday'). Returns
+    (segments, exams, tokens_in, tokens_out); segments is a non-empty list of
+    {class, unit, topic, summary} dicts, exams a (usually empty) list of
+    {title, due_date, kind, format, topics} dicts."""
     if not transcript:
-        return [{"class": "", "unit": "", "topic": "", "summary": ""}], 0, 0
+        return [{"class": "", "unit": "", "topic": "", "summary": ""}], [], 0, 0
     notes_part = (
         "\nThe student took their own notes during this lecture. Integrate them "
         "into the summary, giving weight to anything they flagged:\n"
         + notes.strip() + "\n"
     ) if (notes or "").strip() else ""
+    lecture_date = (created_at or "")[:10]
+    date_part = (
+        f"\nThis lecture was recorded on {lecture_date}. Resolve any relative "
+        "dates the lecturer mentions ('next Friday', 'after spring break', "
+        "'two weeks from now') against this date.\n"
+    ) if lecture_date else ""
     msg = claude.messages.create(
         model="claude-haiku-4-5",
         max_tokens=6000,  # multi-segment replies carry one full summary per topic
@@ -1360,9 +1404,9 @@ def analyze(transcript, notes=""):
                     "share a theme is ONE segment covering that theme (e.g. assorted "
                     "application problems = one 'Applications of Derivatives' segment). "
                     "Most lectures are 1 segment, sometimes 2 — NEVER more than 3.\n"
-                    "Return ONLY a JSON object with key: segments — an array of one "
-                    "object per topic segment, each with keys class, unit, topic, "
-                    "summary.\n"
+                    "Return ONLY a JSON object with keys: segments, exams.\n"
+                    "segments is an array of one object per topic segment, each with "
+                    "keys class, unit, topic, summary.\n"
                     "- class: the course subject (e.g. 'Biology', 'US History')\n"
                     "- unit: the broader unit/module this segment belongs to\n"
                     "- topic: the specific topic of THIS segment, 5 words max "
@@ -1380,7 +1424,18 @@ def analyze(transcript, notes=""):
                     "'## Questions & answers' section: one bullet per exchange, '**Q:** …' "
                     "then '**A:** …' with the lecturer's response (or '*unanswered*'). Omit "
                     "the section if there were none.\n"
-                    + notes_part + "\nTranscript:\n" + transcript
+                    "exams is an array (usually empty) of upcoming tests/quizzes/exams the "
+                    "lecturer announces or discusses in this transcript — ignore mentions of "
+                    "past exams or hypotheticals. Each item: {title, due_date, kind, format, "
+                    "topics}.\n"
+                    "- title: short descriptive name (e.g. 'Midterm 1', 'Quiz on derivatives')\n"
+                    "- due_date: 'YYYY-MM-DD', or \"\" if it can't be resolved\n"
+                    "- kind: 'exam' or 'quiz' (map 'test'/'midterm'/'final' to 'exam')\n"
+                    "- format: what the lecturer says about the exam's format (e.g. '50 "
+                    "multiple choice, no calculator'), else \"\"\n"
+                    "- topics: array of topics/units/chapters the lecturer says it covers, "
+                    "else []\n"
+                    + notes_part + date_part + "\nTranscript:\n" + transcript
                 ),
             }
         ],
@@ -1388,7 +1443,8 @@ def analyze(transcript, notes=""):
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
     segments = _parse_segments(raw)
-    return segments, msg.usage.input_tokens, msg.usage.output_tokens
+    exams = _parse_exams(raw)
+    return segments, exams, msg.usage.input_tokens, msg.usage.output_tokens
 
 
 def _semester(iso_date):
@@ -1666,3 +1722,44 @@ def write_note(row):
     except Exception as e:
         print(f"[listen] hub notes/graph config failed (note itself is written): {e}")
     return dest
+
+
+def write_exam_note(sem, cls, exam):
+    """Files a detected/announced exam or quiz under
+    <vault>/<sem>/<cls>/Exams/<title>.md — separate from lecture notes since
+    an exam isn't tied to one unit. Same title -> same slug -> overwrites in
+    place, so re-detecting an exam across lectures/a revised syllabus is
+    idempotent. A 'topics' entry that exactly matches an existing unit folder
+    under this class links to that unit's hub note; anything else stays a
+    plain bullet. Returns the path (str)."""
+    s_sem, s_cls = _slug(sem), _slug(cls)
+    # str()-wrap every model-supplied field — same defensiveness as
+    # save_assignments' due_date parsing — so malformed JSON from Claude can't
+    # crash finalize()/process_pdf() after the row's already marked done.
+    title = str(exam.get("title") or "").strip() or "Exam"
+    kind = str(exam.get("kind") or "exam")
+    due = str(exam.get("due_date") or "").strip()
+    fmt = str(exam.get("format") or "").strip()
+    topics = exam.get("topics")
+    topics = topics if isinstance(topics, list) else []
+
+    cls_dir = OBSIDIAN_VAULT / s_sem / s_cls
+    units = {p.name for p in cls_dir.iterdir() if p.is_dir()} if cls_dir.is_dir() else set()
+
+    fm = {"class": cls, "kind": kind, "date": due or "TBA", "tags": "[exam]"}
+    front = "\n".join(f"{k}: {v}" for k, v in fm.items())
+    body = f"---\n{front}\n---\n\n# {title}\n\n**Date:** {due or 'TBA'}\n"
+    if fmt:
+        body += f"\n**Format:** {fmt}\n"
+    if topics:
+        bullets = "\n".join(
+            f"- [[{s_sem}/{s_cls}/{t}/{t}|{t}]]" if t in units else f"- {t}"
+            for t in (str(x).strip() for x in topics) if t
+        )
+        if bullets:
+            body += f"\n## Covers\n\n{bullets}\n"
+
+    path = cls_dir / "Exams" / f"{_slug(title)}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return str(path)

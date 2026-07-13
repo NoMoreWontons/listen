@@ -254,7 +254,8 @@ def test_analyze_integrates_notes():
 
     class FakeMsg:
         content = [type("T", (), {
-            "text": '{"segments":[{"class":"C","unit":"U","topic":"T","summary":"S"}]}'})()]
+            "text": '{"segments":[{"class":"C","unit":"U","topic":"T","summary":"S"}],'
+                    '"exams":[{"title":"Midterm","due_date":"2026-10-01","kind":"exam"}]}'})()]
         usage = type("U", (), {"input_tokens": 1, "output_tokens": 2})()
 
     def fake_create(**kw):
@@ -263,13 +264,66 @@ def test_analyze_integrates_notes():
         return FakeMsg()
 
     app.claude.messages.create = fake_create
-    segments, *_ = app.analyze("lecture body", "watch slide 12")
+    segments, exams, *_ = app.analyze("lecture body", "watch slide 12", "2026-09-20T10:00:00")
     prompt = captured["messages"][0]["content"]
     assert "watch slide 12" in prompt, prompt
+    assert "2026-09-20" in prompt, prompt  # lecture date lets the model resolve relative dates
     assert segments[0]["summary"] == "S", segments
-    app.analyze("lecture body")  # no notes -> no notes preamble
+    assert exams == [{"title": "Midterm", "due_date": "2026-10-01", "kind": "exam"}], exams
+    app.analyze("lecture body")  # no notes, no created_at -> no notes/date preamble
     assert "their own notes" not in captured["messages"][0]["content"]
-    print("ok: analyze feeds user notes into the summary prompt")
+    assert "recorded on" not in captured["messages"][0]["content"]
+    print("ok: analyze feeds user notes + lecture date into the prompt, parses exams")
+
+
+def test_parse_exams_defensive():
+    assert app._parse_exams('{"segments":[]}') == []  # missing key
+    assert app._parse_exams('{"exams":"not a list"}') == []  # wrong type
+    assert app._parse_exams('not json at all') == []  # unparseable
+    assert app._parse_exams('{"exams":[{"title":"Midterm"}]}') == [{"title": "Midterm"}]
+    print("ok: _parse_exams parses missing/malformed exams defensively")
+
+
+def test_write_exam_note_links_matching_units():
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        # a unit folder that already exists under this class -> Covers should link it
+        (pathlib.Path(d) / "Fall 26" / "Biology" / "Cells").mkdir(parents=True)
+        exam = {
+            "title": "Midterm 1", "kind": "exam", "due_date": "2026-10-01",
+            "format": "50 multiple choice, no calculator",
+            "topics": ["Cells", "Genetics"],
+        }
+        path = app.write_exam_note("Fall 26", "Biology", exam)
+        expected = pathlib.Path(d) / "Fall 26" / "Biology" / "Exams" / "Midterm 1.md"
+        assert path == str(expected), path
+        text = expected.read_text(encoding="utf-8")
+        assert "class: Biology" in text and "kind: exam" in text and "tags: [exam]" in text, text
+        assert "# Midterm 1" in text, text
+        assert "**Date:** 2026-10-01" in text, text
+        assert "**Format:** 50 multiple choice, no calculator" in text, text
+        assert "- [[Fall 26/Biology/Cells/Cells|Cells]]" in text, text  # matches existing unit
+        assert "- Genetics" in text, text  # no matching folder -> plain bullet
+    print("ok: write_exam_note links Covers entries that match existing unit folders")
+
+
+def test_write_exam_note_undated_no_format_overwrites():
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        exam = {"title": "Pop quiz", "kind": "quiz", "due_date": "", "format": "", "topics": []}
+        path = app.write_exam_note("Fall 26", "Biology", exam)
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+        assert "**Date:** TBA" in text, text
+        assert "**Format:**" not in text, text
+        assert "## Covers" not in text, text
+
+        # re-detecting the same exam overwrites the same file (idempotent)
+        exam2 = {"title": "Pop quiz", "kind": "quiz", "due_date": "2026-11-03", "format": "", "topics": []}
+        path2 = app.write_exam_note("Fall 26", "Biology", exam2)
+        assert path2 == path
+        text2 = pathlib.Path(path).read_text(encoding="utf-8")
+        assert "**Date:** 2026-11-03" in text2, text2
+    print("ok: write_exam_note handles missing date/format/topics, overwrites on re-detection")
 
 
 if __name__ == "__main__":
@@ -281,3 +335,6 @@ if __name__ == "__main__":
     test_legacy_rid_suffixed_files_cleaned_up()
     test_delete_recording_rewrites_shared_note()
     test_analyze_integrates_notes()
+    test_parse_exams_defensive()
+    test_write_exam_note_links_matching_units()
+    test_write_exam_note_undated_no_format_overwrites()
