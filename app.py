@@ -1237,7 +1237,11 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False):
                     "- key_points: the document's content distilled as thorough markdown "
                     "notes (this stands in for a transcript)\n"
                     "- summary: concise key points and any action items, as a markdown "
-                    "bullet list\n" + syllabus_part + notes_part
+                    "bullet list. If the document works through example problems, append "
+                    "a '## Worked examples' section: one '### <short problem name>' per "
+                    "problem with the problem statement, key solution steps, and final "
+                    "answer (LaTeX $...$ for math); omit if none\n"
+                    + syllabus_part + notes_part
                 )},
             ],
         }],
@@ -1365,8 +1369,14 @@ def analyze(transcript, notes=""):
                     "(used as the note title)\n"
                     "- summary: markdown. First, concise key points and any action items "
                     "as a bullet list — built from the LECTURER's material; ignore student "
-                    "chatter unless the lecturer engages it. Then, if any student questions "
-                    "or lecturer prompts occurred during this segment, append a "
+                    "chatter unless the lecturer engages it. Then, if the lecturer worked "
+                    "through any in-class problems or examples in this segment, append a "
+                    "'## Worked examples' section: one '### <short problem name>' per "
+                    "problem with the problem statement, the key solution steps, and the "
+                    "final answer (use LaTeX $...$ for math). Skip trivial throwaway "
+                    "illustrations; omit the section if there were none. Then, if any "
+                    "student questions or lecturer prompts occurred during this segment, "
+                    "append a "
                     "'## Questions & answers' section: one bullet per exchange, '**Q:** …' "
                     "then '**A:** …' with the lecturer's response (or '*unanswered*'). Omit "
                     "the section if there were none.\n"
