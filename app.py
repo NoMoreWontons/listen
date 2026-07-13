@@ -19,6 +19,8 @@ load_dotenv()
 HERE = pathlib.Path(__file__).parent
 AUDIO_DIR = HERE / "audio"
 AUDIO_DIR.mkdir(exist_ok=True)
+FRQ_UPLOAD_DIR = HERE / "frq_uploads"  # photographed/scanned FRQ answer pages, kept for the record
+FRQ_UPLOAD_DIR.mkdir(exist_ok=True)
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
 # ponytail: this is a *stall* timeout, not a total-time budget — any download
@@ -897,25 +899,35 @@ def assignment_complete(aid: str, payload: dict = Body(...)):
 
 # --- practice quiz / test generator ---
 
-def generate_quiz(rows, kind="quiz"):
-    """One Claude call: mixed MCQ + short-answer questions from the filed
-    notes' summaries. Returns the parsed question list; raises if the model
-    returns unparseable JSON (caller surfaces it as an error)."""
-    n_mcq, n_short = (7, 3) if kind == "quiz" else (14, 6)
+def generate_quiz(rows, kind="quiz", fmt="mcq"):
+    """One Claude call: builds a practice quiz/test from the filed notes'
+    summaries. fmt='mcq' -> all multiple-choice (today's shape); fmt='frq' ->
+    free-response questions with a grading rubric (answers are handwritten on
+    paper, photographed, and graded later by grade_frq). Returns the parsed
+    question list; raises if the model returns unparseable JSON (caller
+    surfaces it as an error)."""
     material = "\n\n".join(
         f"## {r.get('topic') or r.get('title') or ''}\n{r.get('summary') or ''}"
         for r in rows if (r.get("summary") or "").strip())
+    if fmt == "frq":
+        n = 4 if kind == "quiz" else 8
+        ask = (
+            f"Create a practice {kind} from these college lecture notes: {n} "
+            "free-response questions. Return ONLY a JSON array; each item is "
+            '{"type":"frq","q":"...","rubric":"2-4 bullet points of what a '
+            'full-credit answer must include"}.\n'
+            "Cover the breadth of the material.\n\n")
+    else:
+        n = 10 if kind == "quiz" else 20
+        ask = (
+            f"Create a practice {kind} from these college lecture notes: {n} "
+            "multiple-choice questions. Return ONLY a JSON array; each item is "
+            '{"type":"mcq","q":"...","choices":["...","...","...","..."],'
+            '"answer":<0-3 index of the correct choice>,"explanation":"one sentence"}.\n'
+            "Cover the breadth of the material; make wrong choices plausible.\n\n")
     msg = claude.messages.create(
         model="claude-haiku-4-5", max_tokens=6000,
-        messages=[{"role": "user", "content": (
-            f"Create a practice {kind} from these college lecture notes: "
-            f"{n_mcq} multiple-choice questions and {n_short} short-answer questions. "
-            "Return ONLY a JSON array; each item is one of:\n"
-            '- {"type":"mcq","q":"...","choices":["...","...","...","..."],'
-            '"answer":<0-3 index of the correct choice>,"explanation":"one sentence"}\n'
-            '- {"type":"short","q":"...","answer":"model answer, 1-3 sentences","explanation":""}\n'
-            "Cover the breadth of the material; make wrong choices plausible.\n\n"
-            "Notes:\n" + material)}],
+        messages=[{"role": "user", "content": ask + "Notes:\n" + material}],
     )
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
@@ -973,12 +985,48 @@ def grade_short(questions, results):
     return pts
 
 
+def grade_frq(questions, files):
+    """One Sonnet vision call grades all FRQ answers from photographed/scanned
+    pages against each question's rubric. files: list of raw file bytes,
+    turned into content blocks via _doc_block. Returns results aligned with
+    questions: {"answer": <transcription>, "score": 0/0.5/1, "feedback": ...}."""
+    blocks = [_doc_block(f) for f in files]
+    listing = "\n\n".join(
+        f"Question {i}: {q.get('q')}\nRubric: {q.get('rubric', '')}"
+        for i, q in enumerate(questions))
+    msg = claude.messages.create(
+        model="claude-sonnet-5", max_tokens=3000,
+        messages=[{"role": "user", "content": blocks + [{"type": "text", "text": (
+            "Grade the handwritten work in the attached pages against these free-response "
+            "questions and rubrics. Return ONLY a JSON array with one object per question, "
+            'in order: {"i": <question number>, "score": <0, 0.5 or 1>, "feedback": "1-2 '
+            'sentences", "transcription": "student\'s answer, briefly"}.\n\n' + listing)}]}],
+    )
+    raw = re.sub(r"^```(?:json)?|```$", "", msg.content[0].text.strip(), flags=re.MULTILINE).strip()
+    try:
+        by_i = {g.get("i"): g for g in json.loads(raw)}
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        by_i = {}
+    results = []
+    for i, q in enumerate(questions):
+        g = by_i.get(i) or {"score": 0, "feedback": "grading failed — compare with the rubric",
+                             "transcription": ""}
+        try:
+            s = min(max(float(g.get("score") or 0), 0.0), 1.0)
+        except (TypeError, ValueError):
+            s = 0.0
+        results.append({"answer": str(g.get("transcription") or ""), "score": s,
+                         "feedback": str(g.get("feedback") or "")})
+    return results
+
+
 @app.post("/quiz/generate")
 def quiz_generate(payload: dict = Body(...)):
     sem = (payload.get("semester") or "").strip()
     cls = (payload.get("class") or "").strip()
     unit = (payload.get("unit") or "").strip()
     kind = payload.get("kind") if payload.get("kind") in ("quiz", "test") else "quiz"
+    fmt = payload.get("format") if payload.get("format") in ("mcq", "frq") else "mcq"
     if not cls:
         return {"error": "class required"}
     q = (sb.table("recordings").select("topic,title,summary")
@@ -991,7 +1039,7 @@ def quiz_generate(payload: dict = Body(...)):
     if not any((r.get("summary") or "").strip() for r in rows):
         return {"error": "no filed notes for that scope yet"}
     try:
-        questions = generate_quiz(rows, kind)
+        questions = generate_quiz(rows, kind, fmt)
     except Exception as e:
         return {"error": f"generation failed: {e}"}
     return sb.table("quizzes").insert({
@@ -1011,6 +1059,46 @@ def quiz_submit(qid: str, payload: dict = Body(...)):
     total = mcq_total + sum(1 for q in questions if q.get("type") == "short")
     score = round(pts / max(total, 1) * 100)
     sb.table("quizzes").update({"answers": results, "score": score}).eq("id", qid).execute()
+    try:
+        write_quiz_note(quiz, questions, results, score)
+    except Exception as e:
+        print(f"[listen] quiz note write failed (grade itself is saved): {e}")
+    return {"score": score, "results": results, "questions": questions}
+
+
+@app.post("/quiz/{qid}/submit_frq")
+def quiz_submit_frq(qid: str, payload: dict = Body(...)):
+    """FRQ submission: JSON body {"files":[{"name":str,"data":<base64>}]} —
+    photographed/scanned answer pages, graded in one Sonnet vision call
+    (grade_frq). JSON body rather than multipart: keeps the same request
+    style as every other endpoint and skips the python-multipart dependency
+    (see /upload's docstring for the same call on audio/PDF uploads)."""
+    import base64
+    quiz = sb.table("quizzes").select("*").eq("id", qid).single().execute().data
+    questions = quiz["questions"] or []
+    files_in = payload.get("files") or []
+    if not files_in:
+        return {"error": "no files uploaded"}
+    file_bytes = []
+    for n, f in enumerate(files_in):
+        try:
+            data = base64.b64decode(f.get("data") or "")
+        except (ValueError, TypeError):
+            return {"error": f"file {n + 1}: invalid upload"}
+        suffix = pathlib.Path(f.get("name") or "").suffix or ".jpg"
+        (FRQ_UPLOAD_DIR / f"{qid}_{n}{suffix}").write_bytes(data)
+        file_bytes.append(data)
+    try:
+        results = grade_frq(questions, file_bytes)
+    except Exception as e:
+        return {"error": f"grading failed: {e}"}
+    pts = sum(r["score"] for r in results)
+    score = round(pts / max(len(questions), 1) * 100)
+    sb.table("quizzes").update({"answers": results, "score": score}).eq("id", qid).execute()
+    try:
+        write_quiz_note(quiz, questions, results, score)
+    except Exception as e:
+        print(f"[listen] quiz note write failed (grade itself is saved): {e}")
     return {"score": score, "results": results, "questions": questions}
 
 
@@ -1809,6 +1897,46 @@ def write_exam_note(sem, cls, exam):
             body += f"\n## Covers\n\n{bullets}\n"
 
     path = cls_dir / "Exams" / f"{_slug(title)}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+def write_quiz_note(quiz, questions, results, score):
+    """Files a graded practice quiz/test under
+    <vault>/<sem>/<cls>/Practice/<kind> <date> <time> — <score>%.md. Mirrors
+    write_exam_note's structure/graph anchor. Returns the path (str)."""
+    s_sem, s_cls = _slug(quiz.get("semester")), _slug(quiz.get("class"))
+    kind = str(quiz.get("kind") or "quiz")
+    now = datetime.datetime.now()
+
+    fm = {"class": quiz.get("class") or "", "kind": kind, "score": score,
+          "date": now.strftime("%Y-%m-%d"), "tags": "[practice]"}
+    front = "\n".join(f"{k}: {v}" for k, v in fm.items())
+    body = f"---\n{front}\n---\n\n# {kind.title()} — {score}%\n"
+
+    for i, q in enumerate(questions):
+        r = results[i] if i < len(results) else {}
+        body += f"\n### Q{i + 1}\n\n{q.get('q', '')}\n\n"
+        if q.get("type") == "mcq":
+            choices = q.get("choices") or []
+            correct, picked = q.get("answer"), r.get("answer")
+            for ci, c in enumerate(choices):
+                tags = [t for t, ok in (("correct", ci == correct), ("your pick", ci == picked)) if ok]
+                body += f"- {c}" + (f" ({', '.join(tags)})" if tags else "") + "\n"
+        elif q.get("type") == "frq":
+            body += f"**Rubric:** {q.get('rubric', '')}\n\n**Transcribed answer:** {r.get('answer', '')}\n"
+        else:  # short — legacy quizzes
+            body += f"**Model answer:** {q.get('answer', '')}\n\n**Your answer:** {r.get('answer', '')}\n"
+        if "score" in r:
+            body += f"\nScore: {r['score']} — {r.get('feedback', '')}\n"
+        elif "correct" in r:
+            body += f"\n{'Correct' if r.get('correct') else 'Incorrect'}\n"
+
+    body += f"\nClass: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]\n"
+
+    path = (OBSIDIAN_VAULT / s_sem / s_cls / "Practice"
+            / f"{kind} {now:%Y-%m-%d %H%M} — {score}%.md")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return str(path)

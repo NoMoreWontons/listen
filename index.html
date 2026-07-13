@@ -510,6 +510,10 @@
           <option value="quiz">Quiz — 10 q</option>
           <option value="test">Test — 20 q</option>
         </select>
+        <select id="pFormat">
+          <option value="mcq">MCQ</option>
+          <option value="frq">FRQ — write on paper</option>
+        </select>
         <button onclick="genQuiz(this)">Generate</button>
       </div>
       <div id="pastQuizzes"></div>
@@ -1186,6 +1190,7 @@ async function genQuiz(btn) {
     class: document.getElementById('pClass').value,
     unit: document.getElementById('pUnit').value,
     kind: document.getElementById('pKind').value,
+    format: document.getElementById('pFormat').value,
   };
   if (!body.class) { alert('record and file some lectures first'); return; }
   btn.disabled = true; btn.textContent = 'generating…';
@@ -1201,18 +1206,28 @@ async function genQuiz(btn) {
 }
 
 function renderQuizForm(q) {
-  document.getElementById('quizArea').innerHTML = `<div class="quiz" data-qid="${q.id}">
-    <div class="quiz-head"><b>${esc(q.kind)} — ${esc(q.class || '')}${q.unit ? ' / ' + esc(q.unit) : ''}</b>
-      <button onclick="closeQuiz()" title="Close">&#10005;</button></div>
-    ${q.questions.map((qq, i) => `<div class="q" data-i="${i}">
-      <p>${i + 1}. ${esc(qq.q)}</p>
-      ${qq.type === 'mcq'
-        ? qq.choices.map((c, ci) => `<label><input type="radio" name="q${i}" value="${ci}"> ${esc(c)}</label>`).join('')
-        : `<textarea rows="2" placeholder="your answer"></textarea>`}
-    </div>`).join('')}
-    <button class="submit" onclick="submitQuiz(this, '${q.id}')">Submit</button>
-  </div>`;
-  document.getElementById('quizArea').scrollIntoView({ behavior: 'smooth' });
+  const area = document.getElementById('quizArea');
+  const head = `<div class="quiz-head"><b>${esc(q.kind)} — ${esc(q.class || '')}${q.unit ? ' / ' + esc(q.unit) : ''}</b>
+      <button onclick="closeQuiz()" title="Close">&#10005;</button></div>`;
+  if (q.questions[0]?.type === 'frq') {
+    area.innerHTML = `<div class="quiz" data-qid="${q.id}">${head}
+      ${q.questions.map((qq, i) => `<div class="q"><p>${i + 1}. ${esc(qq.q)}</p></div>`).join('')}
+      <p class="gs-note">Write your answers on paper, then photograph/scan and upload.</p>
+      <input type="file" id="frqFiles" multiple accept="image/*,.pdf" capture="environment">
+      <button class="submit" onclick="submitFrq('${q.id}', this)">Submit</button>
+    </div>`;
+  } else {
+    area.innerHTML = `<div class="quiz" data-qid="${q.id}">${head}
+      ${q.questions.map((qq, i) => `<div class="q" data-i="${i}">
+        <p>${i + 1}. ${esc(qq.q)}</p>
+        ${qq.type === 'mcq'
+          ? qq.choices.map((c, ci) => `<label><input type="radio" name="q${i}" value="${ci}"> ${esc(c)}</label>`).join('')
+          : `<textarea rows="2" placeholder="your answer"></textarea>`}
+      </div>`).join('')}
+      <button class="submit" onclick="submitQuiz(this, '${q.id}')">Submit</button>
+    </div>`;
+  }
+  area.scrollIntoView({ behavior: 'smooth' });
 }
 
 async function submitQuiz(btn, qid) {
@@ -1234,6 +1249,27 @@ async function submitQuiz(btn, qid) {
   } finally { btn.disabled = false; }
 }
 
+async function submitFrq(qid, btn) {
+  const files = [...document.getElementById('frqFiles').files];
+  if (!files.length) { alert('attach at least one photo/scan'); return; }
+  btn.disabled = true; btn.textContent = 'grading…';
+  try {
+    const encoded = await Promise.all(files.map(f => new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve({ name: f.name, data: r.result.split(',')[1] });
+      r.onerror = reject;
+      r.readAsDataURL(f);
+    })));
+    const g = await (await fetch(`/quiz/${qid}/submit_frq`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: encoded }),
+    })).json();
+    if (g.error) { alert(g.error); return; }
+    pastLoaded = 0;
+    renderQuizResults(qid, g.questions, g.results, g.score);
+  } finally { btn.disabled = false; }
+}
+
 function renderQuizResults(qid, questions, results, score) {
   document.getElementById('quizArea').innerHTML = `<div class="quiz" data-qid="${qid}">
     <div class="quiz-head"><b>Score: ${score}%</b>
@@ -1248,9 +1284,11 @@ function renderQuizResults(qid, questions, results, score) {
           ${qq.explanation ? '<br>' + esc(qq.explanation) : ''}</p>`;
       } else {
         const s = r.score ?? 0;
+        const ref = qq.type === 'frq' ? `Rubric: ${esc(qq.rubric || '')}` : `Model answer: ${esc(qq.answer || '')}`;
+        const mine = qq.type === 'frq' ? `Transcribed: ${esc(String(r.answer || '(blank)'))}` : `You wrote: ${esc(String(r.answer || '(blank)'))}`;
         verdict = `<p class="verdict ${s >= 1 ? 'good' : 'bad'}">${s >= 1 ? '✓' : s > 0 ? '½' : '✗'} ${esc(r.feedback || '')}
-          <br>Model answer: ${esc(qq.answer || '')}</p>
-          <p class="verdict">You wrote: ${esc(String(r.answer || '(blank)'))}</p>`;
+          <br>${ref}</p>
+          <p class="verdict">${mine}</p>`;
       }
       return `<div class="q"><p>${i + 1}. ${esc(qq.q)}</p>${verdict}</div>`;
     }).join('')}
