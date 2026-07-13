@@ -1291,6 +1291,9 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
         "- summary: a short plain-English overview — what the assignment covers, "
         "which concepts it practices, and anything incomplete or worth "
         "revisiting, as a markdown bullet list\n"
+        "Write ALL math notation as LaTeX ($...$ inline, $$...$$ for display "
+        "equations) — never plain-text approximations like x^2, sqrt(), or "
+        "unicode fractions.\n"
     ) if homework else (
         "- key_points: the document's content distilled as thorough markdown "
         "notes (this stands in for a transcript)\n"
@@ -1299,6 +1302,9 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
         "a '## Worked examples' section: one '### <short problem name>' per "
         "problem with the problem statement, key solution steps, and final "
         "answer (LaTeX $...$ for math); omit if none\n"
+        "Write ALL math notation as LaTeX ($...$ inline, $$...$$ for display "
+        "equations) — never plain-text approximations like x^2, sqrt(), or "
+        "unicode fractions.\n"
     )
     msg = claude.messages.create(
         model="claude-haiku-4-5",
@@ -1486,7 +1492,9 @@ def analyze(transcript, notes="", created_at=None):
                     "append a "
                     "'## Questions & answers' section: one bullet per exchange, '**Q:** …' "
                     "then '**A:** …' with the lecturer's response (or '*unanswered*'). Omit "
-                    "the section if there were none.\n"
+                    "the section if there were none. Write ALL math notation as LaTeX "
+                    "($...$ inline, $$...$$ for display equations) — never plain-text "
+                    "approximations like x^2, sqrt(), or unicode fractions.\n"
                     "exams is an array (usually empty) of upcoming tests/quizzes/exams the "
                     "lecturer announces or discusses in this transcript — ignore mentions of "
                     "past exams or hypotheticals. Each item: {title, due_date, kind, format, "

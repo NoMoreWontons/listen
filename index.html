@@ -428,9 +428,19 @@
 
   h4 { font-family: var(--font-display); font-size: .8rem; margin: .8rem 0 .3rem; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .06em; }
   pre { white-space: pre-wrap; word-wrap: break-word; font-size: .88rem; margin: 0; }
+  .md { font-size: .88rem; }
+  .md h2, .md h3 { margin: .6rem 0 .25rem; font-size: 1rem; }
+  .md h3 { font-size: .92rem; }
+  .md ul, .md ol { margin: .2rem 0 .4rem; padding-left: 1.3rem; }
+  .md p { margin: .3rem 0; }
+  .md .katex-display { overflow-x: auto; }
   details summary { cursor: pointer; font-size: .82rem; color: var(--ink-soft); margin-top: .6rem; }
   details summary:focus-visible { outline: 2px solid var(--live); outline-offset: 2px; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/contrib/auto-render.min.js"></script>
 </head>
 <body>
 <div class="brand">
@@ -656,6 +666,16 @@ pauseBtn.onclick = () => {
 };
 
 function esc(s) { return s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+// summaries/key points are markdown with $...$ math; render instead of <pre>-dumping.
+// esc first so any raw HTML from the model stays inert, then marked turns md syntax into tags.
+function md(s) { return window.marked ? `<div class="md">${marked.parse(esc(s))}</div>` : `<pre>${esc(s)}</pre>`; }
+// call after innerHTML that may contain md(); no-op offline (CDN unreachable)
+function typeset(el) {
+  if (window.renderMathInElement) renderMathInElement(el, {
+    delimiters: [{ left: '$$', right: '$$', display: true }, { left: '$', right: '$', display: false }],
+    throwOnError: false,
+  });
+}
 function escAttr(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
 const STAGE_LABEL = { loading_model: 'loading model', transcribing: 'transcribing', summarizing: 'summarizing' };
@@ -848,13 +868,14 @@ async function refresh() {
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
       ${r.status === 'split_pending' ? splitCard(r) : r.status !== 'error' ? labelEditor(r) : ''}
       ${r.source === 'homework' && r.status === 'done' ? hwLinker(r) : ''}
-      ${r.status === 'done' && r.summary ? `<h4>Summary</h4><pre>${esc(r.summary)}</pre>` : ''}
+      ${r.status === 'done' && r.summary ? `<h4>Summary</h4>${md(r.summary)}` : ''}
       ${r.source === 'syllabus' && r.status === 'done' ? `<p><a href="/assignments/${r.id}.ics">&#128197; Download due dates (.ics) — import into Google Calendar</a></p>` : ''}
       ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
       ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
     </div>`).join('');
   for (const d of document.querySelectorAll('#list details[data-k]'))
     if (openK.has(d.dataset.k)) d.open = true;
+  typeset(document.getElementById('list'));
   renderTree(rows);
   renderMerge(rows);
   renderPractice(rows);
