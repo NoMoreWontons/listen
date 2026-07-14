@@ -1308,7 +1308,8 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
     )
     msg = claude.messages.create(
         model="claude-haiku-4-5",
-        max_tokens=3000,
+        # 3000 truncated homework per-problem write-ups mid-JSON (unparseable -> raw blob stored)
+        max_tokens=8000,
         messages=[{
             "role": "user",
             "content": [
