@@ -89,3 +89,4 @@ alter table cards enable row level security;   -- match quizzes/recordings; app 
 -- one segment per topic and waits (status='split_pending') for the user to
 -- approve/decline via POST /split before filing.
 alter table recordings add column if not exists pending_segments jsonb;
+alter table recordings add column if not exists addendum text;  -- post-filing corrections/additions, rendered verbatim in the note

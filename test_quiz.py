@@ -56,9 +56,11 @@ def test_generate_quiz_mcq():
     assert "10 multiple-choice questions" in captured["messages"][0]["content"]
     assert qs == [{"type": "mcq", "q": "2+2?", "choices": ["3", "4"], "answer": 1, "explanation": ""}], qs
 
+    assert "Bias toward harder" not in captured["messages"][0]["content"]  # quizzes stay breadth-first
     app.generate_quiz(rows, "test", "mcq")
     assert "20 multiple-choice questions" in captured["messages"][0]["content"]
-    print("ok: generate_quiz builds mcq prompt/counts (10/20 questions) and parses the response")
+    assert "Bias toward harder" in captured["messages"][0]["content"]  # tests skew hard
+    print("ok: generate_quiz builds mcq prompt/counts (10/20 questions), test kind skews hard")
 
 
 def test_generate_quiz_frq():
@@ -121,7 +123,7 @@ def test_grade_frq_parse():
 def test_write_quiz_note():
     with tempfile.TemporaryDirectory() as d:
         app.OBSIDIAN_VAULT = pathlib.Path(d)
-        quiz = {"semester": "Fall 26", "class": "Biology", "kind": "quiz"}
+        quiz = {"semester": "Fall 26", "class": "Biology", "unit": "Cells", "kind": "quiz"}
         questions = [
             {"type": "mcq", "q": "2+2?", "choices": ["3", "4"], "answer": 1, "explanation": ""},
             {"type": "frq", "q": "Explain mitosis.", "rubric": "- phases\n- purpose"},
@@ -132,7 +134,7 @@ def test_write_quiz_note():
         ]
         path = app.write_quiz_note(quiz, questions, results, 75)
         p = pathlib.Path(path)
-        assert p.parent == pathlib.Path(d) / "Fall 26" / "Biology" / "Practice", path
+        assert p.parent == pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / "Practice", path
         assert p.name.startswith("quiz ") and p.name.endswith("— 75%.md"), path
         text = p.read_text(encoding="utf-8")
         assert "class: Biology" in text and "kind: quiz" in text, text

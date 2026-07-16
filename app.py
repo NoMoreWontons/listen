@@ -461,6 +461,26 @@ def label(rid: str, payload: dict = Body(...)):
     return {"ok": error is None, "obsidian_path": path, "error": error}
 
 
+@app.post("/addendum/{rid}")
+def addendum(rid: str, payload: dict = Body(...)):
+    """Appends a dated correction/addition to a finished recording and
+    rewrites its Obsidian note in place. No Claude call — the summary is
+    untouched; the text shows verbatim under 'Corrections & additions'."""
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "nothing to append"}
+    row = sb.table("recordings").select("*").eq("id", rid).single().execute().data
+    if not row or row.get("status") != "done":
+        return {"ok": False, "error": "recording isn't finished yet — use the notes box instead"}
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d")
+    combined = f"{(row.get('addendum') or '').rstrip()}\n\n**{stamp}:** {text}".strip()
+    _set(rid, addendum=combined)  # saved before the file write — a failed write never loses it
+    row["addendum"] = combined
+    path = write_note(row)
+    _set(rid, obsidian_path=path)
+    return {"ok": True, "obsidian_path": path}
+
+
 def _cleanup_unit_dir(sem, cls, unit):
     """Removes a unit's hub note + folder if relabeling/deleting emptied it —
     shared tail for merge_units, merge_topics (cross-unit), delete_unit."""
@@ -909,6 +929,10 @@ def generate_quiz(rows, kind="quiz", fmt="mcq"):
     material = "\n\n".join(
         f"## {r.get('topic') or r.get('title') or ''}\n{r.get('summary') or ''}"
         for r in rows if (r.get("summary") or "").strip())
+    # tests simulate the real thing — skew hard; quizzes stay a breadth check
+    hard = ("Bias toward harder questions: multi-step reasoning, applying "
+            "concepts to unfamiliar scenarios, and combining ideas across "
+            "topics — minimize pure recall.\n" if kind == "test" else "")
     if fmt == "frq":
         n = 4 if kind == "quiz" else 8
         ask = (
@@ -916,7 +940,7 @@ def generate_quiz(rows, kind="quiz", fmt="mcq"):
             "free-response questions. Return ONLY a JSON array; each item is "
             '{"type":"frq","q":"...","rubric":"2-4 bullet points of what a '
             'full-credit answer must include"}.\n'
-            "Cover the breadth of the material.\n\n")
+            "Cover the breadth of the material.\n" + hard + "\n")
     else:
         n = 10 if kind == "quiz" else 20
         ask = (
@@ -924,7 +948,7 @@ def generate_quiz(rows, kind="quiz", fmt="mcq"):
             "multiple-choice questions. Return ONLY a JSON array; each item is "
             '{"type":"mcq","q":"...","choices":["...","...","...","..."],'
             '"answer":<0-3 index of the correct choice>,"explanation":"one sentence"}.\n'
-            "Cover the breadth of the material; make wrong choices plausible.\n\n")
+            "Cover the breadth of the material; make wrong choices plausible.\n" + hard + "\n")
     msg = claude.messages.create(
         model="claude-haiku-4-5", max_tokens=6000,
         messages=[{"role": "user", "content": ask + "Notes:\n" + material}],
@@ -1628,15 +1652,21 @@ def _note_md(rows):
         # strict hierarchy: topic links unit only; unit links class, class links semester
         f"Unit: [[{sem}/{cls}/{unit}/{unit}|{unit}]]\n\n"
     )
+    def extra(r, h):  # user corrections/additions appended after filing — verbatim, never resummarized
+        a = (r.get("addendum") or "").strip()
+        return f"\n\n{h} Corrections & additions\n\n{a}" if a else ""
+
     if len(rows) == 1:
         return (
             head
-            + f"## Summary\n\n{first.get('summary') or ''}\n\n"
-            + f"## Transcript\n\n{first.get('transcript') or ''}\n"
+            + f"## Summary\n\n{first.get('summary') or ''}"
+            + extra(first, "##")
+            + f"\n\n## Transcript\n\n{first.get('transcript') or ''}\n"
         )
     body = "\n\n".join(
         f"## {(r.get('created_at') or '')[:10]} — {r.get('title') or r.get('topic') or 'Lecture'}\n\n"
-        f"### Summary\n\n{r.get('summary') or ''}\n\n"
+        f"### Summary\n\n{r.get('summary') or ''}"
+        f"{extra(r, '###')}\n\n"
         f"### Transcript\n\n{r.get('transcript') or ''}"
         for r in rows
     )
@@ -1859,12 +1889,14 @@ def write_note(row):
 
 
 def write_exam_note(sem, cls, exam):
-    """Files a detected/announced exam or quiz under
-    <vault>/<sem>/<cls>/Exams/<title>.md — separate from lecture notes since
-    an exam isn't tied to one unit. Same title -> same slug -> overwrites in
-    place, so re-detecting an exam across lectures/a revised syllabus is
-    idempotent. A 'topics' entry that exactly matches an existing unit folder
-    under this class links to that unit's hub note; anything else stays a
+    """Files a detected/announced exam or quiz under a Practice folder:
+    <vault>/<sem>/<cls>/<unit>/Practice/<title>.md when exactly one 'topics'
+    entry matches an existing unit folder, else class-level
+    <vault>/<sem>/<cls>/Practice/<title>.md. Same title -> same slug ->
+    overwrites in place (an existing note anywhere under this class's
+    Practice folders is reused), so re-detecting an exam across lectures/a
+    revised syllabus is idempotent. A 'topics' entry that exactly matches an
+    existing unit folder links to that unit's hub note; anything else stays a
     plain bullet. Returns the path (str)."""
     s_sem, s_cls = _slug(sem), _slug(cls)
     # str()-wrap every model-supplied field — same defensiveness as
@@ -1896,7 +1928,17 @@ def write_exam_note(sem, cls, exam):
         if bullets:
             body += f"\n## Covers\n\n{bullets}\n"
 
-    path = cls_dir / "Exams" / f"{_slug(title)}.md"
+    fname = f"{_slug(title)}.md"
+    # reuse an existing note wherever it already lives so re-detection stays
+    # an overwrite even as unit folders appear later
+    path = next(iter(cls_dir.glob(f"*/Practice/{fname}")), None) if cls_dir.is_dir() else None
+    if path is None and (cls_dir / "Practice" / fname).exists():
+        path = cls_dir / "Practice" / fname
+    if path is None:
+        matched = [t for t in (str(x).strip() for x in topics) if t in units]
+        # ponytail: exam spanning several units stays class-level; per-unit copies if that grates
+        dest = cls_dir / matched[0] / "Practice" if len(matched) == 1 else cls_dir / "Practice"
+        path = dest / fname
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return str(path)
@@ -1904,9 +1946,11 @@ def write_exam_note(sem, cls, exam):
 
 def write_quiz_note(quiz, questions, results, score):
     """Files a graded practice quiz/test under
-    <vault>/<sem>/<cls>/Practice/<kind> <date> <time> — <score>%.md. Mirrors
+    <vault>/<sem>/<cls>/<unit>/Practice/<kind> <date> <time> — <score>%.md
+    (class-level Practice when the quiz wasn't scoped to a unit). Mirrors
     write_exam_note's structure/graph anchor. Returns the path (str)."""
     s_sem, s_cls = _slug(quiz.get("semester")), _slug(quiz.get("class"))
+    unit = (quiz.get("unit") or "").strip()
     kind = str(quiz.get("kind") or "quiz")
     now = datetime.datetime.now()
 
@@ -1935,8 +1979,10 @@ def write_quiz_note(quiz, questions, results, score):
 
     body += f"\nClass: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]\n"
 
-    path = (OBSIDIAN_VAULT / s_sem / s_cls / "Practice"
-            / f"{kind} {now:%Y-%m-%d %H%M} — {score}%.md")
+    base = OBSIDIAN_VAULT / s_sem / s_cls
+    if unit:
+        base = base / _slug(unit)
+    path = base / "Practice" / f"{kind} {now:%Y-%m-%d %H%M} — {score}%.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return str(path)

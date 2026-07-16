@@ -41,7 +41,8 @@
 
   .main {
     display: grid;
-    grid-template-columns: 3fr 2fr;
+    /* minmax(0,…) — plain fr lets long merge-panel/select text widen the column, jittering layout */
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
     gap: 1.5rem;
     align-items: start;
     margin-top: 2.25rem;
@@ -675,10 +676,15 @@ function labelEditor(r) {
     <input class="lbl-class" list="dl-class" placeholder="class" value="${escAttr(r.class)}">
     <input class="lbl-unit"  list="dl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
     <input class="lbl-topic" list="dl-topic" placeholder="topic" value="${escAttr(r.topic)}">
-    <textarea class="lbl-notes" rows="2"
-      placeholder="your notes — woven into the AI summary on save">${esc(r.notes || '')}</textarea>
+    <textarea class="lbl-notes" rows="2" oninput="localStorage.setItem('notes-draft-${r.id}', this.value)"
+      placeholder="your notes — woven into the AI summary on save">${esc(localStorage.getItem('notes-draft-' + r.id) ?? r.notes ?? '')}</textarea>
     <button onclick="saveLabels('${r.id}')">${filed ? 'Update note' : live ? 'Save labels' : 'Save to Obsidian'}</button>
     <button class="ocr-btn" onclick="ocrNotes('${r.id}', this)" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the notes box">&#128247; Add notes from file</button>
+    ${live ? '' : `
+    <textarea class="lbl-addendum" rows="2" oninput="localStorage.setItem('addendum-draft-${r.id}', this.value)"
+      placeholder="correction / addition — appended to the note as-is, no re-summary">${esc(localStorage.getItem('addendum-draft-' + r.id) ?? '')}</textarea>
+    <button onclick="saveAddendum('${r.id}')">Append to note</button>
+    <button class="ocr-btn" onclick="ocrNotes('${r.id}', this, '.lbl-addendum')" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the correction box">&#128247; From file</button>`}
     ${hint}
   </div>`;
   // filed already -> tuck the editor away; relabelling moves the note
@@ -762,7 +768,7 @@ async function deleteRec(rid) {
   refresh();
 }
 
-async function ocrNotes(rid, btn) {
+async function ocrNotes(rid, btn, sel = '.lbl-notes') {
   const picker = document.createElement('input');
   picker.type = 'file';
   picker.accept = 'image/*,.pdf,.pptx,.docx,.txt,.md';
@@ -775,8 +781,10 @@ async function ocrNotes(rid, btn) {
       const resp = await (await fetch(`/ocr?filename=${encodeURIComponent(f.name)}`,
         { method: 'POST', body: f })).json();
       if (resp.error) { alert(resp.error); return; }
-      const ta = document.querySelector(`.labels[data-rid="${rid}"] .lbl-notes`);
+      const ta = document.querySelector(`.labels[data-rid="${rid}"] ${sel}`);
       ta.value = (ta.value.trim() ? ta.value.trimEnd() + '\n\n' : '') + resp.text;
+      const key = sel === '.lbl-addendum' ? 'addendum-draft-' : 'notes-draft-';
+      localStorage.setItem(key + rid, ta.value); // programmatic set skips oninput
       ta.focus(); // review before save; focus also pauses the 5s refresh wipe
     } finally {
       btn.disabled = false; btn.textContent = old;
@@ -799,6 +807,20 @@ async function saveLabels(rid) {
     }),
   })).json();
   if (resp.error) alert(resp.error);
+  else localStorage.removeItem('notes-draft-' + rid); // server has it now
+  refresh();
+}
+
+async function saveAddendum(rid) {
+  const ta = document.querySelector(`.labels[data-rid="${rid}"] .lbl-addendum`);
+  if (!ta.value.trim()) return;
+  const resp = await (await fetch(`/addendum/${rid}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: ta.value }),
+  })).json();
+  if (resp.error) { alert(resp.error); return; }
+  localStorage.removeItem('addendum-draft-' + rid);
+  document.activeElement?.blur(); // focused textarea would make refresh() skip the repaint
   refresh();
 }
 
@@ -1139,7 +1161,7 @@ let quizRows = [];
 
 // Fill a semester>class>unit cascade of <select>s from filed rows.
 // Blank semester = all semesters; blank unit = whole class. Preserves current picks.
-function fillScope(rows, semSel, clsSel, unitSel) {
+function fillScope(rows, semSel, clsSel, unitSel, hideExamUnits = false) {
   const done = rows.filter(r => r.status === 'done' && r.class);
   const uniq = arr => [...new Set(arr)].sort();
   const opt = (v, label) => `<option value="${escAttr(v)}">${esc(label ?? v)}</option>`;
@@ -1157,7 +1179,8 @@ function fillScope(rows, semSel, clsSel, unitSel) {
   if (classes.includes(clsCur)) clsSel.value = clsCur;
 
   const cls = clsSel.value;
-  const units = uniq(inSem.filter(r => r.class === cls && r.unit).map(r => r.unit));
+  const units = uniq(inSem.filter(r => r.class === cls && r.unit).map(r => r.unit))
+    .filter(u => !hideExamUnits || !/exam/i.test(u)); // quiz creator: exam/exam-prep units aren't study material
   unitSel.innerHTML = opt('', 'whole class') + units.map(u => opt(u)).join('');
 }
 
@@ -1165,11 +1188,11 @@ function renderPractice(rows) {
   const card = document.getElementById('practice');
   if (document.activeElement && card.contains(document.activeElement)) return;
   quizRows = rows;
-  fillScope(rows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'));
+  fillScope(rows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'), true);
   loadPastQuizzes();
 }
 function pScope() {
-  fillScope(quizRows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'));
+  fillScope(quizRows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'), true);
 }
 
 let pastLoaded = 0;
