@@ -1026,6 +1026,72 @@ def quiz_get(qid: str):
     return sb.table("quizzes").select("*").eq("id", qid).single().execute().data
 
 
+# --- study material from tree selection ---
+
+def _scope_rows(rows, scopes):
+    """Rows matching any scope (unit match, topic match if given). One pass
+    over rows so a unit scope plus a topic scope inside it can't duplicate."""
+    return [r for r in rows if any(
+        r.get("unit") == s.get("unit") and (not s.get("topic") or r.get("topic") == s.get("topic"))
+        for s in scopes)]
+
+
+@app.post("/study/generate")
+def study_generate(payload: dict = Body(...)):
+    sem = (payload.get("semester") or "").strip()
+    cls = (payload.get("class") or "").strip()
+    kind = payload.get("kind")
+    scopes = payload.get("scopes")
+    if kind not in ("quiz", "test", "flashcards", "cheatsheet"):
+        return {"error": "bad kind"}
+    if not cls:
+        return {"error": "class required"}
+    if not isinstance(scopes, list) or not scopes or not all(
+            isinstance(s, dict) and (s.get("unit") or "").strip() for s in scopes):
+        return {"error": "scopes required"}
+
+    q = (sb.table("recordings").select("topic,title,summary,unit")
+         .eq("status", "done").eq("class", cls))
+    if sem:
+        q = q.eq("semester", sem)
+    rows = _scope_rows(q.execute().data, scopes)
+    if not any((r.get("summary") or "").strip() for r in rows):
+        return {"error": "no filed notes for that scope yet"}
+
+    units = {s["unit"] for s in scopes}
+    unit = next(iter(units)) if len(units) == 1 else None
+
+    if kind in ("quiz", "test"):
+        try:
+            questions = generate_quiz(rows, kind)
+        except Exception as e:
+            return {"error": f"generation failed: {e}"}
+        return sb.table("quizzes").insert({
+            "kind": kind, "semester": sem or None, "class": cls, "unit": unit,
+            "questions": questions,
+        }).execute().data[0]
+
+    if kind == "flashcards":
+        try:
+            cards = generate_cards(rows)
+        except Exception as e:
+            return {"error": f"generation failed: {e}"}
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        valid = [
+            {"semester": sem or None, "class": cls, "unit": unit,
+             "front": c.get("front", ""), "back": c.get("back", ""), "due_at": now}
+            for c in cards if c.get("front") and c.get("back")
+        ]
+        if not valid:
+            return {"error": "no usable cards generated"}
+        sb.table("cards").insert(valid).execute()
+        return {"count": len(valid)}
+
+    md = build_cheatsheet(rows, cls, unit or "")
+    fname = _slug(f"{cls} {unit or ''}".strip()) + " cheatsheet.md"
+    return {"filename": fname, "markdown": md}
+
+
 # --- flashcards / spaced repetition (SM-2) ---
 
 _GRADE_Q = {"again": 0, "hard": 3, "good": 4, "easy": 5}
