@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 graph_settings.json
 app_settings.json
+server.log
