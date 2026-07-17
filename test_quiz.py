@@ -55,6 +55,7 @@ def test_generate_quiz_mcq():
     assert captured["model"] == "claude-haiku-4-5", captured["model"]
     assert "10 multiple-choice questions" in captured["messages"][0]["content"]
     assert qs == [{"type": "mcq", "q": "2+2?", "choices": ["3", "4"], "answer": 1, "explanation": ""}], qs
+    assert '"topic"' in captured["messages"][0]["content"]  # weak-spot loop needs per-question topic
 
     assert "Bias toward harder" not in captured["messages"][0]["content"]  # quizzes stay breadth-first
     app.generate_quiz(rows, "test", "mcq")
@@ -149,9 +150,131 @@ def test_write_quiz_note():
     print("ok: write_quiz_note writes frontmatter, mcq/frq bodies, and the graph anchor")
 
 
+def test_ask_notes():
+    class FakeQuery:
+        """Chainable stand-in covering only select/eq/execute — all ask_notes uses."""
+        def __init__(self, rows):
+            self.rows = rows
+
+        def select(self, *a, **k):
+            return self
+
+        def eq(self, k, v):
+            self.rows = [r for r in self.rows if r.get(k) == v]
+            return self
+
+        def execute(self):
+            return type("R", (), {"data": self.rows})()
+
+    class FakeSB:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def table(self, name):
+            assert name == "recordings"
+            return FakeQuery(self.rows)
+
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        note_path = str(pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / "Mitosis.md")
+        rows = [{"status": "done", "semester": "Fall 26", "class": "Biology", "unit": "Cells",
+                 "topic": "Mitosis", "summary": "Mitosis has 4 phases.", "obsidian_path": note_path}]
+        app.sb = FakeSB(rows)
+
+        captured = {}
+
+        class FakeMsg:
+            content = [type("T", (), {
+                "text": '{"answer":"Mitosis has 4 phases.","topics":["Mitosis"]}'})()]
+
+        def fake_create(**kw):
+            captured.clear()
+            captured.update(kw)
+            return FakeMsg()
+
+        app.claude.messages.create = fake_create
+        resp = app.ask_notes({"question": "What are the phases of mitosis?", "class": "Biology"})
+        assert captured["model"] == "claude-sonnet-5", captured["model"]
+        prompt = captured["messages"][0]["content"]
+        assert "Mitosis has 4 phases." in prompt and "What are the phases of mitosis?" in prompt, prompt
+        assert resp == {"answer": "Mitosis has 4 phases.",
+                         "topics": [{"topic": "Mitosis", "uri": app._obsidian_uri(note_path)}]}, resp
+
+        # unparseable JSON -> raw text as answer, no topics
+        app.claude.messages.create = lambda **kw: type("M", (), {
+            "content": [type("T", (), {"text": "not json at all"})()]})()
+        assert app.ask_notes({"question": "x", "class": "Biology"}) == {
+            "answer": "not json at all", "topics": []}
+
+        # empty question -> error, no Claude call needed
+        assert app.ask_notes({"question": ""}) == {"error": "question required"}
+
+        # scope with no filed summaries -> error
+        app.sb = FakeSB([{"status": "done", "semester": "Fall 26", "class": "Chem", "topic": "X",
+                           "summary": "", "obsidian_path": None}])
+        assert app.ask_notes({"question": "anything", "class": "Chem"}) == {
+            "error": "no filed notes in that scope yet"}
+    print("ok: ask_notes builds prompt from notes, resolves topic->obsidian uri, "
+          "falls back on bad JSON, guards empty question / empty scope")
+
+
+def test_weak_topics():
+    rows = [
+        {  # graded quiz: topic A misses 2/3 (mcq miss, frq 0.4 miss, frq 1.0 hit),
+           # plus one no-topic question (ignored) and one topic-B question (attempted=1, excluded)
+            "score": 80,
+            "questions": [
+                {"type": "mcq", "topic": "A", "q": "q1", "answer": 1},
+                {"type": "frq", "topic": "A", "q": "q2"},
+                {"type": "frq", "topic": "A", "q": "q3"},
+                {"type": "mcq", "q": "no topic key"},
+                {"type": "mcq", "topic": "B", "q": "q5"},
+            ],
+            "answers": [
+                {"answer": 0, "correct": False},
+                {"answer": "x", "score": 0.4, "feedback": "eh"},
+                {"answer": "y", "score": 1.0, "feedback": "good"},
+                {"answer": "z", "correct": True},
+                {"answer": 1, "correct": False},
+            ],
+        },
+        {  # topic C: 1/2 miss -> included but ranks below A (lower rate).
+           # the miss is a boundary case: exactly half credit counts as weak
+            "score": 90,
+            "questions": [
+                {"type": "frq", "topic": "C", "q": "q1"},
+                {"type": "mcq", "topic": "C", "q": "q2"},
+            ],
+            "answers": [
+                {"answer": "meh", "score": 0.5, "feedback": "half"},
+                {"answer": 1, "correct": True},
+            ],
+        },
+        {  # ungraded (score None) -> skipped entirely, even though it has a topic
+            "score": None,
+            "questions": [{"type": "mcq", "topic": "D", "q": "q1"}],
+            "answers": [{"answer": 0, "correct": False}],
+        },
+        {  # score set but never answered -> skipped
+            "score": 50,
+            "questions": [{"type": "mcq", "topic": "E", "q": "q1"}],
+            "answers": [],
+        },
+    ]
+    out = app.weak_topics(rows)
+    assert out == [
+        {"topic": "A", "missed": 2, "attempted": 3, "rate": 0.67},
+        {"topic": "C", "missed": 1, "attempted": 2, "rate": 0.5},
+    ], out  # worst-first; topic B excluded (n<2), D/E excluded (ungraded)
+    print("ok: weak_topics aggregates mcq/frq misses per topic, ignores no-topic/ungraded "
+          "questions, drops sub-threshold topics, sorts worst-first")
+
+
 if __name__ == "__main__":
     test_grade_mcq()
     test_generate_quiz_mcq()
     test_generate_quiz_frq()
     test_grade_frq_parse()
     test_write_quiz_note()
+    test_ask_notes()
+    test_weak_topics()

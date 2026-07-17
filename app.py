@@ -5,6 +5,8 @@ import time
 import threading
 import datetime
 import pathlib
+import subprocess
+import tempfile
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
@@ -47,6 +49,20 @@ def audio_path(rid):
 
 def pdf_path(rid):
     return AUDIO_DIR / f"{rid}.pdf"
+
+
+# --- app-wide settings (currently just the live-transcript toggle) ---
+APP_SETTINGS_FILE = pathlib.Path(__file__).with_name("app_settings.json")
+APP_SETTINGS_DEFAULTS = {"live_transcript": False}
+
+
+def app_settings():
+    try:
+        saved = json.loads(APP_SETTINGS_FILE.read_text(encoding="utf-8"))
+        return {**APP_SETTINGS_DEFAULTS,
+                **{k: bool(saved[k]) for k in APP_SETTINGS_DEFAULTS if k in saved}}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return dict(APP_SETTINGS_DEFAULTS)
 
 
 # --- Whisper: load the model once, lazily, GPU with CPU fallback ---
@@ -339,7 +355,25 @@ def index():
 def start(title: str = ""):
     title = title or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     row = sb.table("recordings").insert({"title": title, "status": "recording"}).execute().data[0]
+    if app_settings()["live_transcript"]:
+        threading.Thread(target=live_preview, args=(row["id"],), daemon=True).start()
     return {"id": row["id"]}
+
+
+@app.get("/app_settings")
+def get_app_settings():
+    return {**app_settings(), "retention_days": RETENTION_DAYS}  # read-only, for the "audio expired" message
+
+
+@app.post("/app_settings")
+async def set_app_settings(request: Request):
+    posted = await request.json()
+    st = app_settings()
+    for k in APP_SETTINGS_DEFAULTS:
+        if k in posted and isinstance(posted[k], bool):
+            st[k] = posted[k]
+    APP_SETTINGS_FILE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    return {"ok": True, **st}
 
 
 @app.post("/chunk/{rid}")
@@ -416,7 +450,7 @@ def recordings():
         sb.table("recordings")
         .select("id,title,created_at,status,transcript,summary,stage,progress,"
                 "tokens_in,tokens_out,semester,class,unit,topic,obsidian_path,source,notes,"
-                "pending_segments")
+                "pending_segments,live_transcript")
         .order("created_at", desc=True)
         .execute()
         .data
@@ -426,6 +460,45 @@ def recordings():
         g = _transcribe_gates.get(r["id"])
         r["paused"] = bool(g) and not g.is_set()
     return rows
+
+
+def _audio_mime(path):
+    """Sniff the real container from magic bytes — uploads keep a .webm
+    filename whatever the actual format (see /upload), so the extension lies
+    and a wrong Content-Type makes browsers refuse to play a valid file."""
+    try:
+        head = open(path, "rb").read(12)
+    except OSError:
+        return "audio/webm"
+    if head[:4] == b"\x1aE\xdf\xa3":
+        return "audio/webm"
+    if head[:4] == b"OggS":
+        return "audio/ogg"
+    if head[:4] == b"RIFF":
+        return "audio/wav"
+    if head[4:8] == b"ftyp":
+        return "audio/mp4"
+    if head[:3] == b"ID3" or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mpeg"
+    return "audio/webm"
+
+
+@app.get("/audio/{rid}")
+def get_audio(rid: str):
+    """Serves the raw recording for <audio> playback -- FileResponse handles
+    Range requests so seeking works. 404s once sweep_old_audio has reaped it."""
+    path = audio_path(rid)
+    if not path.exists():
+        return Response(json.dumps({"error": "audio expired"}), status_code=404, media_type="application/json")
+    return FileResponse(path, media_type=_audio_mime(path))
+
+
+@app.get("/segments/{rid}")
+def get_segments(rid: str):
+    """Timestamped transcript segments -- split out of /recordings since it's
+    a big payload the 5s poll doesn't need."""
+    row = sb.table("recordings").select("segments").eq("id", rid).single().execute().data or {}
+    return row.get("segments") or []
 
 
 @app.post("/label/{rid}")
@@ -650,6 +723,18 @@ def _report_model_progress(rid, stop_event):
             last = pct
 
 
+def _seg_entries(segs):
+    """Whisper segments -> compact {s,e,t} timestamp dicts for the `segments`
+    jsonb column. ponytail: past ~2000 entries (very long lectures) truncate
+    text to 200 chars instead of dropping entries -- keeps every timestamp,
+    just bounds jsonb size."""
+    entries = [{"s": round(s.start, 1), "e": round(s.end, 1), "t": s.text.strip()} for s in segs]
+    if len(entries) > 2000:
+        for e in entries:
+            e["t"] = e["t"][:200]
+    return entries
+
+
 def process(rid):
     try:
         _gate(rid).wait()  # paused -> don't even start the model load
@@ -665,20 +750,88 @@ def process(rid):
         with _transcribe_lock:
             segments, info = model.transcribe(str(audio_path(rid)))
             duration = max(info.duration, 1)
-            parts, last_pct = [], -1
+            parts, raw_segs, last_pct = [], [], -1
             for seg in segments:
                 _gate(rid).wait()  # paused -> block before decoding further
                 parts.append(seg.text)
+                raw_segs.append(seg)
                 pct = min(99, int(seg.end / duration * 100) // 5 * 5)
                 if pct != last_pct:
                     _set(rid, progress=pct)
                     last_pct = pct
         transcript = "".join(parts).strip()
+        _set(rid, segments=_seg_entries(raw_segs))
         finalize(rid, transcript)
     except Exception as e:
-        _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]")
+        _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]", live_transcript=None)
     finally:
         _transcribe_gates.pop(rid, None)  # restart/finish always comes up unpaused
+
+
+def _append_live(old, new):
+    """Appends freshly-decoded preview text onto the running live_transcript.
+    Pure/testable — no dedupe of overlapping tail decodes, this is preview-quality."""
+    return ((old or "") + " " + new).strip()
+
+
+def live_preview(rid):
+    """Optional battery-costing loop (see app_settings): every 45s, ffmpeg-extracts
+    the unprocessed tail of the in-progress recording and runs whisper on just that
+    slice, appending the text to live_transcript. Exits when the row leaves
+    'recording', the audio file disappears, or ffmpeg isn't on PATH."""
+    model = None
+    offset = 0.0
+    while True:
+        time.sleep(45)
+        try:
+            row = (sb.table("recordings").select("status,live_transcript").eq("id", rid)
+                   .single().execute().data)  # one round-trip: status check + current text
+            if not row or row["status"] != "recording":
+                return
+            path = audio_path(rid)
+            if not path.exists():
+                return
+            tmp_path = None
+            try:
+                # ffmpeg runs OUTSIDE the lock — it doesn't touch the model, and
+                # holding the lock through a reseek of a long recording would stall
+                # a concurrent recording's real transcription for the whole decode.
+                fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error", "-ss", str(offset), "-i", str(path),
+                     "-ac", "1", "-ar", "16000", tmp_path],
+                    check=True,
+                )
+                if not _transcribe_lock.acquire(blocking=False):
+                    continue  # real transcription is using the model — skip this tick
+                try:
+                    if model is None:  # load lazily -- only after ffmpeg's confirmed present
+                        model = get_model()
+                    segments, info = model.transcribe(tmp_path)
+                    # segments is a lazy generator — drain it INSIDE the lock,
+                    # decoding is the actual model work
+                    text = " ".join(seg.text.strip() for seg in segments).strip()
+                finally:
+                    _transcribe_lock.release()
+                # ponytail: offset advances by the tail's *decoded* duration, not
+                # real elapsed time -- approximate tail boundary, ceiling is fine
+                # because this is preview-quality; process() re-decodes the whole
+                # file from scratch when the recording actually stops.
+                offset += max(info.duration, 0.0)
+                if text:
+                    _set(rid, live_transcript=_append_live(row.get("live_transcript"), text))
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+        except FileNotFoundError:
+            print("[listen] live preview needs ffmpeg on PATH")
+            return
+        except Exception as e:
+            print(f"[listen] live preview tick failed: {e}")
 
 
 def finalize(rid, transcript, created_at=None):
@@ -687,7 +840,7 @@ def finalize(rid, transcript, created_at=None):
     the Obsidian note (single topic), or park it split_pending with the
     proposed segments for the user to confirm via /split (multiple topics).
     The row's own source value is preserved."""
-    _set(rid, stage="summarizing", progress=100)
+    _set(rid, stage="summarizing", progress=100, live_transcript=None)
     # honor labels/notes the user set live/before stop; Claude only fills the blanks
     pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source")
            .eq("id", rid).single().execute().data or {})
@@ -939,7 +1092,8 @@ def generate_quiz(rows, kind="quiz", fmt="mcq"):
             f"Create a practice {kind} from these college lecture notes: {n} "
             "free-response questions. Return ONLY a JSON array; each item is "
             '{"type":"frq","q":"...","rubric":"2-4 bullet points of what a '
-            'full-credit answer must include"}.\n'
+            'full-credit answer must include","topic":"the exact ## section '
+            'header this question came from"}.\n'
             "Cover the breadth of the material.\n" + hard + "\n")
     else:
         n = 10 if kind == "quiz" else 20
@@ -947,7 +1101,8 @@ def generate_quiz(rows, kind="quiz", fmt="mcq"):
             f"Create a practice {kind} from these college lecture notes: {n} "
             "multiple-choice questions. Return ONLY a JSON array; each item is "
             '{"type":"mcq","q":"...","choices":["...","...","...","..."],'
-            '"answer":<0-3 index of the correct choice>,"explanation":"one sentence"}.\n'
+            '"answer":<0-3 index of the correct choice>,"explanation":"one sentence",'
+            '"topic":"the exact ## section header this question came from"}.\n'
             "Cover the breadth of the material; make wrong choices plausible.\n" + hard + "\n")
     msg = claude.messages.create(
         model="claude-haiku-4-5", max_tokens=6000,
@@ -956,6 +1111,46 @@ def generate_quiz(rows, kind="quiz", fmt="mcq"):
     raw = msg.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
+
+
+def weak_topics(quiz_rows):
+    """Pure aggregation for the weak-spot study loop: per-topic miss rate
+    across graded quizzes. quiz_rows are quiz records with questions/answers/
+    score (ungraded rows — score None or no answers — are skipped). Only
+    questions carrying a "topic" key count (older quizzes predate the field
+    and are silently skipped). Returns worst-first, topics with >=2 attempts
+    and >=1 miss only, capped at 5: [{"topic","missed","attempted","rate"}].
+    ponytail: topics join by name string — rename a topic in the label editor
+    and its old quiz history orphans; join via recording ids if that bites."""
+    agg = {}  # topic -> [missed, attempted]
+    for row in quiz_rows:
+        if row.get("score") is None:
+            continue
+        answers = row.get("answers") or []
+        if not answers:
+            continue
+        for q, a in zip(row.get("questions") or [], answers):
+            topic = (q or {}).get("topic")
+            if not topic:
+                continue
+            a = a or {}
+            score = a.get("score")
+            # <= : exactly half credit is still a weak spot, not a pass
+            miss = a.get("correct") is False or (score is not None and score <= 0.5)
+            m, n = agg.get(topic, (0, 0))
+            agg[topic] = (m + miss, n + 1)
+    out = [{"topic": t, "missed": m, "attempted": n, "rate": round(m / n, 2)}
+           for t, (m, n) in agg.items() if n >= 2 and m >= 1]
+    out.sort(key=lambda r: -r["rate"])
+    return out[:5]
+
+
+@app.get("/weak_spots")
+def weak_spots(cls: str = Query(..., alias="class"), semester: str = ""):
+    q = sb.table("quizzes").select("questions,answers,semester,class,score").eq("class", cls)
+    if semester:
+        q = q.eq("semester", semester)
+    return weak_topics(q.execute().data)
 
 
 def grade_mcq(questions, answers):
@@ -1060,6 +1255,9 @@ def quiz_generate(payload: dict = Body(...)):
     if unit:
         q = q.eq("unit", unit)
     rows = q.execute().data
+    topics = payload.get("topics")
+    if topics:
+        rows = [r for r in rows if r.get("topic") in topics]
     if not any((r.get("summary") or "").strip() for r in rows):
         return {"error": "no filed notes for that scope yet"}
     try:
@@ -1070,6 +1268,53 @@ def quiz_generate(payload: dict = Body(...)):
         "kind": kind, "semester": sem or None, "class": cls, "unit": unit or None,
         "questions": questions,
     }).execute().data[0]
+
+
+@app.post("/ask")
+def ask_notes(payload: dict = Body(...)):
+    """One Claude call: answers a question using only filed lecture-note
+    summaries in scope. Returns the answer plus obsidian links for whichever
+    topics the model says it drew on."""
+    question = (payload.get("question") or "").strip()
+    if not question:
+        return {"error": "question required"}
+    sem = (payload.get("semester") or "").strip()
+    cls = (payload.get("class") or "").strip()
+    q = sb.table("recordings").select("semester,class,unit,topic,summary,obsidian_path").eq("status", "done")
+    if sem:
+        q = q.eq("semester", sem)
+    if cls:
+        q = q.eq("class", cls)
+    rows = q.execute().data
+    if not any((r.get("summary") or "").strip() for r in rows):
+        return {"error": "no filed notes in that scope yet"}
+    material = "\n\n".join(
+        f"## {r.get('topic') or ''}\n{r.get('summary') or ''}"
+        for r in rows if (r.get("summary") or "").strip())
+    ask = (
+        "Answer the student's question using ONLY the lecture-note summaries below. "
+        "Be concise. If the notes don't cover it, say so. Return ONLY a JSON object "
+        '{"answer":"...","topics":["topic names actually used"]}.\n\n'
+        f"Question: {question}\n\nNotes:\n" + material)
+    try:
+        msg = claude.messages.create(
+            model="claude-sonnet-5", max_tokens=1000,
+            messages=[{"role": "user", "content": ask}],
+        )
+    except Exception as e:  # match quiz_generate: surface as JSON, not a 500
+        return {"error": f"ask failed: {e}"}
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+    try:
+        parsed = json.loads(raw)
+        answer = str(parsed.get("answer") or "")
+        topic_names = parsed.get("topics") or []
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        answer, topic_names = raw, []
+    by_topic = {r["topic"]: r for r in rows if r.get("topic")}
+    topics = [{"topic": t, "uri": _obsidian_uri((by_topic.get(t) or {}).get("obsidian_path"))}
+              for t in topic_names]
+    return {"answer": answer, "topics": topics}
 
 
 @app.post("/quiz/{qid}/submit")
