@@ -325,6 +325,8 @@
     color: var(--ink-soft);
     margin-left: .4rem;
   }
+  .topic .pick { margin-right: .35rem; opacity: .35; }
+  .topic:hover .pick, .pick:checked { opacity: 1; }
   .tree-del {
     float: right; border: none; background: none; cursor: pointer;
     color: var(--ink-soft); font-size: .78rem; padding: 0 .3rem; opacity: 0;
@@ -496,6 +498,7 @@
   <div class="side">
     <section class="folders">
       <span class="deck-label">Library</span>
+      <div id="pickBar" hidden></div>
       <div id="tree"></div>
     </section>
     <section class="folders" id="merge" hidden></section>
@@ -1016,7 +1019,12 @@ function renderTree(rows) {
     const del = rs.length > 1
       ? `<button class="tree-del" title="Delete all ${rs.length} recordings" data-topic-del data-rids="${rs.map(x => x.id).join(',')}">&#10005;</button>`
       : `<button class="tree-del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>`;
-    return `<div class="topic" data-rid="${escAttr(r.id)}" ${attrs}>${label}<span class="when">${rs.length > 1 ? '&times;' + rs.length + ' &middot; ' : ''}${(r.created_at || '').slice(0, 10)}</span>${del}</div>`;
+    // draggable="false" on the checkbox: it sits inside a draggable div, without this a checkbox
+    // click starts a tree drag instead of toggling.
+    const pick = r.topic
+      ? `<input type="checkbox" class="pick" draggable="false" data-sem="${escAttr(sem)}" data-cls="${escAttr(cls)}" data-topic="${escAttr(r.topic)}">`
+      : '';
+    return `<div class="topic" data-rid="${escAttr(r.id)}" ${attrs}>${pick}${label}<span class="when">${rs.length > 1 ? '&times;' + rs.length + ' &middot; ' : ''}${(r.created_at || '').slice(0, 10)}</span>${del}</div>`;
   };
 
   const unitHtml = (sem, cls, unit, recs) => {
@@ -1034,12 +1042,87 @@ function renderTree(rows) {
       + `data-unit="${escAttr(unit)}" data-count="${recs.length}">&#10005;</button></summary>${inner}</details>`;
   };
 
-  document.getElementById('tree').innerHTML = Object.keys(tree).sort().map(sem =>
+  const treeDiv = document.getElementById('tree');
+  treeDiv.innerHTML = Object.keys(tree).sort().map(sem =>
     det(sem, sem, Object.keys(tree[sem]).sort().map(cls =>
       det(sem + '/' + cls, cls, Object.keys(tree[sem][cls]).sort()
         .map(unit => unitHtml(sem, cls, unit, tree[sem][cls][unit])).join(''))
     ).join(''))
   ).join('');
+
+  // survive the rewrite above: re-check boxes still picked, and drop pickedTopics entries whose
+  // topic vanished (renamed/deleted elsewhere) so a stale name can't be submitted.
+  const liveBoxes = [...treeDiv.querySelectorAll('.pick')];
+  const liveKeys = new Set(liveBoxes.map(cb => cb.dataset.sem + '||' + cb.dataset.cls + '||' + cb.dataset.topic));
+  for (const key of pickedTopics.keys()) if (!liveKeys.has(key)) pickedTopics.delete(key);
+  for (const cb of liveBoxes)
+    cb.checked = pickedTopics.has(cb.dataset.sem + '||' + cb.dataset.cls + '||' + cb.dataset.topic);
+  renderPickBar();
+}
+
+// ---- multi-select topics -> practice material: key is "sem||cls||topic", values from one class
+// only (enforced on check). Survives the 5s re-render via the block at the end of renderTree above.
+const pickedTopics = new Map();
+function renderPickBar() {
+  const bar = document.getElementById('pickBar');
+  if (!pickedTopics.size) { bar.hidden = true; bar.innerHTML = ''; return; }
+  // mid-interaction guard: the 5s poll re-runs renderTree -> here; rebuilding while a
+  // select is focused would snap its dropdown shut (same class of bug as the notes wipe)
+  if (bar.contains(document.activeElement)) return;
+  const prevKind = document.getElementById('pickKind')?.value;
+  const prevFmt = document.getElementById('pickFmt')?.value;
+  bar.hidden = false;
+  bar.innerHTML = `<div class="merge-manual">
+    <span>${pickedTopics.size} topic${pickedTopics.size > 1 ? 's' : ''}</span>
+    <select id="pickKind">
+      <option value="quiz">Quiz — 10 q</option>
+      <option value="test">Test — 20 q</option>
+    </select>
+    <select id="pickFmt">
+      <option value="mcq">MCQ</option>
+      <option value="frq">FRQ — write on paper</option>
+    </select>
+    <button class="pill-btn" data-pick-create>Create</button>
+    <button class="pill-btn" data-pick-clear>Clear</button>
+  </div>`;
+  if (prevKind) document.getElementById('pickKind').value = prevKind;
+  if (prevFmt) document.getElementById('pickFmt').value = prevFmt;
+}
+
+function clearPicked() {
+  pickedTopics.clear();
+  for (const cb of document.getElementById('tree').querySelectorAll('.pick:checked')) cb.checked = false;
+  renderPickBar(); // pickedTopics is empty now, so this hides #pickBar too
+}
+
+// delegated: #pickBar's innerHTML is rewritten by renderPickBar, so listeners live on the container.
+document.getElementById('pickBar').addEventListener('click', e => {
+  if (e.target.closest('[data-pick-clear]')) { clearPicked(); return; }
+  const btn = e.target.closest('[data-pick-create]');
+  if (btn) createFromPicked(btn);
+});
+
+async function createFromPicked(btn) {
+  const first = pickedTopics.values().next().value; // one-class rule guarantees every entry shares sem/cls
+  const body = {
+    semester: first.sem,
+    class: first.cls,
+    kind: document.getElementById('pickKind').value,
+    format: document.getElementById('pickFmt').value,
+    topics: [...pickedTopics.values()].map(t => t.topic),
+  };
+  btn.disabled = true; const old = btn.textContent; btn.textContent = 'generating…';
+  try {
+    const q = await (await fetch('/quiz/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json();
+    if (q.error) { alert(q.error); return; }
+    clearPicked();
+    pastLoaded = 0;
+    renderQuizForm(q);
+    document.getElementById('quizArea').scrollIntoView({ behavior: 'smooth' });
+  } finally { btn.disabled = false; btn.textContent = old; }
 }
 
 // delegated: #tree's innerHTML is rewritten every refresh, so listeners live on the container.
@@ -1075,6 +1158,21 @@ treeEl.addEventListener('dragend', () => {
   treeDragging = false;
   dragItem = null;
   for (const el of treeEl.querySelectorAll('.drag-over')) el.classList.remove('drag-over');
+});
+treeEl.addEventListener('change', e => {
+  const cb = e.target.closest('.pick');
+  if (!cb) return;
+  const { sem, cls, topic } = cb.dataset;
+  const key = sem + '||' + cls + '||' + topic;
+  if (!cb.checked) { pickedTopics.delete(key); renderPickBar(); return; }
+  const existing = pickedTopics.values().next().value; // one class rule: compare against any existing pick
+  if (existing && (existing.sem !== sem || existing.cls !== cls)) {
+    alert('pick topics from one class at a time');
+    cb.checked = false;
+    return;
+  }
+  pickedTopics.set(key, { sem, cls, topic });
+  renderPickBar();
 });
 treeEl.addEventListener('click', async e => {
   const t = e.target.closest('[data-topic-del]');
