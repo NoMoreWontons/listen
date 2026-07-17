@@ -1545,8 +1545,9 @@ def _note_md(rows):
     """Combined note for every recording sharing one topic (rows: non-empty
     transcripts, oldest first — see _group_rows). Frontmatter/H1/date come
     from the earliest recording. A single recording keeps the original
-    Summary/Transcript layout so most notes don't churn; multiple get one
-    dated section per recording."""
+    Summary/Transcript layout so most notes don't churn; multiple get all
+    dated summaries up top, then a Transcripts section with one dated
+    subsection per recording."""
     first = rows[0]
     source = first.get("source") or "local"
     fm = {
@@ -1572,13 +1573,12 @@ def _note_md(rows):
             + f"## Summary\n\n{first.get('summary') or ''}\n\n"
             + f"## Transcript\n\n{first.get('transcript') or ''}\n"
         )
-    body = "\n\n".join(
-        f"## {(r.get('created_at') or '')[:10]} — {r.get('title') or r.get('topic') or 'Lecture'}\n\n"
-        f"### Summary\n\n{r.get('summary') or ''}\n\n"
-        f"### Transcript\n\n{r.get('transcript') or ''}"
-        for r in rows
-    )
-    return head + body + "\n"
+    heading = lambda r: f"{(r.get('created_at') or '')[:10]} — {r.get('title') or r.get('topic') or 'Lecture'}"
+    notes = "\n\n".join(
+        f"## {heading(r)}\n\n{r.get('summary') or ''}" for r in rows)
+    transcripts = "\n\n".join(
+        f"### {heading(r)}\n\n{r.get('transcript') or ''}" for r in rows)
+    return head + notes + "\n\n## Transcripts\n\n" + transcripts + "\n"
 
 
 def _hub_desc(kind, name, context):

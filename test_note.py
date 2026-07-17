@@ -124,7 +124,8 @@ def test_second_recording_joins_topic():
         assert p1 == p2, (p1, p2)
         text = pathlib.Path(p2).read_text(encoding="utf-8")
         assert "alpha transcript" in text and "beta transcript" in text, text
-        assert "### Summary" in text, text  # multi-recording layout
+        assert "## Transcripts" in text, text  # multi-recording layout: notes top, transcripts bottom
+        assert text.index("summary r2") < text.index("## Transcripts") < text.index("alpha transcript"), text
         assert rows[0]["obsidian_path"] == p2
         assert rows[1]["obsidian_path"] == p2
     print("ok: second recording on same topic joins one combined file")
@@ -152,7 +153,7 @@ def test_relabel_away_and_last_one_out():
         assert pathlib.Path(shared_path).exists(), "shared note should survive while r1 still uses it"
         old_text = pathlib.Path(shared_path).read_text(encoding="utf-8")
         assert "alpha transcript" in old_text and "beta transcript" not in old_text, old_text
-        assert "### Summary" not in old_text  # back to single-recording layout
+        assert "## Transcripts" not in old_text  # back to single-recording layout
 
         # the last remaining recording (r1) also leaves
         rows[0]["topic"] = "Cytokinesis"
