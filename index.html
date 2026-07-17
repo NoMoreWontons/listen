@@ -323,6 +323,26 @@
   .folders summary.drag-over, .folders .topic.drag-over {
     background: #f7e8cf; outline: 2px dashed #93670f; outline-offset: -2px;
   }
+  .folders summary.sel, .folders .topic.sel {
+    background: #f1ecdf; outline: 1px solid #93670f; outline-offset: -1px;
+  }
+  .tree-menu {
+    position: fixed;
+    z-index: 1000;
+    min-width: 140px;
+    background: var(--card);
+    border: 1px solid var(--card-edge);
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.18);
+    padding: .3rem 0;
+    font-size: .85rem;
+  }
+  .tree-menu-item {
+    padding: .35rem .9rem;
+    cursor: pointer;
+    color: var(--ink);
+  }
+  .tree-menu-item:hover { background: #f1ecdf; }
   #tree:empty::before {
     content: "Nothing filed yet — finished recordings appear here by semester / class / unit.";
     display: block;
@@ -901,8 +921,21 @@ function canDrop(drag, target) {
   return !!drag && !!target && drag.kind === target.kind && drag.k === target.k && drag.name !== target.name;
 }
 
+// ---- tree multi-select + right-click study menu. Keys are "sem||cls||unit" (unit) or
+// "sem||cls||unit||topic" (topic) — el.dataset.k + '||' + el.dataset.name builds them directly.
+let treeSel = new Set();  // selected keys, all within selClass
+let selClass = null;      // "sem||cls" the selection belongs to — a new class clears it
+let menuEl = null;        // the open context menu, or null — also gates renderTree (like treeDragging)
+let genBusy = false;      // true while a /study/generate request is in flight
+function applyTreeSel() {
+  const tree = document.getElementById('tree'); // not treeEl — renderTree calls this before treeEl's own const binding exists on first boot
+  for (const el of tree.querySelectorAll('.sel')) el.classList.remove('sel');
+  for (const el of tree.querySelectorAll('[data-kind]'))
+    if (treeSel.has(el.dataset.k + '||' + el.dataset.name)) el.classList.add('sel');
+}
+
 function renderTree(rows) {
-  if (treeDragging) return; // a rewrite here would yank the dragged node out from under the drag
+  if (treeDragging || menuEl) return; // a rewrite here would yank the dragged node, or the right-clicked node, out from under the interaction
   // semester > class > unit > topics, from filed recordings only
   const tree = {};
   for (const r of rows) {
@@ -950,6 +983,7 @@ function renderTree(rows) {
         .map(unit => unitHtml(sem, cls, unit, tree[sem][cls][unit])).join(''))
     ).join(''))
   ).join('');
+  applyTreeSel();
 }
 
 // delegated: #tree's innerHTML is rewritten every refresh, so listeners live on the container.
@@ -987,6 +1021,17 @@ treeEl.addEventListener('dragend', () => {
   for (const el of treeEl.querySelectorAll('.drag-over')) el.classList.remove('drag-over');
 });
 treeEl.addEventListener('click', async e => {
+  if (e.ctrlKey || e.metaKey) {
+    const el = e.target.closest('[data-kind]');
+    if (!el) return;
+    e.preventDefault(); // don't toggle the <details> or follow an obsidian link on ctrl-click
+    const cls = el.dataset.k, key = cls + '||' + el.dataset.name;
+    if (selClass !== cls) { treeSel.clear(); selClass = cls; }
+    treeSel.has(key) ? treeSel.delete(key) : treeSel.add(key);
+    if (!treeSel.size) selClass = null;
+    applyTreeSel();
+    return;
+  }
   const t = e.target.closest('[data-topic-del]');
   if (t) {
     e.preventDefault();
@@ -1014,6 +1059,107 @@ async function deleteTopic(rids) {
   for (const rid of rids) await fetch(`/recordings/${rid}`, { method: 'DELETE' });
   document.activeElement?.blur();
   refresh();
+}
+
+// ---- tree right-click menu: study material (quiz/test/flashcards/cheat sheet) for the
+// current selection, plus rename/delete when exactly one item is selected.
+treeEl.addEventListener('contextmenu', e => {
+  const el = e.target.closest('[data-kind]');
+  if (!el) return;
+  e.preventDefault();
+  const cls = el.dataset.k, key = cls + '||' + el.dataset.name;
+  if (!treeSel.has(key)) { treeSel = new Set([key]); selClass = cls; } // outside selection: select just this
+  applyTreeSel();
+  openTreeMenu(e.clientX, e.clientY);
+});
+// click-away / scroll / Esc close the menu — permanent listeners, gated on menuEl so they're near-free when idle
+document.addEventListener('click', e => { if (menuEl && !menuEl.contains(e.target)) closeTreeMenu(); });
+document.addEventListener('scroll', () => { if (menuEl) closeTreeMenu(); }, true);
+document.addEventListener('keydown', e => { if (menuEl && e.key === 'Escape') closeTreeMenu(); });
+
+function closeTreeMenu() { menuEl?.remove(); menuEl = null; }
+
+function openTreeMenu(x, y) {
+  closeTreeMenu();
+  const items = [
+    ['Quiz', el => genStudy('quiz', el)],
+    ['Test', el => genStudy('test', el)],
+    ['Flashcards', el => genStudy('flashcards', el)],
+    ['Cheat sheet', el => genStudy('cheatsheet', el)],
+  ];
+  if (treeSel.size === 1) items.push(['Rename', renameSel], ['Delete', deleteSel]);
+  menuEl = document.createElement('div');
+  menuEl.className = 'tree-menu';
+  menuEl.innerHTML = items.map((it, i) => `<div class="tree-menu-item" data-i="${i}">${esc(it[0])}</div>`).join('');
+  document.body.appendChild(menuEl);
+  const r = menuEl.getBoundingClientRect();
+  menuEl.style.left = Math.max(4, Math.min(x, window.innerWidth - r.width - 4)) + 'px';
+  menuEl.style.top = Math.max(4, Math.min(y, window.innerHeight - r.height - 4)) + 'px';
+  menuEl.addEventListener('click', e => {
+    const it = e.target.closest('[data-i]');
+    if (it) items[+it.dataset.i][1](it);
+  });
+}
+
+// scopes: a selected unit is sent whole ({unit}), a selected topic narrows to it ({unit, topic}) —
+// backend dedupes any overlap, so a unit + one of its topics both selected isn't double-counted here.
+function studyScopes() {
+  return [...treeSel].map(k => {
+    const rest = k.split('||').slice(2);
+    return rest.length > 1 ? { unit: rest[0], topic: rest[1] } : { unit: rest[0] };
+  });
+}
+
+async function genStudy(kind, itemEl) {
+  if (genBusy) return;
+  genBusy = true;
+  itemEl.textContent = '…';
+  const [sem, cls] = selClass.split('||');
+  try {
+    const resp = await (await fetch('/study/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, semester: sem, class: cls, scopes: studyScopes() }),
+    })).json();
+    if (resp.error) { alert(resp.error); return; }
+    if (kind === 'quiz' || kind === 'test') { pastLoaded = 0; renderQuizForm(resp); }
+    else if (kind === 'flashcards') { alert(`Made ${resp.count} cards.`); }
+    else {
+      const blob = new Blob([resp.markdown], { type: 'text/markdown' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = resp.filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+  } finally { genBusy = false; closeTreeMenu(); }
+}
+
+function renameSel() {
+  const [sem, cls] = selClass.split('||');
+  const rest = [...treeSel][0].split('||').slice(2);
+  closeTreeMenu();
+  const isTopic = rest.length > 1;
+  const oldName = rest.at(-1);
+  const name = prompt('Rename to:', oldName);
+  if (!name || name === oldName) return;
+  const body = isTopic
+    ? { semester: sem, class: cls, from_unit: rest[0], from_topic: rest[1], to_unit: rest[0], to_topic: name }
+    : { semester: sem, class: cls, from_unit: rest[0], to_unit: name };
+  fetch(isTopic ? '/merge_topics' : '/merge_units', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then(r => r.json()).then(resp => {
+    if (!resp.ok) { alert(resp.error || 'rename failed'); return; }
+    treeSel.clear(); selClass = null; refresh();
+  });
+}
+
+// reuses the existing per-row delete button (and its confirm) instead of duplicating that logic
+function deleteSel() {
+  const name = [...treeSel][0].split('||').slice(2).join('||');
+  closeTreeMenu();
+  const el = [...treeEl.querySelectorAll('[data-kind]')].find(x => x.dataset.k === selClass && x.dataset.name === name);
+  el?.querySelector('.tree-del')?.click();
+  treeSel.clear(); selClass = null;
 }
 
 // ---- merge panel: units or topics — suggests near-duplicates, lets the user merge any two ----
