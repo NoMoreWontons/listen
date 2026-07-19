@@ -325,7 +325,8 @@ def test_write_exam_note_links_matching_units():
             "topics": ["Cells", "Genetics"],
         }
         path = app.write_exam_note("Fall 26", "Biology", exam)
-        expected = pathlib.Path(d) / "Fall 26" / "Biology" / "Exams" / "Midterm 1.md"
+        # exactly one topic ("Cells") matches an existing unit folder -> unit-level Practice
+        expected = pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / "Practice" / "Midterm 1.md"
         assert path == str(expected), path
         text = expected.read_text(encoding="utf-8")
         assert "class: Biology" in text and "kind: exam" in text and "tags: [exam]" in text, text
@@ -357,6 +358,25 @@ def test_write_exam_note_undated_no_format_overwrites():
     print("ok: write_exam_note handles missing date/format/topics, overwrites on re-detection")
 
 
+def test_addendum_renders_without_resummary():
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        rows = [mkrow("r1", "Mitosis", "2026-07-01T10:00:00",
+                      addendum="**2026-07-16:** prof corrected: anaphase before telophase")]
+        app.sb = FakeSB(rows)
+        text = pathlib.Path(app.write_note(rows[0])).read_text(encoding="utf-8")
+        assert "## Corrections & additions" in text, text
+        assert "anaphase before telophase" in text, text
+        assert text.index("## Summary") < text.index("## Corrections") < text.index("## Transcript"), text
+        assert rows[0]["summary"] == "summary r1"  # untouched — no re-summarize
+
+        # multi-recording layout: addendum nests under its own recording's section
+        rows.append(mkrow("r2", "Mitosis", "2026-07-02T10:00:00"))
+        text = pathlib.Path(app.write_note(rows[0])).read_text(encoding="utf-8")
+        assert "### Corrections & additions" in text, text
+    print("ok: addendum renders verbatim between Summary and Transcript, summary untouched")
+
+
 if __name__ == "__main__":
     test_single_recording()
     test_second_recording_joins_topic()
@@ -370,3 +390,4 @@ if __name__ == "__main__":
     test_parse_exams_defensive()
     test_write_exam_note_links_matching_units()
     test_write_exam_note_undated_no_format_overwrites()
+    test_addendum_renders_without_resummary()

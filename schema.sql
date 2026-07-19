@@ -89,3 +89,6 @@ alter table cards enable row level security;   -- match quizzes/recordings; app 
 -- one segment per topic and waits (status='split_pending') for the user to
 -- approve/decline via POST /split before filing.
 alter table recordings add column if not exists pending_segments jsonb;
+alter table recordings add column if not exists addendum text;  -- post-filing corrections/additions, rendered verbatim in the note
+alter table recordings add column if not exists segments jsonb;  -- whisper per-segment timestamps [{s,e,t}, ...], for click-to-seek playback
+alter table recordings add column if not exists live_transcript text;  -- rolling preview while recording (opt-in toggle); cleared on finalize

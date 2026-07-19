@@ -41,7 +41,8 @@
 
   .main {
     display: grid;
-    grid-template-columns: 3fr 2fr;
+    /* minmax(0,…) — plain fr lets long merge-panel/select text widen the column, jittering layout */
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
     gap: 1.5rem;
     align-items: start;
     margin-top: 2.25rem;
@@ -214,6 +215,15 @@
   }
   .merge-level button:hover { background: #f1ecdf; }
   .merge-level button.on { background: #f1ecdf; color: var(--ink); border-color: #c9c0aa; }
+
+  /* generic pill toggle (same look as .merge-level button, used outside that panel) */
+  .pill-btn {
+    font-family: var(--font-display); font-weight: 600; font-size: .72rem;
+    padding: .3rem .75rem; border: 1px solid var(--card-edge); border-radius: 999px;
+    background: #fffdf8; color: var(--ink-soft); cursor: pointer;
+  }
+  .pill-btn:hover { background: #f1ecdf; }
+  .pill-btn.on { background: #f1ecdf; color: var(--ink); border-color: #c9c0aa; }
   .merge-hint { margin: 0 0 .25rem; font-size: .78rem; color: var(--ink-soft); }
   .merge-sugg {
     display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
@@ -225,15 +235,16 @@
     color: var(--ink-soft); margin-left: .45rem;
   }
   .merge-actions { display: flex; gap: .35rem; }
-  .merge-sugg button, .merge-manual button {
+  .merge-sugg button, .merge-manual button, #weakSpots button {
     font-family: var(--font-display); font-weight: 600; font-size: .72rem;
     padding: .3rem .75rem; border: 1px solid var(--card-edge); border-radius: 999px;
     background: #fffdf8; color: var(--ink); cursor: pointer; white-space: nowrap;
   }
-  .merge-sugg button:hover, .merge-manual button:hover { background: #f1ecdf; }
+  .merge-sugg button:hover, .merge-manual button:hover, #weakSpots button:hover { background: #f1ecdf; }
+  #weakSpots .gs-note { margin: 0 0 .6rem; display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
   .merge-manual { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .8rem; }
   .merge-into { color: var(--ink-soft); }
-  .merge-manual select {
+  .merge-manual select, .merge-manual input[type="text"] {
     flex: 1; min-width: 8rem; max-width: 13rem; font-size: .8rem; padding: .3rem .4rem;
     border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
   }
@@ -314,6 +325,8 @@
     color: var(--ink-soft);
     margin-left: .4rem;
   }
+  .topic .pick { margin-right: .35rem; opacity: .35; }
+  .topic:hover .pick, .pick:checked { opacity: 1; }
   .tree-del {
     float: right; border: none; background: none; cursor: pointer;
     color: var(--ink-soft); font-size: .78rem; padding: 0 .3rem; opacity: 0;
@@ -427,6 +440,15 @@
     border-radius: 6px; padding: .5rem .7rem; margin: .6rem 0 0; white-space: pre-wrap;
   }
   .tokens { font-family: var(--font-mono); font-size: .7rem; color: var(--ink-soft); margin: .5rem 0 0; }
+  .live-tx {
+    max-height: 6rem; overflow-y: auto; margin: .6rem 0 0; padding: .5rem .7rem;
+    font-family: var(--font-mono); font-size: .78rem; color: var(--ink-soft);
+    background: #fffdf8; border: 1px solid var(--card-edge); border-radius: 6px;
+    white-space: pre-wrap;
+  }
+  .seg { cursor: pointer }
+  .seg:hover { background: #f1ecdf }
+  audio { width: 100%; margin-top: .4rem }
   .src { font-family: var(--font-mono); font-size: .62rem; text-transform: uppercase; letter-spacing: .05em;
     background: #e6def5; color: #5b3f8f; border-radius: 999px; padding: .12rem .5rem; }
 
@@ -477,6 +499,7 @@
         <button id="pauseBtn" hidden>&#10074;&#10074; Pause</button>
         <span id="timer" class="timer">0:00</span>
         <select id="micSelect" title="Microphone"></select>
+        <button id="liveTx" class="pill-btn" title="Show rolling transcript while recording — uses noticeably more battery (extra Whisper decodes)">Live transcript</button>
       </div>
     </div>
     <div class="deck-group">
@@ -505,6 +528,7 @@
   <div class="side">
     <section class="folders">
       <span class="deck-label">Library</span>
+      <div id="pickBar" hidden></div>
       <div id="tree"></div>
     </section>
     <section class="folders" id="merge" hidden></section>
@@ -540,9 +564,22 @@
           <option value="quiz">Quiz — 10 q</option>
           <option value="test">Test — 20 q</option>
         </select>
+        <select id="pFormat">
+          <option value="mcq">MCQ</option>
+          <option value="frq">FRQ — write on paper</option>
+        </select>
         <button onclick="genQuiz(this)">Generate</button>
       </div>
+      <div id="weakSpots"></div>
       <div id="pastQuizzes"></div>
+    </section>
+    <section class="folders" id="ask">
+      <span class="deck-label">Ask my notes</span>
+      <div class="merge-manual">
+        <input type="text" id="askQ" placeholder="Ask a question about your notes…">
+        <button onclick="askNotes(this)">Ask</button>
+      </div>
+      <div id="askAnswer"></div>
     </section>
     <section class="folders" id="review">
       <span class="deck-label">Review</span>
@@ -563,6 +600,7 @@
 let mr, rid, recording = false;
 let audioCtx, analyser, rafId, timerId, startTime;
 let openAssignments = [];
+let retentionDays = 7;  // overwritten by /app_settings; used only in the "audio expired" message
 const btn = document.getElementById('btn');
 const timer = document.getElementById('timer');
 const mic = document.getElementById('mic');
@@ -582,6 +620,18 @@ navigator.mediaDevices.addEventListener('devicechange', loadMics);
 loadMics();
 
 function fmt(s) { return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+
+// stamps live notes with elapsed recording time so they line up with the lecture later.
+// setTimeout lets the native Enter/newline land first, then we insert the prefix on the new line.
+function stampNote(e, ta) {
+  if (e.key !== 'Enter' || !recording || !startTime) return;
+  const stamp = `[${fmt(Math.floor((Date.now() - startTime) / 1000))}] `;
+  setTimeout(() => {
+    const pos = ta.selectionStart;
+    ta.setRangeText(stamp, pos, pos, 'end');
+    ta.dispatchEvent(new Event('input'));  // setRangeText doesn't fire input -- keep the draft save wired
+  }, 0);
+}
 
 function drawWave() {
   rafId = requestAnimationFrame(drawWave);
@@ -700,6 +750,25 @@ function escAttr(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', 
 
 const STAGE_LABEL = { loading_model: 'loading model', transcribing: 'transcribing', summarizing: 'summarizing' };
 
+// fills the audio player + timestamped transcript into a done row's <details>, once,
+// the first time it's opened (data-loaded guard -- the 5s refresh() wipe re-renders
+// the <details> empty, so this gets called again next open via the ontoggle wiring
+// and once more per poll while open, from refresh()'s post-render pass below).
+async function loadAudioBox(details, rid) {
+  const slot = details.querySelector('.audio-slot');
+  if (!details.open || !slot || slot.dataset.loaded) return;
+  slot.dataset.loaded = '1';
+  const segs = await (await fetch(`/segments/${rid}`)).json();
+  const segHtml = segs.map(s => `<span class="seg" data-s="${s.s}">[${fmt(Math.floor(s.s))}] ${esc(s.t)}</span> `).join('');
+  slot.innerHTML = `<audio controls preload="none" src="/audio/${rid}"></audio><div class="live-tx">${segHtml}</div>`;
+  const audio = slot.querySelector('audio');
+  audio.onerror = () => { audio.outerHTML = `<p class="lbl-hint">audio expired (kept ${retentionDays} days)</p>`; };
+  slot.querySelectorAll('.seg').forEach(el => el.onclick = () => {
+    const a = slot.querySelector('audio');
+    if (a) { a.currentTime = +el.dataset.s; a.play(); }
+  });
+}
+
 function labelEditor(r) {
   const live = r.status !== 'done';
   const filed = !!r.obsidian_uri;
@@ -711,10 +780,16 @@ function labelEditor(r) {
     <input class="lbl-class" list="dl-class" placeholder="class" value="${escAttr(r.class)}">
     <input class="lbl-unit"  list="dl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
     <input class="lbl-topic" list="dl-topic" placeholder="topic" value="${escAttr(r.topic)}">
-    <textarea class="lbl-notes" rows="2"
-      placeholder="your notes — woven into the AI summary on save">${esc(r.notes || '')}</textarea>
+    <textarea class="lbl-notes" rows="2" oninput="localStorage.setItem('notes-draft-${r.id}', this.value)"
+      ${r.status === 'recording' ? 'onkeydown="stampNote(event, this)"' : ''}
+      placeholder="your notes — woven into the AI summary on save">${esc(localStorage.getItem('notes-draft-' + r.id) ?? r.notes ?? '')}</textarea>
     <button onclick="saveLabels('${r.id}')">${filed ? 'Update note' : live ? 'Save labels' : 'Save to Obsidian'}</button>
     <button class="ocr-btn" onclick="ocrNotes('${r.id}', this)" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the notes box">&#128247; Add notes from file</button>
+    ${live ? '' : `
+    <textarea class="lbl-addendum" rows="2" oninput="localStorage.setItem('addendum-draft-${r.id}', this.value)"
+      placeholder="correction / addition — appended to the note as-is, no re-summary">${esc(localStorage.getItem('addendum-draft-' + r.id) ?? '')}</textarea>
+    <button onclick="saveAddendum('${r.id}')">Append to note</button>
+    <button class="ocr-btn" onclick="ocrNotes('${r.id}', this, '.lbl-addendum')" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the correction box">&#128247; From file</button>`}
     ${hint}
   </div>`;
   // filed already -> tuck the editor away; relabelling moves the note
@@ -758,6 +833,22 @@ async function togglePause(rid) {
   refresh();
 }
 
+// ---- live transcript preview toggle (off by default -- costs battery) ----
+async function loadAppSettings() {
+  const s = await (await fetch('/app_settings')).json();
+  document.getElementById('liveTx').classList.toggle('on', !!s.live_transcript);
+  if (s.retention_days) retentionDays = s.retention_days;
+}
+document.getElementById('liveTx').onclick = async () => {
+  const on = document.getElementById('liveTx').classList.contains('on');
+  await fetch('/app_settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ live_transcript: !on }),
+  });
+  loadAppSettings();
+};
+loadAppSettings();
+
 document.getElementById('uploadBtn').onclick = () => fileInput.click();
 fileInput.onchange = () => { uploadFile(fileInput.files[0]); fileInput.value = ''; };
 const hwInput = document.getElementById('hwInput');
@@ -800,7 +891,7 @@ async function deleteRec(rid) {
   refresh();
 }
 
-async function ocrNotes(rid, btn) {
+async function ocrNotes(rid, btn, sel = '.lbl-notes') {
   const picker = document.createElement('input');
   picker.type = 'file';
   picker.accept = 'image/*,.pdf,.pptx,.docx,.txt,.md';
@@ -813,8 +904,10 @@ async function ocrNotes(rid, btn) {
       const resp = await (await fetch(`/ocr?filename=${encodeURIComponent(f.name)}`,
         { method: 'POST', body: f })).json();
       if (resp.error) { alert(resp.error); return; }
-      const ta = document.querySelector(`.labels[data-rid="${rid}"] .lbl-notes`);
+      const ta = document.querySelector(`.labels[data-rid="${rid}"] ${sel}`);
       ta.value = (ta.value.trim() ? ta.value.trimEnd() + '\n\n' : '') + resp.text;
+      const key = sel === '.lbl-addendum' ? 'addendum-draft-' : 'notes-draft-';
+      localStorage.setItem(key + rid, ta.value); // programmatic set skips oninput
       ta.focus(); // review before save; focus also pauses the 5s refresh wipe
     } finally {
       btn.disabled = false; btn.textContent = old;
@@ -837,6 +930,20 @@ async function saveLabels(rid) {
     }),
   })).json();
   if (resp.error) alert(resp.error);
+  else localStorage.removeItem('notes-draft-' + rid); // server has it now
+  refresh();
+}
+
+async function saveAddendum(rid) {
+  const ta = document.querySelector(`.labels[data-rid="${rid}"] .lbl-addendum`);
+  if (!ta.value.trim()) return;
+  const resp = await (await fetch(`/addendum/${rid}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: ta.value }),
+  })).json();
+  if (resp.error) { alert(resp.error); return; }
+  localStorage.removeItem('addendum-draft-' + rid);
+  document.activeElement?.blur(); // focused textarea would make refresh() skip the repaint
   refresh();
 }
 
@@ -873,6 +980,10 @@ function progressBar(r) {
 async function refresh() {
   // ponytail: don't blow away a label field the user is mid-edit on the 5s tick
   if (document.activeElement && document.getElementById('list').contains(document.activeElement)) return;
+  // don't yank a playing <audio> out from under the user: skip only the #list
+  // rebuild while ANY of them plays — side panels below keep updating.
+  // ponytail: progress bars inside #list freeze during playback; acceptable.
+  const audioPlaying = [...document.querySelectorAll('#list audio')].some(a => !a.paused);
   const rows = await (await fetch('/recordings')).json();
   openAssignments = [];  // never let a failed fetch (e.g. migration not yet applied) be non-array — hwLinker.filter would throw and blank the list
   if (rows.some(r => r.source === 'homework' && r.status === 'done')) {
@@ -880,10 +991,11 @@ async function refresh() {
   }
   updateDatalists(rows);
   const openK = new Set([...document.querySelectorAll('#list details[open]')].map(d => d.dataset.k).filter(Boolean));
-  document.getElementById('list').innerHTML = rows.map(r => `
+  if (!audioPlaying) document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
       <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.obsidian_uri ? ` <a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">&#8599; Obsidian</a>` : ''}${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload'))}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
       ${r.status === 'transcribing' ? progressBar(r) : ''}
+      ${r.status === 'recording' && r.live_transcript ? `<div class="live-tx">${esc(r.live_transcript)}</div>` : ''}
       ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
       ${r.status === 'split_pending' ? splitCard(r) : r.status !== 'error' ? labelEditor(r) : ''}
@@ -891,11 +1003,15 @@ async function refresh() {
       ${r.status === 'done' && r.summary ? `<h4>Summary</h4>${md(r.summary)}` : ''}
       ${r.source === 'syllabus' && r.status === 'done' ? `<p><a href="/assignments/${r.id}.ics">&#128197; Download due dates (.ics) — import into Google Calendar</a></p>` : ''}
       ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
+      ${r.status === 'done' ? `<details class="audio-box" data-k="${r.id}-audio" ontoggle="loadAudioBox(this,'${r.id}')"><summary>&#9654; audio + timestamps</summary><div class="audio-slot"></div></details>` : ''}
       ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
     </div>`).join('');
   for (const d of document.querySelectorAll('#list details[data-k]'))
     if (openK.has(d.dataset.k)) d.open = true;
   typeset(document.getElementById('list'));
+  // details start closed by default -- ontoggle only fires on the open<->closed transitions
+  // above, so re-opened boxes (openK) need an explicit kick to (re)fill their now-empty slot.
+  document.querySelectorAll('#list details.audio-box[open]').forEach(d => loadAudioBox(d, d.dataset.k.replace('-audio', '')));
   renderTree(rows);
   renderMerge(rows);
   renderPractice(rows);
@@ -959,7 +1075,12 @@ function renderTree(rows) {
     const del = rs.length > 1
       ? `<button class="tree-del" title="Delete all ${rs.length} recordings" data-topic-del data-rids="${rs.map(x => x.id).join(',')}">&#10005;</button>`
       : `<button class="tree-del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>`;
-    return `<div class="topic" data-rid="${escAttr(r.id)}" ${attrs}>${label}<span class="when">${rs.length > 1 ? '&times;' + rs.length + ' &middot; ' : ''}${(r.created_at || '').slice(0, 10)}</span>${del}</div>`;
+    // draggable="false" on the checkbox: it sits inside a draggable div, without this a checkbox
+    // click starts a tree drag instead of toggling.
+    const pick = r.topic
+      ? `<input type="checkbox" class="pick" draggable="false" data-sem="${escAttr(sem)}" data-cls="${escAttr(cls)}" data-topic="${escAttr(r.topic)}">`
+      : '';
+    return `<div class="topic" data-rid="${escAttr(r.id)}" ${attrs}>${pick}${label}<span class="when">${rs.length > 1 ? '&times;' + rs.length + ' &middot; ' : ''}${(r.created_at || '').slice(0, 10)}</span>${del}</div>`;
   };
 
   const unitHtml = (sem, cls, unit, recs) => {
@@ -977,13 +1098,88 @@ function renderTree(rows) {
       + `data-unit="${escAttr(unit)}" data-count="${recs.length}">&#10005;</button></summary>${inner}</details>`;
   };
 
-  document.getElementById('tree').innerHTML = Object.keys(tree).sort().map(sem =>
+  const treeDiv = document.getElementById('tree');
+  treeDiv.innerHTML = Object.keys(tree).sort().map(sem =>
     det(sem, sem, Object.keys(tree[sem]).sort().map(cls =>
       det(sem + '/' + cls, cls, Object.keys(tree[sem][cls]).sort()
         .map(unit => unitHtml(sem, cls, unit, tree[sem][cls][unit])).join(''))
     ).join(''))
   ).join('');
   applyTreeSel();
+
+  // survive the rewrite above: re-check boxes still picked, and drop pickedTopics entries whose
+  // topic vanished (renamed/deleted elsewhere) so a stale name can't be submitted.
+  const liveBoxes = [...treeDiv.querySelectorAll('.pick')];
+  const liveKeys = new Set(liveBoxes.map(cb => cb.dataset.sem + '||' + cb.dataset.cls + '||' + cb.dataset.topic));
+  for (const key of pickedTopics.keys()) if (!liveKeys.has(key)) pickedTopics.delete(key);
+  for (const cb of liveBoxes)
+    cb.checked = pickedTopics.has(cb.dataset.sem + '||' + cb.dataset.cls + '||' + cb.dataset.topic);
+  renderPickBar();
+}
+
+// ---- multi-select topics -> practice material: key is "sem||cls||topic", values from one class
+// only (enforced on check). Survives the 5s re-render via the block at the end of renderTree above.
+const pickedTopics = new Map();
+function renderPickBar() {
+  const bar = document.getElementById('pickBar');
+  if (!pickedTopics.size) { bar.hidden = true; bar.innerHTML = ''; return; }
+  // mid-interaction guard: the 5s poll re-runs renderTree -> here; rebuilding while a
+  // select is focused would snap its dropdown shut (same class of bug as the notes wipe)
+  if (bar.contains(document.activeElement)) return;
+  const prevKind = document.getElementById('pickKind')?.value;
+  const prevFmt = document.getElementById('pickFmt')?.value;
+  bar.hidden = false;
+  bar.innerHTML = `<div class="merge-manual">
+    <span>${pickedTopics.size} topic${pickedTopics.size > 1 ? 's' : ''}</span>
+    <select id="pickKind">
+      <option value="quiz">Quiz — 10 q</option>
+      <option value="test">Test — 20 q</option>
+    </select>
+    <select id="pickFmt">
+      <option value="mcq">MCQ</option>
+      <option value="frq">FRQ — write on paper</option>
+    </select>
+    <button class="pill-btn" data-pick-create>Create</button>
+    <button class="pill-btn" data-pick-clear>Clear</button>
+  </div>`;
+  if (prevKind) document.getElementById('pickKind').value = prevKind;
+  if (prevFmt) document.getElementById('pickFmt').value = prevFmt;
+}
+
+function clearPicked() {
+  pickedTopics.clear();
+  for (const cb of document.getElementById('tree').querySelectorAll('.pick:checked')) cb.checked = false;
+  renderPickBar(); // pickedTopics is empty now, so this hides #pickBar too
+}
+
+// delegated: #pickBar's innerHTML is rewritten by renderPickBar, so listeners live on the container.
+document.getElementById('pickBar').addEventListener('click', e => {
+  if (e.target.closest('[data-pick-clear]')) { clearPicked(); return; }
+  const btn = e.target.closest('[data-pick-create]');
+  if (btn) createFromPicked(btn);
+});
+
+async function createFromPicked(btn) {
+  const first = pickedTopics.values().next().value; // one-class rule guarantees every entry shares sem/cls
+  const body = {
+    semester: first.sem,
+    class: first.cls,
+    kind: document.getElementById('pickKind').value,
+    format: document.getElementById('pickFmt').value,
+    topics: [...pickedTopics.values()].map(t => t.topic),
+  };
+  btn.disabled = true; const old = btn.textContent; btn.textContent = 'generating…';
+  try {
+    const q = await (await fetch('/quiz/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json();
+    if (q.error) { alert(q.error); return; }
+    clearPicked();
+    pastLoaded = 0;
+    renderQuizForm(q);
+    document.getElementById('quizArea').scrollIntoView({ behavior: 'smooth' });
+  } finally { btn.disabled = false; btn.textContent = old; }
 }
 
 // delegated: #tree's innerHTML is rewritten every refresh, so listeners live on the container.
@@ -1019,6 +1215,21 @@ treeEl.addEventListener('dragend', () => {
   treeDragging = false;
   dragItem = null;
   for (const el of treeEl.querySelectorAll('.drag-over')) el.classList.remove('drag-over');
+});
+treeEl.addEventListener('change', e => {
+  const cb = e.target.closest('.pick');
+  if (!cb) return;
+  const { sem, cls, topic } = cb.dataset;
+  const key = sem + '||' + cls + '||' + topic;
+  if (!cb.checked) { pickedTopics.delete(key); renderPickBar(); return; }
+  const existing = pickedTopics.values().next().value; // one class rule: compare against any existing pick
+  if (existing && (existing.sem !== sem || existing.cls !== cls)) {
+    alert('pick topics from one class at a time');
+    cb.checked = false;
+    return;
+  }
+  pickedTopics.set(key, { sem, cls, topic });
+  renderPickBar();
 });
 treeEl.addEventListener('click', async e => {
   if (e.ctrlKey || e.metaKey) {
@@ -1304,7 +1515,7 @@ let quizRows = [];
 
 // Fill a semester>class>unit cascade of <select>s from filed rows.
 // Blank semester = all semesters; blank unit = whole class. Preserves current picks.
-function fillScope(rows, semSel, clsSel, unitSel) {
+function fillScope(rows, semSel, clsSel, unitSel, hideExamUnits = false) {
   const done = rows.filter(r => r.status === 'done' && r.class);
   const uniq = arr => [...new Set(arr)].sort();
   const opt = (v, label) => `<option value="${escAttr(v)}">${esc(label ?? v)}</option>`;
@@ -1322,7 +1533,8 @@ function fillScope(rows, semSel, clsSel, unitSel) {
   if (classes.includes(clsCur)) clsSel.value = clsCur;
 
   const cls = clsSel.value;
-  const units = uniq(inSem.filter(r => r.class === cls && r.unit).map(r => r.unit));
+  const units = uniq(inSem.filter(r => r.class === cls && r.unit).map(r => r.unit))
+    .filter(u => !hideExamUnits || !/exam/i.test(u)); // quiz creator: exam/exam-prep units aren't study material
   unitSel.innerHTML = opt('', 'whole class') + units.map(u => opt(u)).join('');
 }
 
@@ -1330,11 +1542,14 @@ function renderPractice(rows) {
   const card = document.getElementById('practice');
   if (document.activeElement && card.contains(document.activeElement)) return;
   quizRows = rows;
-  fillScope(rows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'));
+  fillScope(rows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'), true);
   loadPastQuizzes();
+  loadWeakSpots();
 }
 function pScope() {
-  fillScope(quizRows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'));
+  fillScope(quizRows, document.getElementById('pSem'), document.getElementById('pClass'), document.getElementById('pUnit'), true);
+  weakLoaded = 0;  // scope changed — stale weak spots for the old class must not linger
+  loadWeakSpots();
 }
 
 let pastLoaded = 0;
@@ -1349,12 +1564,52 @@ async function loadPastQuizzes() {
     </div>`).join('');
 }
 
+let weakLoaded = 0;
+let weakTopicsCache = [];
+async function loadWeakSpots() {
+  if (Date.now() - weakLoaded < 30000) return; // gentle poll, same cadence as loadPastQuizzes
+  const cls = document.getElementById('pClass').value;
+  const el = document.getElementById('weakSpots');
+  if (!cls) { el.innerHTML = ''; weakTopicsCache = []; return; }
+  weakLoaded = Date.now();
+  const qs = new URLSearchParams({ class: cls });
+  const sem = document.getElementById('pSem').value;
+  if (sem) qs.set('semester', sem);
+  const spots = await (await fetch('/weak_spots?' + qs)).json();
+  weakTopicsCache = spots.map(s => s.topic);
+  el.innerHTML = spots.length ? `<p class="gs-note">Weakest: ${
+    spots.map(s => `${esc(s.topic)} (${s.missed}/${s.attempted})`).join(', ')
+  } <button onclick="drillWeak(this)">Drill these</button></p>` : '';
+}
+
+async function drillWeak(btn) {
+  const body = {
+    semester: document.getElementById('pSem').value,
+    class: document.getElementById('pClass').value,
+    // no unit: weak spots aggregate class-wide, a unit filter can zero them out
+    kind: 'quiz',
+    format: document.getElementById('pFormat').value,
+    topics: weakTopicsCache,
+  };
+  btn.disabled = true; const old = btn.textContent; btn.textContent = 'generating…';
+  try {
+    const q = await (await fetch('/quiz/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json();
+    if (q.error) { alert(q.error); return; }
+    pastLoaded = 0;
+    renderQuizForm(q);
+  } finally { btn.disabled = false; btn.textContent = old; }
+}
+
 async function genQuiz(btn) {
   const body = {
     semester: document.getElementById('pSem').value,
     class: document.getElementById('pClass').value,
     unit: document.getElementById('pUnit').value,
     kind: document.getElementById('pKind').value,
+    format: document.getElementById('pFormat').value,
   };
   if (!body.class) { alert('record and file some lectures first'); return; }
   btn.disabled = true; btn.textContent = 'generating…';
@@ -1370,18 +1625,28 @@ async function genQuiz(btn) {
 }
 
 function renderQuizForm(q) {
-  document.getElementById('quizArea').innerHTML = `<div class="quiz" data-qid="${q.id}">
-    <div class="quiz-head"><b>${esc(q.kind)} — ${esc(q.class || '')}${q.unit ? ' / ' + esc(q.unit) : ''}</b>
-      <button onclick="closeQuiz()" title="Close">&#10005;</button></div>
-    ${q.questions.map((qq, i) => `<div class="q" data-i="${i}">
-      <p>${i + 1}. ${esc(qq.q)}</p>
-      ${qq.type === 'mcq'
-        ? qq.choices.map((c, ci) => `<label><input type="radio" name="q${i}" value="${ci}"> ${esc(c)}</label>`).join('')
-        : `<textarea rows="2" placeholder="your answer"></textarea>`}
-    </div>`).join('')}
-    <button class="submit" onclick="submitQuiz(this, '${q.id}')">Submit</button>
-  </div>`;
-  document.getElementById('quizArea').scrollIntoView({ behavior: 'smooth' });
+  const area = document.getElementById('quizArea');
+  const head = `<div class="quiz-head"><b>${esc(q.kind)} — ${esc(q.class || '')}${q.unit ? ' / ' + esc(q.unit) : ''}</b>
+      <button onclick="closeQuiz()" title="Close">&#10005;</button></div>`;
+  if (q.questions[0]?.type === 'frq') {
+    area.innerHTML = `<div class="quiz" data-qid="${q.id}">${head}
+      ${q.questions.map((qq, i) => `<div class="q"><p>${i + 1}. ${esc(qq.q)}</p></div>`).join('')}
+      <p class="gs-note">Write your answers on paper, then photograph/scan and upload.</p>
+      <input type="file" id="frqFiles" multiple accept="image/*,.pdf" capture="environment">
+      <button class="submit" onclick="submitFrq('${q.id}', this)">Submit</button>
+    </div>`;
+  } else {
+    area.innerHTML = `<div class="quiz" data-qid="${q.id}">${head}
+      ${q.questions.map((qq, i) => `<div class="q" data-i="${i}">
+        <p>${i + 1}. ${esc(qq.q)}</p>
+        ${qq.type === 'mcq'
+          ? qq.choices.map((c, ci) => `<label><input type="radio" name="q${i}" value="${ci}"> ${esc(c)}</label>`).join('')
+          : `<textarea rows="2" placeholder="your answer"></textarea>`}
+      </div>`).join('')}
+      <button class="submit" onclick="submitQuiz(this, '${q.id}')">Submit</button>
+    </div>`;
+  }
+  area.scrollIntoView({ behavior: 'smooth' });
 }
 
 async function submitQuiz(btn, qid) {
@@ -1403,6 +1668,27 @@ async function submitQuiz(btn, qid) {
   } finally { btn.disabled = false; }
 }
 
+async function submitFrq(qid, btn) {
+  const files = [...document.getElementById('frqFiles').files];
+  if (!files.length) { alert('attach at least one photo/scan'); return; }
+  btn.disabled = true; btn.textContent = 'grading…';
+  try {
+    const encoded = await Promise.all(files.map(f => new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve({ name: f.name, data: r.result.split(',')[1] });
+      r.onerror = reject;
+      r.readAsDataURL(f);
+    })));
+    const g = await (await fetch(`/quiz/${qid}/submit_frq`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: encoded }),
+    })).json();
+    if (g.error) { alert(g.error); return; }
+    pastLoaded = 0;
+    renderQuizResults(qid, g.questions, g.results, g.score);
+  } finally { btn.disabled = false; }
+}
+
 function renderQuizResults(qid, questions, results, score) {
   document.getElementById('quizArea').innerHTML = `<div class="quiz" data-qid="${qid}">
     <div class="quiz-head"><b>Score: ${score}%</b>
@@ -1417,9 +1703,11 @@ function renderQuizResults(qid, questions, results, score) {
           ${qq.explanation ? '<br>' + esc(qq.explanation) : ''}</p>`;
       } else {
         const s = r.score ?? 0;
+        const ref = qq.type === 'frq' ? `Rubric: ${esc(qq.rubric || '')}` : `Model answer: ${esc(qq.answer || '')}`;
+        const mine = qq.type === 'frq' ? `Transcribed: ${esc(String(r.answer || '(blank)'))}` : `You wrote: ${esc(String(r.answer || '(blank)'))}`;
         verdict = `<p class="verdict ${s >= 1 ? 'good' : 'bad'}">${s >= 1 ? '✓' : s > 0 ? '½' : '✗'} ${esc(r.feedback || '')}
-          <br>Model answer: ${esc(qq.answer || '')}</p>
-          <p class="verdict">You wrote: ${esc(String(r.answer || '(blank)'))}</p>`;
+          <br>${ref}</p>
+          <p class="verdict">${mine}</p>`;
       }
       return `<div class="q"><p>${i + 1}. ${esc(qq.q)}</p>${verdict}</div>`;
     }).join('')}
@@ -1435,6 +1723,30 @@ async function openQuiz(qid) {
 }
 
 function closeQuiz() { document.getElementById('quizArea').innerHTML = ''; }
+
+// ---- ask my notes: lives in #askAnswer, outside #list, so the 5s refresh() never wipes it.
+async function askNotes(btn) {
+  const question = document.getElementById('askQ').value.trim();
+  if (!question) return;
+  const body = {
+    question,
+    semester: document.getElementById('pSem').value,
+    class: document.getElementById('pClass').value,
+  };
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = 'thinking…';
+  try {
+    const resp = await (await fetch('/ask', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json();
+    if (resp.error) { alert(resp.error); return; }
+    const links = resp.topics.map(t => t.uri
+      ? `<a href="${t.uri}">${esc(t.topic)}</a>` : esc(t.topic)).join(' · ');
+    document.getElementById('askAnswer').innerHTML =
+      `<p>${esc(resp.answer)}</p>` + (links ? `<p class="pq-score">${links}</p>` : '');
+  } finally { btn.disabled = false; btn.textContent = old; }
+}
 
 // ---- flashcard review: due count re-renders on refresh (focus-guarded);
 // ---- the review session lives in #reviewArea, which refresh() never touches.
