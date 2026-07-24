@@ -32,6 +32,10 @@ MODEL_LOAD_STALL_S = int(os.getenv("MODEL_LOAD_STALL_S", "300"))
 OBSIDIAN_VAULT = pathlib.Path(
     os.getenv("OBSIDIAN_VAULT", str(pathlib.Path.home() / "College Lectures"))
 )
+# Every study artifact — announced exams, graded quizzes/tests, cheat sheets,
+# flashcard decks — files under this folder inside the unit (class-level when
+# the scope spans units). Was "Practice"; _migrate_prep_dirs renames old ones.
+PREP_DIR = "Exam Prep"
 # Notion fallback: user records lectures with Notion's AI meeting-note taker into
 # a dedicated database; we poll it, pull transcripts, run the same Claude pipeline.
 # Off unless NOTION_TOKEN is set (an internal-integration secret shared with the DB).
@@ -723,16 +727,25 @@ def _report_model_progress(rid, stop_event):
             last = pct
 
 
+def _cap_entries(entries):
+    """ponytail: past ~2000 entries (very long lectures) truncate text to 200
+    chars instead of dropping entries -- keeps every timestamp, just bounds
+    jsonb size. Returns copies so the caller's working list keeps full text."""
+    if len(entries) > 2000:
+        return [{**e, "t": e["t"][:200]} for e in entries]
+    return entries
+
+
 def _seg_entries(segs):
     """Whisper segments -> compact {s,e,t} timestamp dicts for the `segments`
-    jsonb column. ponytail: past ~2000 entries (very long lectures) truncate
-    text to 200 chars instead of dropping entries -- keeps every timestamp,
-    just bounds jsonb size."""
-    entries = [{"s": round(s.start, 1), "e": round(s.end, 1), "t": s.text.strip()} for s in segs]
-    if len(entries) > 2000:
-        for e in entries:
-            e["t"] = e["t"][:200]
-    return entries
+    jsonb column."""
+    return _cap_entries([{"s": round(s.start, 1), "e": round(s.end, 1), "t": s.text.strip()}
+                         for s in segs])
+
+
+def _resume_at(entries):
+    """Second to restart whisper from, given already-checkpointed segments."""
+    return entries[-1]["e"] if entries else 0
 
 
 def process(rid):
@@ -746,21 +759,39 @@ def process(rid):
         finally:
             stop.set()
 
+        # ponytail: crash/shutdown recovery is just the checkpoint below read back —
+        # `segments` holds every decoded entry so far, so restart resumes at the last
+        # one's end instead of re-decoding the whole lecture. clip_timestamps keeps
+        # seg.end and info.duration absolute/full-file, so the progress math is unchanged.
+        # ponytail: a >2000-segment lecture that crashes rebuilds its prefix from the
+        # DB copy, whose text _cap_entries truncated to 200 chars -- resumed transcript
+        # for those is lossy. Store the untruncated text elsewhere if that ever bites.
+        done = (sb.table("recordings").select("segments").eq("id", rid)
+                .single().execute().data or {}).get("segments") or []
         _set(rid, stage="transcribing", progress=0)
         with _transcribe_lock:
-            segments, info = model.transcribe(str(audio_path(rid)))
+            # condition_on_previous_text=False: whisper's default feeds each
+            # window its own last output, so on muffled/narrowband audio one
+            # hallucinated line seeds a loop that runs for minutes. Measured on
+            # the 2026-07-23 lecture: repeated sentences 12 -> 2 (first 4 min)
+            # and 37 -> 4 (last 4.5 min). Costs a little cross-window context.
+            # vad_filter=True cuts the loops further but drops real quiet speech
+            # on this audio — not worth it.
+            segments, info = model.transcribe(str(audio_path(rid)),
+                                              clip_timestamps=str(_resume_at(done)),
+                                              condition_on_previous_text=False)
             duration = max(info.duration, 1)
-            parts, raw_segs, last_pct = [], [], -1
+            entries, last_pct = list(done), -1
             for seg in segments:
                 _gate(rid).wait()  # paused -> block before decoding further
-                parts.append(seg.text)
-                raw_segs.append(seg)
+                entries.append({"s": round(seg.start, 1), "e": round(seg.end, 1),
+                                "t": seg.text.strip()})
                 pct = min(99, int(seg.end / duration * 100) // 5 * 5)
                 if pct != last_pct:
-                    _set(rid, progress=pct)
+                    _set(rid, progress=pct, segments=_cap_entries(entries))
                     last_pct = pct
-        transcript = "".join(parts).strip()
-        _set(rid, segments=_seg_entries(raw_segs))
+        transcript = " ".join(e["t"] for e in entries).strip()
+        _set(rid, segments=_cap_entries(entries))
         finalize(rid, transcript)
     except Exception as e:
         _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]", live_transcript=None)
@@ -808,7 +839,7 @@ def live_preview(rid):
                 try:
                     if model is None:  # load lazily -- only after ffmpeg's confirmed present
                         model = get_model()
-                    segments, info = model.transcribe(tmp_path)
+                    segments, info = model.transcribe(tmp_path, condition_on_previous_text=False)
                     # segments is a lazy generator — drain it INSIDE the lock,
                     # decoding is the actual model work
                     text = " ".join(seg.text.strip() for seg in segments).strip()
@@ -1249,13 +1280,14 @@ def quiz_generate(payload: dict = Body(...)):
     fmt = payload.get("format") if payload.get("format") in ("mcq", "frq") else "mcq"
     if not cls:
         return {"error": "class required"}
-    q = (sb.table("recordings").select("topic,title,summary")
+    q = (sb.table("recordings").select("topic,title,summary,semester")
          .eq("status", "done").eq("class", cls))
     if sem:
         q = q.eq("semester", sem)
     if unit:
         q = q.eq("unit", unit)
     rows = q.execute().data
+    sem = sem or _rows_semester(rows)
     topics = payload.get("topics")
     if topics:
         rows = [r for r in rows if r.get("topic") in topics]
@@ -1398,6 +1430,7 @@ def study_generate(payload: dict = Body(...)):
     sem = (payload.get("semester") or "").strip()
     cls = (payload.get("class") or "").strip()
     kind = payload.get("kind")
+    fmt = payload.get("format") if payload.get("format") in ("mcq", "frq") else "mcq"
     scopes = payload.get("scopes")
     if kind not in ("quiz", "test", "flashcards", "cheatsheet"):
         return {"error": "bad kind"}
@@ -1407,11 +1440,12 @@ def study_generate(payload: dict = Body(...)):
             isinstance(s, dict) and (s.get("unit") or "").strip() for s in scopes):
         return {"error": "scopes required"}
 
-    q = (sb.table("recordings").select("topic,title,summary,unit")
+    q = (sb.table("recordings").select("topic,title,summary,unit,semester")
          .eq("status", "done").eq("class", cls))
     if sem:
         q = q.eq("semester", sem)
     rows = _scope_rows(q.execute().data, scopes)
+    sem = sem or _rows_semester(rows)
     if not any((r.get("summary") or "").strip() for r in rows):
         return {"error": "no filed notes for that scope yet"}
 
@@ -1420,7 +1454,7 @@ def study_generate(payload: dict = Body(...)):
 
     if kind in ("quiz", "test"):
         try:
-            questions = generate_quiz(rows, kind)
+            questions = generate_quiz(rows, kind, fmt)
         except Exception as e:
             return {"error": f"generation failed: {e}"}
         return sb.table("quizzes").insert({
@@ -1442,11 +1476,13 @@ def study_generate(payload: dict = Body(...)):
         if not valid:
             return {"error": "no usable cards generated"}
         sb.table("cards").insert(valid).execute()
-        return {"count": len(valid)}
+        return {"count": len(valid), "path": write_cards_note(sem, cls, unit or "")}
 
     md = build_cheatsheet(rows, cls, unit or "")
     fname = _slug(f"{cls} {unit or ''}".strip()) + " cheatsheet.md"
-    return {"filename": fname, "markdown": md}
+    # filed in the vault as well as downloaded — the download is the export copy
+    return {"filename": fname, "markdown": md,
+            "path": write_prep_note(sem, cls, unit or "", fname, md)}
 
 
 # --- flashcards / spaced repetition (SM-2) ---
@@ -1498,6 +1534,7 @@ def cards_generate(payload: dict = Body(...)):
     if unit:
         q = q.eq("unit", unit)
     rows = q.execute().data
+    sem = sem or _rows_semester(rows)
     if not any((r.get("summary") or "").strip() for r in rows):
         return {"error": "no filed notes for that scope yet"}
     try:
@@ -1513,7 +1550,7 @@ def cards_generate(payload: dict = Body(...)):
     if not valid:
         return {"error": "no usable cards generated"}
     sb.table("cards").insert(valid).execute()
-    return {"count": len(valid)}
+    return {"count": len(valid), "path": write_cards_note(sem, cls, unit)}
 
 
 @app.get("/cards/due")
@@ -1590,15 +1627,17 @@ def cheatsheet(class_: str = Query("", alias="class"), unit: str = "", semester:
     unit = unit.strip()
     if not cls:
         return Response("class required", media_type="text/plain", status_code=400)
-    q = (sb.table("recordings").select("topic,title,summary")
+    q = (sb.table("recordings").select("topic,title,summary,semester")
          .eq("status", "done").eq("class", cls))
     if sem:
         q = q.eq("semester", sem)
     if unit:
         q = q.eq("unit", unit)
     rows = q.execute().data
+    sem = sem or _rows_semester(rows)
     md = build_cheatsheet(rows, cls, unit)
     fname = _slug(f"{cls} {unit}".strip()) + " cheatsheet.md"
+    write_prep_note(sem, cls, unit, fname, md)  # file it, then serve the download
     return Response(md, media_type="text/markdown",
                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
@@ -1773,25 +1812,39 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
     return (*parts, msg.usage.input_tokens, msg.usage.output_tokens)
 
 
+def _json_obj(raw):
+    """The first JSON object in raw, ignoring any prose the model appended
+    after it. json.JSONDecoder().raw_decode stops at the end of the object, so
+    trailing '---\n**Note on transcript quality:** ...' commentary no longer
+    poisons the parse. Returns {} when there is no JSON object at all.
+    Deliberately NOT brace-counting/regex brace-matching: summaries contain
+    LaTeX with literal braces (\\frac{1}{2}, x^{2}) that would break that."""
+    start = raw.find("{")
+    if start == -1:
+        return {}
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(raw, start)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
 def _parse_segments(raw):
     """Parses analyze()'s {"segments": [...]} JSON reply into a list of
     {class, unit, topic, summary} dicts. Pure — no network/DB — so it's
     directly testable. Falls back to one segment holding the raw text as the
     summary, Unsorted/Untitled labels, if the JSON is unparseable or empty —
     mirrors the pre-split single-object fallback."""
-    try:
-        segments = json.loads(raw).get("segments") or []
-        if not segments:
-            raise ValueError("empty segments")
-        return [
-            {"class": s.get("class", ""), "unit": s.get("unit", ""),
-             "topic": s.get("topic", ""), "summary": s.get("summary", "")}
-            for s in segments
-        ]
-    except (json.JSONDecodeError, AttributeError, ValueError):
+    segments = _json_obj(raw).get("segments") or []
+    if not segments:
         # ponytail: model ignored the JSON ask — keep its text as the summary,
         # drop into an Unsorted bucket the user can re-file from the UI.
         return [{"class": "Unsorted", "unit": "Unsorted", "topic": "Untitled", "summary": raw}]
+    return [
+        {"class": s.get("class", ""), "unit": s.get("unit", ""),
+         "topic": s.get("topic", ""), "summary": s.get("summary", "")}
+        for s in segments
+    ]
 
 
 def _norm_words(s):
@@ -1840,11 +1893,8 @@ def _parse_exams(raw):
     """Parses analyze()'s {"exams": [...]} JSON reply defensively — missing
     key, non-list, or unparseable JSON all fall back to no exams detected.
     Pure — no network/DB — so it's directly testable."""
-    try:
-        exams = json.loads(raw).get("exams")
-        return exams if isinstance(exams, list) else []
-    except (json.JSONDecodeError, AttributeError):
-        return []
+    exams = _json_obj(raw).get("exams")
+    return exams if isinstance(exams, list) else []
 
 
 def analyze(transcript, notes="", created_at=None):
@@ -1885,14 +1935,21 @@ def analyze(transcript, notes="", created_at=None):
                     "moves to a genuinely different one that a student would file as "
                     "its own note (e.g. 'derivatives of inverse functions' then "
                     "'applications of derivatives'). Segments are CONCEPTS, not "
-                    "examples: several worked problems, asides, or recaps on the same "
-                    "concept all belong to one segment, and a run of small topics that "
-                    "share a theme is ONE segment covering that theme (e.g. assorted "
-                    "application problems = one 'Applications of Derivatives' segment). "
+                    "examples: several worked problems, asides, tangents, off-topic "
+                    "chatter, or recaps on the same concept all belong to one segment. "
+                    "A distinct named technique, method, rule, or theorem that the "
+                    "lecturer introduces and teaches in its own right IS its own segment, "
+                    "even when it shares a unit with what came before (e.g. "
+                    "'antiderivatives' then 'u-substitution' = two segments, both in the "
+                    "Integration unit). Test: if the topic label you'd write needs an "
+                    "'and' to cover what happened (e.g. 'Antiderivatives and "
+                    "u-substitution'), that is TWO segments, not one — split it and give "
+                    "each half its own label.\n"
                     "Lectures often OPEN by reviewing the previous class — an opening "
                     "recap is NEVER its own segment, even when its subject differs from "
                     "today's material: fold it into the first new-material segment.\n"
-                    "Most lectures are 1 segment, sometimes 2 — NEVER more than 3.\n"
+                    "Usually 1-2 segments, sometimes 3 — NEVER more than 4. When torn "
+                    "between one compound segment and two clean ones, SPLIT.\n"
                     "Return ONLY a JSON object with keys: segments, exams.\n"
                     "segments is an array of one object per topic segment, each with "
                     "keys class, unit, topic, summary.\n"
@@ -2224,13 +2281,73 @@ def write_note(row):
     return dest
 
 
+def _rows_semester(rows):
+    """Semester to file under when the caller didn't pick one — every scope
+    selector defaults to 'All semesters', and an empty semester would slug to
+    'Untitled' and strand the note at the vault root, off the graph."""
+    return next((r.get("semester") for r in rows if r.get("semester")), "")
+
+
+def write_prep_note(sem, cls, unit, filename, body):
+    """Writes a study artifact into the unit's Exam Prep folder --
+    <vault>/<sem>/<cls>/<unit>/Exam Prep/<filename>, class-level when unit is
+    empty (a scope spanning units). Shared by the cheat-sheet and flashcard
+    exports; quizzes/exams build their own paths since they reuse existing
+    notes. Returns the path (str)."""
+    base = OBSIDIAN_VAULT / _slug(sem) / _slug(cls)
+    if unit:
+        base = base / _slug(unit)
+    path = base / PREP_DIR / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+def write_cards_note(sem, cls, unit):
+    """Readable snapshot of a scope's flashcard deck in its Exam Prep folder.
+    The DB stays the source of truth for SM-2 scheduling — this is rewritten
+    whole on each generation so a second batch doesn't split across notes."""
+    q = sb.table("cards").select("front,back").eq("class", cls)
+    if sem:
+        q = q.eq("semester", sem)
+    if unit:
+        q = q.eq("unit", unit)
+    cards = q.execute().data or []
+    body = (f"---\nclass: {cls}\ntags: [flashcards]\n---\n\n"
+            f"# Flashcards — {unit or cls}\n\n"
+            + "".join(f"- **{c.get('front', '')}** — {c.get('back', '')}\n" for c in cards)
+            + f"\nClass: [[{_slug(sem)}/{_slug(cls)}/{_slug(cls)}|{_slug(cls)}]]\n")
+    return write_prep_note(sem, cls, unit, "Flashcards.md", body)
+
+
+def _migrate_prep_dirs():
+    """One-time rename of the old 'Practice' folders to PREP_DIR so old and new
+    study notes don't sit in two folders side by side. ponytail: runs on every
+    import — a no-op once nothing under the vault is named Practice."""
+    if not OBSIDIAN_VAULT.is_dir():
+        return
+    for p in list(OBSIDIAN_VAULT.rglob("Practice")):
+        if not p.is_dir():
+            continue
+        dest = p.with_name(PREP_DIR)
+        try:
+            if dest.exists():
+                for f in p.iterdir():
+                    f.replace(dest / f.name)  # same filename = same note, overwrite
+                p.rmdir()
+            else:
+                p.rename(dest)
+        except OSError as e:
+            print(f"[listen] Practice -> {PREP_DIR} migration skipped for {p}: {e}")
+
+
 def write_exam_note(sem, cls, exam):
-    """Files a detected/announced exam or quiz under a Practice folder:
-    <vault>/<sem>/<cls>/<unit>/Practice/<title>.md when exactly one 'topics'
+    """Files a detected/announced exam or quiz under the Exam Prep folder:
+    <vault>/<sem>/<cls>/<unit>/Exam Prep/<title>.md when exactly one 'topics'
     entry matches an existing unit folder, else class-level
-    <vault>/<sem>/<cls>/Practice/<title>.md. Same title -> same slug ->
+    <vault>/<sem>/<cls>/Exam Prep/<title>.md. Same title -> same slug ->
     overwrites in place (an existing note anywhere under this class's
-    Practice folders is reused), so re-detecting an exam across lectures/a
+    Exam Prep folders is reused), so re-detecting an exam across lectures/a
     revised syllabus is idempotent. A 'topics' entry that exactly matches an
     existing unit folder links to that unit's hub note; anything else stays a
     plain bullet. Returns the path (str)."""
@@ -2267,13 +2384,13 @@ def write_exam_note(sem, cls, exam):
     fname = f"{_slug(title)}.md"
     # reuse an existing note wherever it already lives so re-detection stays
     # an overwrite even as unit folders appear later
-    path = next(iter(cls_dir.glob(f"*/Practice/{fname}")), None) if cls_dir.is_dir() else None
-    if path is None and (cls_dir / "Practice" / fname).exists():
-        path = cls_dir / "Practice" / fname
+    path = next(iter(cls_dir.glob(f"*/{PREP_DIR}/{fname}")), None) if cls_dir.is_dir() else None
+    if path is None and (cls_dir / PREP_DIR / fname).exists():
+        path = cls_dir / PREP_DIR / fname
     if path is None:
         matched = [t for t in (str(x).strip() for x in topics) if t in units]
         # ponytail: exam spanning several units stays class-level; per-unit copies if that grates
-        dest = cls_dir / matched[0] / "Practice" if len(matched) == 1 else cls_dir / "Practice"
+        dest = cls_dir / matched[0] / PREP_DIR if len(matched) == 1 else cls_dir / PREP_DIR
         path = dest / fname
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
@@ -2282,8 +2399,8 @@ def write_exam_note(sem, cls, exam):
 
 def write_quiz_note(quiz, questions, results, score):
     """Files a graded practice quiz/test under
-    <vault>/<sem>/<cls>/<unit>/Practice/<kind> <date> <time> — <score>%.md
-    (class-level Practice when the quiz wasn't scoped to a unit). Mirrors
+    <vault>/<sem>/<cls>/<unit>/Exam Prep/<kind> <date> <time> — <score>%.md
+    (class-level Exam Prep when the quiz wasn't scoped to a unit). Mirrors
     write_exam_note's structure/graph anchor. Returns the path (str)."""
     s_sem, s_cls = _slug(quiz.get("semester")), _slug(quiz.get("class"))
     unit = (quiz.get("unit") or "").strip()
@@ -2318,7 +2435,10 @@ def write_quiz_note(quiz, questions, results, score):
     base = OBSIDIAN_VAULT / s_sem / s_cls
     if unit:
         base = base / _slug(unit)
-    path = base / "Practice" / f"{kind} {now:%Y-%m-%d %H%M} — {score}%.md"
+    path = base / PREP_DIR / f"{kind} {now:%Y-%m-%d %H%M} — {score}%.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return str(path)
+
+
+_migrate_prep_dirs()   # import-time, idempotent — see the function docstring

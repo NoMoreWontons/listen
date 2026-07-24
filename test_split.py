@@ -42,6 +42,30 @@ def test_parse_segments_fallback():
     print("ok: unparseable/empty JSON falls back to one Unsorted segment")
 
 
+def test_parse_segments_trailing_prose():
+    # valid JSON object followed by trailing prose the model appended after
+    # the closing brace -> parses the JSON, does NOT fall back to Unsorted,
+    # and LaTeX braces in the summary survive intact.
+    raw = ('{"segments":[{"class":"Physics","unit":"Work and Energy",'
+           '"topic":"Work, energy, and power","summary":"$\\\\frac{1}{2}mv^2$"}]}'
+           '\n\n---\n\n**Note on transcript quality:** garbled.')
+    segs = app._parse_segments(raw)
+    assert segs == [{"class": "Physics", "unit": "Work and Energy",
+                      "topic": "Work, energy, and power",
+                      "summary": "$\\frac{1}{2}mv^2$"}], segs
+    print("ok: trailing prose after valid JSON doesn't break segment parsing")
+
+
+def test_parse_exams_trailing_prose():
+    raw = ('{"segments":[{"class":"Physics","unit":"Work and Energy",'
+           '"topic":"Work, energy, and power","summary":"$\\\\frac{1}{2}mv^2$"}],'
+           '"exams":[{"title":"Midterm","due_date":"2026-08-01"}]}'
+           '\n\n---\n\n**Note on transcript quality:** garbled.')
+    exams = app._parse_exams(raw)
+    assert exams == [{"title": "Midterm", "due_date": "2026-08-01"}], exams
+    print("ok: trailing prose after valid JSON doesn't break exams parsing")
+
+
 def test_segments_summary_concat():
     segments = [
         {"topic": "Inverse fn derivatives", "summary": "- point a"},
@@ -56,4 +80,6 @@ if __name__ == "__main__":
     test_parse_segments_one()
     test_parse_segments_two()
     test_parse_segments_fallback()
+    test_parse_segments_trailing_prose()
+    test_parse_exams_trailing_prose()
     test_segments_summary_concat()

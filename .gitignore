@@ -5,3 +5,4 @@ __pycache__/
 graph_settings.json
 app_settings.json
 server.log
+.gstack/

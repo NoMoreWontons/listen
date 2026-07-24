@@ -10,8 +10,10 @@ try:
     assert row["title"] == "memo test", row
     assert row["source"] == "upload_audio", row
     assert app.audio_path(rid).read_bytes() == b"not real audio"
-    bad = c.post("/upload?kind=pdf&filename=x.pdf", content=b"x")
-    assert "error" in bad.json(), bad.json()
+    # unknown kind must be rejected *before* the insert — otherwise every test run
+    # leaks a permanent "[error: unsupported file type]" row into the real DB
+    bad = c.post("/upload?kind=nope&filename=x.pdf", content=b"x")
+    assert bad.json() == {"error": "unknown kind 'nope'"}, bad.json()
     print("ok: upload creates row + file, unknown kind rejected")
 finally:
     app.sb.table("recordings").delete().eq("id", rid).execute()

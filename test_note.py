@@ -325,8 +325,8 @@ def test_write_exam_note_links_matching_units():
             "topics": ["Cells", "Genetics"],
         }
         path = app.write_exam_note("Fall 26", "Biology", exam)
-        # exactly one topic ("Cells") matches an existing unit folder -> unit-level Practice
-        expected = pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / "Practice" / "Midterm 1.md"
+        # exactly one topic ("Cells") matches an existing unit folder -> unit-level Exam Prep
+        expected = pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / app.PREP_DIR / "Midterm 1.md"
         assert path == str(expected), path
         text = expected.read_text(encoding="utf-8")
         assert "class: Biology" in text and "kind: exam" in text and "tags: [exam]" in text, text

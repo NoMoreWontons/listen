@@ -135,7 +135,7 @@ def test_write_quiz_note():
         ]
         path = app.write_quiz_note(quiz, questions, results, 75)
         p = pathlib.Path(path)
-        assert p.parent == pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / "Practice", path
+        assert p.parent == pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / app.PREP_DIR, path
         assert p.name.startswith("quiz ") and p.name.endswith("— 75%.md"), path
         text = p.read_text(encoding="utf-8")
         assert "class: Biology" in text and "kind: quiz" in text, text

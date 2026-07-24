@@ -2,6 +2,8 @@
 Stubs app.sb with a tiny in-memory fake and app.claude with a canned reply —
 no real Supabase/network. Run: python test_study.py"""
 import os
+import pathlib
+import tempfile
 
 os.environ.setdefault("SUPABASE_URL", "http://localhost")
 os.environ.setdefault("SUPABASE_SERVICE_KEY", "x")
@@ -55,7 +57,9 @@ class FakeSB:
     def table(self, name):
         if name == "recordings":
             return FakeQuery(self.recordings)
-        return FakeQuery([], store=self.quizzes if name == "quizzes" else self.cards)
+        if name == "cards":  # selectable too — write_cards_note reads the deck back
+            return FakeQuery(self.cards, store=self.cards)
+        return FakeQuery([], store=self.quizzes)
 
 
 def mkrow(unit, topic, summary="notes here", cls="Biology", status="done"):
@@ -144,21 +148,96 @@ def test_quiz_mixed_units_null():
     print("ok: mixed-unit scopes -> unit null")
 
 
+def test_quiz_format_passthrough():
+    """The tree right-click menu sends format like the Practice builder does —
+    it has to reach generate_quiz's prompt, and anything else must fall to mcq."""
+    seen = {}
+
+    def spy(**kw):
+        seen["prompt"] = kw["messages"][0]["content"]
+        return fake_quiz_msg(**kw)
+
+    app.claude.messages.create = spy
+    for fmt, want in [("frq", "free-response"), ("mcq", "multiple-choice"),
+                      (None, "multiple-choice"), ("bogus", "multiple-choice")]:
+        app.sb = FakeSB([mkrow("Cells", "Mitosis")])
+        body = {"kind": "quiz", "class": "Biology", "scopes": [{"unit": "Cells"}]}
+        if fmt is not None:
+            body["format"] = fmt
+        app.study_generate(body)
+        assert want in seen["prompt"], (fmt, seen["prompt"][:200])
+    print("ok: format reaches the quiz prompt, bad/absent format -> mcq")
+
+
 def test_flashcards():
-    app.sb = FakeSB([mkrow("Cells", "Mitosis")])
-    app.claude.messages.create = fake_cards_msg
-    out = app.study_generate({"kind": "flashcards", "class": "Biology", "scopes": [{"unit": "Cells"}]})
-    assert out == {"count": 1}, out
-    assert app.sb.cards[0]["unit"] == "Cells"
-    print("ok: flashcards -> generate+insert path, count returned")
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        app.sb = FakeSB([mkrow("Cells", "Mitosis")])
+        app.claude.messages.create = fake_cards_msg
+        out = app.study_generate({"kind": "flashcards", "class": "Biology", "scopes": [{"unit": "Cells"}]})
+        assert out["count"] == 1, out
+        assert app.sb.cards[0]["unit"] == "Cells"
+        # deck snapshot lands in the unit's Exam Prep folder, alongside quizzes/exams
+        p = pathlib.Path(out["path"])
+        assert p == pathlib.Path(d) / "Untitled" / "Biology" / "Cells" / app.PREP_DIR / "Flashcards.md", p
+        assert "**f1** — b1" in p.read_text(encoding="utf-8")
+    print("ok: flashcards -> generate+insert, deck note filed under Exam Prep")
 
 
 def test_cheatsheet():
-    app.sb = FakeSB([mkrow("Cells", "Mitosis", summary="Mitosis is cell division.")])
-    out = app.study_generate({"kind": "cheatsheet", "class": "Biology", "scopes": [{"unit": "Cells"}]})
-    assert out["filename"] == "Biology Cells cheatsheet.md", out
-    assert "# Biology" in out["markdown"] and "Mitosis is cell division." in out["markdown"], out
-    print("ok: cheatsheet returns filename + markdown")
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        app.sb = FakeSB([mkrow("Cells", "Mitosis", summary="Mitosis is cell division.")])
+        out = app.study_generate({"kind": "cheatsheet", "class": "Biology", "scopes": [{"unit": "Cells"}]})
+        assert out["filename"] == "Biology Cells cheatsheet.md", out
+        assert "# Biology" in out["markdown"] and "Mitosis is cell division." in out["markdown"], out
+        p = pathlib.Path(out["path"])
+        assert p == (pathlib.Path(d) / "Untitled" / "Biology" / "Cells" / app.PREP_DIR
+                     / "Biology Cells cheatsheet.md"), p
+        assert p.read_text(encoding="utf-8") == out["markdown"]
+    print("ok: cheatsheet returns markdown and files a copy under Exam Prep")
+
+
+def test_semester_falls_back_to_rows():
+    """'All semesters' (the scope selectors' default) sends semester='' — the
+    notes must still file under the real semester, not a root 'Untitled'."""
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        rows = [dict(mkrow("Cells", "Mitosis", summary="Mitosis is cell division."),
+                     semester="Fall 26")]
+        app.sb = FakeSB(rows)
+        out = app.study_generate({"kind": "cheatsheet", "class": "Biology",
+                                  "scopes": [{"unit": "Cells"}]})
+        assert pathlib.Path(out["path"]).parent == (
+            pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / app.PREP_DIR), out["path"]
+
+        app.sb = FakeSB(rows)
+        app.claude.messages.create = fake_quiz_msg
+        q = app.study_generate({"kind": "quiz", "class": "Biology", "scopes": [{"unit": "Cells"}]})
+        assert q["semester"] == "Fall 26", q  # quiz row too — write_quiz_note reads it back
+    print("ok: blank semester resolves from the scope's rows")
+
+
+def test_migrate_prep_dirs():
+    """Old Practice folders get renamed; a pre-existing Exam Prep folder absorbs
+    them instead of leaving two side by side."""
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        plain = pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / "Practice"
+        plain.mkdir(parents=True)
+        (plain / "quiz.md").write_text("q", encoding="utf-8")
+        clash = pathlib.Path(d) / "Fall 26" / "Physics" / "Practice"
+        clash.mkdir(parents=True)
+        (clash / "Midterm 1.md").write_text("m", encoding="utf-8")
+        (clash.with_name(app.PREP_DIR)).mkdir()
+
+        app._migrate_prep_dirs()
+
+        assert not plain.exists() and not clash.exists()
+        assert (plain.with_name(app.PREP_DIR) / "quiz.md").read_text(encoding="utf-8") == "q"
+        assert (clash.with_name(app.PREP_DIR) / "Midterm 1.md").read_text(encoding="utf-8") == "m"
+        app._migrate_prep_dirs()  # idempotent
+    print("ok: Practice folders migrate to Exam Prep, merging into an existing one")
 
 
 if __name__ == "__main__":
@@ -167,6 +246,9 @@ if __name__ == "__main__":
     test_no_summaries_error()
     test_quiz_single_unit()
     test_quiz_mixed_units_null()
+    test_quiz_format_passthrough()
     test_flashcards()
     test_cheatsheet()
+    test_semester_falls_back_to_rows()
+    test_migrate_prep_dirs()
     print("test_study: OK")

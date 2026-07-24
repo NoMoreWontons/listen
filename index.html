@@ -6,152 +6,217 @@
 <title>listen</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700;12..96,800&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --stone:      #EDE9DE; /* page ground, warm cardboard */
-    --panel:      #2B2A28; /* transport console, brushed-graphite chassis */
-    --panel-edge: #444038; /* console bevel highlight */
+    /* ---- ground & chassis ---- */
+    --paper:      #EFEBE0; /* page ground, warm cardboard */
+    --paper-deep: #E4DECF; /* recessed wells, rack gaps */
+    --card:       #FBF9F3; /* module face */
+    --chassis:    #2B2A28; /* transport console, brushed graphite */
+    --chassis-hi: #444038; /* console bevel highlight */
+    --chassis-lo: #1E1C1A; /* scope well */
     --lcd:        #F3EEE2; /* cream readout window */
-    --ink:        #2B2A28;
-    --ink-soft:   #837c6c;
+
+    /* ---- ink ---- */
+    --ink:        #23221F;
+    --ink-soft:   #7B7466;
     --ink-on-panel: #C9C4B6;
+
+    /* ---- lamps ---- */
     --rec:        #D9432F; /* transport REC lamp */
     --live:       #3FA78C; /* signal LED, "hearing audio" */
     --amber:      #DE9A32; /* transcribing */
-    --card:       #FBF9F3;
-    --card-edge:  #E1DACB;
-    --radius-panel: 18px;
+    --amber-ink:  #3A2C00;
+
+    /* ---- engraved rules: one rail token, not six ad-hoc greys ---- */
+    --rail:       #D8D1BF;
+    --rail-soft:  #E7E1D2;
+    --rail-dark:  #C4BBA4;
+
+    --radius-panel: 16px;
     --radius-card: 10px;
-    --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
-    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --radius-ctl: 7px;
+
+    --font-display: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+    /* ---- type scale: 6 steps, no in-between guessing ---- */
+    --t-xs:   0.6875rem;
+    --t-sm:   0.8125rem;
+    --t-base: 0.9375rem;
+    --t-lg:   1.125rem;
+    --t-xl:   1.5rem;
+    --t-2xl:  2.25rem;
+
+    /* ---- spacing: 4px base ---- */
+    --s1: .25rem; --s2: .5rem; --s3: .75rem; --s4: 1rem;
+    --s5: 1.5rem; --s6: 2rem; --s7: 3rem;
   }
 
   * { box-sizing: border-box; }
 
   body {
-    font-family: system-ui, sans-serif;
-    background: var(--stone);
+    font-family: var(--font-body);
+    background: var(--paper);
     color: var(--ink);
-    max-width: 1200px;
+    max-width: 1240px;
     margin: 0 auto;
-    padding: 2.5rem 1.25rem 4rem;
-    line-height: 1.5;
+    padding: var(--s6) 1.25rem var(--s7);
+    font-size: var(--t-base);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* focus discipline: one visible ring everywhere, no per-widget exceptions */
+  :focus-visible {
+    outline: 2px solid var(--live);
+    outline-offset: 2px;
+    border-radius: 4px;
   }
 
   .main {
     display: grid;
     /* minmax(0,…) — plain fr lets long merge-panel/select text widen the column, jittering layout */
     grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
-    gap: 1.5rem;
+    gap: var(--s5);
     align-items: start;
-    margin-top: 2.25rem;
+    margin-top: var(--s5);
   }
-  @media (max-width: 800px) {
+  @media (max-width: 860px) {
     .main { grid-template-columns: 1fr; }
   }
 
-  .brand { margin-bottom: 1.75rem; }
+  /* ---- brand ---- */
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s3);
+    padding-bottom: var(--s3);
+    margin-bottom: var(--s5);
+    border-bottom: 1px solid var(--rail);
+  }
   .brand h1 {
     font-family: var(--font-display);
-    font-weight: 700;
-    font-size: 1.8rem;
-    letter-spacing: -0.02em;
+    font-weight: 800;
+    font-size: var(--t-2xl);
+    letter-spacing: -0.035em;
+    line-height: 1;
     margin: 0;
   }
   .tagline {
-    margin: .15rem 0 0;
-    font-size: .8rem;
+    margin: 0;
+    font-size: var(--t-xs);
+    font-family: var(--font-mono);
     color: var(--ink-soft);
     text-transform: uppercase;
-    letter-spacing: .08em;
+    letter-spacing: .1em;
   }
 
+  /* ---- engraved unit label: text, then a hairline rail to the panel edge ---- */
   .deck-label {
-    display: block;
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
     font-family: var(--font-display);
-    font-size: .68rem;
-    font-weight: 600;
-    letter-spacing: .12em;
+    font-size: var(--t-xs);
+    font-weight: 700;
+    letter-spacing: .14em;
     text-transform: uppercase;
-    color: var(--ink-on-panel);
-    opacity: .65;
-    margin-bottom: .5rem;
+    color: var(--ink-soft);
+    margin-bottom: var(--s3);
   }
+  .deck-label::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--rail);
+  }
+  .deck .deck-label { color: var(--ink-on-panel); opacity: .8; }
+  .deck .deck-label::after { background: var(--chassis-hi); }
 
   /* ---- transport console ---- */
   .deck {
-    background: var(--panel);
+    background:
+      linear-gradient(180deg, #322F2C 0%, var(--chassis) 62%, #262421 100%);
     border-radius: var(--radius-panel);
-    padding: 1.4rem 1.5rem 1.6rem;
+    padding: 1.25rem 1.4rem 1.4rem;
     box-shadow:
-      inset 0 1px 0 var(--panel-edge),
-      0 10px 24px -14px rgba(0,0,0,.55);
+      inset 0 1px 0 var(--chassis-hi),
+      inset 0 -1px 0 #171514,
+      0 12px 28px -16px rgba(0,0,0,.6);
   }
 
   .deck-row {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 1.5rem;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 10rem auto;
+    align-items: start;
+    gap: var(--s5);
+  }
+  @media (max-width: 860px) {
+    .deck-row { grid-template-columns: 1fr; gap: var(--s4); }
   }
 
-  .deck-group.signal { text-align: right; }
+  .deck-group.signal { min-width: 0; }
 
-  #controls { display: flex; align-items: center; gap: 1rem; }
+  #controls { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
 
   /* universal click/hover feedback for every button; specific rules below still win on color */
   button { transition: transform .1s ease, filter .15s ease; }
-  button:hover { filter: brightness(1.15); }
-  button:active { transform: translateY(1px) scale(.98); filter: brightness(.95); }
+  button:hover { filter: brightness(1.08); }
+  button:active { transform: translateY(1px) scale(.985); filter: brightness(.95); }
   @media (prefers-reduced-motion: reduce) { button:active { transform: none; } }
 
-  button#btn, button.upload-btn {
+  button#btn, button#pauseBtn, button.upload-btn {
     font-family: var(--font-display);
     font-weight: 600;
-    font-size: .95rem;
+    font-size: var(--t-sm);
     letter-spacing: .01em;
-    padding: .65rem 1.3rem;
+    padding: .6rem 1.15rem;
     border-radius: 999px;
-    border: 1px solid #55504a;
-    background: #38352f;
+    border: 1px solid #57524B;
+    background: linear-gradient(180deg, #3E3A34, #322F2A);
     color: var(--ink-on-panel);
     cursor: pointer;
-    box-shadow: 0 1px 0 rgba(255,255,255,.05) inset, 0 2px 4px rgba(0,0,0,.3);
+    box-shadow: 0 1px 0 rgba(255,255,255,.06) inset, 0 2px 5px rgba(0,0,0,.35);
     transition: transform .12s ease, background .2s ease, box-shadow .2s ease;
   }
-  button#btn:hover, button.upload-btn:hover { background: #423e37; }
+  button#btn { padding-left: 1.3rem; padding-right: 1.3rem; }
+  button#btn:hover, button#pauseBtn:hover, button.upload-btn:hover { background: linear-gradient(180deg, #4A453E, #3B3731); }
+  button#btn:active, button#pauseBtn:active, button.upload-btn:active { transform: translateY(1px); }
+  .deck-group.upload { display: flex; flex-wrap: wrap; gap: var(--s2); }
+  .deck-group.upload > .deck-label { flex: 1 1 100%; margin-bottom: var(--s1); }
+
   button.tx-pause {
-    font-size: .8rem;
-    padding: .15rem .6rem;
-    margin-left: .5rem;
+    font-family: var(--font-display);
+    font-size: var(--t-xs);
+    font-weight: 600;
+    padding: .15rem .65rem;
+    margin-left: var(--s2);
     border-radius: 999px;
-    border: 1px solid #55504a;
-    background: #38352f;
-    color: var(--ink-on-panel);
+    border: 1px solid var(--rail-dark);
+    background: var(--card);
+    color: var(--ink-soft);
     cursor: pointer;
   }
-  button.tx-pause.tx-paused { background: #6b5416; border-color: #9a7c22; }
-  button#btn:active, button.upload-btn:active { transform: translateY(1px); }
-  button#btn:focus-visible {
-    outline: 2px solid var(--live);
-    outline-offset: 2px;
-  }
+  button.tx-pause.tx-paused { background: #F7E8CF; border-color: #C69A3E; color: #7A5510; }
 
   select#micSelect {
     font-family: var(--font-mono);
-    font-size: .78rem;
-    background: #38352f;
+    font-size: var(--t-xs);
+    max-width: 11rem;
+    background: #38352F;
     color: var(--ink-on-panel);
-    border: 1px solid #55504a;
-    border-radius: 6px;
+    border: 1px solid #57524B;
+    border-radius: var(--radius-ctl);
     padding: .4rem .5rem;
   }
+
   button#btn.recording {
     background: var(--rec);
     color: #fff;
-    border-color: var(--rec);
+    border-color: #EE5B45;
     animation: pulse 1.6s ease-in-out infinite;
   }
   @keyframes pulse {
@@ -162,269 +227,372 @@
     button#btn.recording { animation: none; }
   }
 
-  /* timer as a recessed LCD counter window */
+  /* tape counter — recessed LCD window, always legible, tabular digits */
   .timer {
     display: none;
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
-    font-size: 1.05rem;
+    font-weight: 500;
+    font-size: var(--t-base);
     background: var(--lcd);
     color: var(--ink);
-    padding: .45rem .7rem;
-    border-radius: 6px;
-    box-shadow: inset 0 1px 3px rgba(0,0,0,.35);
-    letter-spacing: .03em;
+    padding: .4rem .7rem;
+    border-radius: var(--radius-ctl);
+    box-shadow: inset 0 2px 4px rgba(0,0,0,.4), 0 1px 0 rgba(255,255,255,.06);
+    letter-spacing: .04em;
   }
   .timer.on { display: inline-block; }
 
   .mic {
     display: none;
-    font-size: .82rem;
+    font-size: var(--t-xs);
     font-family: var(--font-mono);
     color: var(--ink-on-panel);
+    word-break: break-word;
   }
   .mic.on { display: inline; }
 
-  /* oscilloscope panel */
+  /* oscilloscope well — visible at rest so the deck is never dead air */
+  /* slim well at rest, full scope while the meters run */
   #wave {
-    display: none;
+    display: block;
     width: 100%;
-    height: 84px;
-    margin-top: 1.25rem;
+    height: 26px;
+    margin-top: var(--s4);
+    transition: height .25s ease;
     border-radius: 8px;
     background:
-      linear-gradient(var(--panel-edge) 1px, transparent 1px) 0 50% / 100% 21px,
-      #221f1c;
-    box-shadow: inset 0 1px 4px rgba(0,0,0,.5);
+      linear-gradient(var(--chassis-hi) 1px, transparent 1px) 0 50% / 100% 18px,
+      linear-gradient(90deg, rgba(68,64,56,.55) 1px, transparent 1px) 0 0 / 40px 100%,
+      var(--chassis-lo);
+    box-shadow: inset 0 2px 6px rgba(0,0,0,.55), inset 0 0 0 1px rgba(0,0,0,.5);
   }
-  #wave.on { display: block; }
+  #wave.on { height: 84px; }
+  @media (prefers-reduced-motion: reduce) { #wave { transition: none; } }
+  .rack-foot { margin: var(--s3) 0 0; font-size: var(--t-sm); color: var(--ink-soft); }
 
-  /* ---- sessions ---- */
-  .sessions > .deck-label, .folders > .deck-label { color: var(--ink-soft); opacity: 1; margin-bottom: .75rem; }
+  /* ---- sessions column ---- */
+  .sessions > .deck-label { margin-bottom: var(--s3); }
 
-  a.obs { color: inherit; text-decoration: underline dotted; }
+  a.obs { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
   a.obs:hover { text-decoration: underline; }
 
-  /* ---- merge panel (units/topics) ---- */
-  .side { display: grid; gap: 1.5rem; align-content: start; }
-  .merge-level { display: flex; gap: .35rem; margin: 0 0 .6rem; }
-  .merge-level button {
-    font-family: var(--font-display); font-weight: 600; font-size: .72rem;
-    padding: .3rem .75rem; border: 1px solid var(--card-edge); border-radius: 999px;
-    background: #fffdf8; color: var(--ink-soft); cursor: pointer;
+  /* ---- rack: the side column is one chassis, not five floating cards ---- */
+  .side {
+    display: grid;
+    gap: 1px;                      /* the gap IS the rail between rack units */
+    align-content: start;
+    background: var(--rail);
+    border: 1px solid var(--rail-dark);
+    border-radius: var(--radius-card);
+    overflow: hidden;
   }
-  .merge-level button:hover { background: #f1ecdf; }
-  .merge-level button.on { background: #f1ecdf; color: var(--ink); border-color: #c9c0aa; }
+  .folders {
+    background: var(--card);
+    border: 0;
+    border-radius: 0;
+    padding: var(--s4) 1.1rem 1.1rem;
+  }
+  .side > .folders:first-child { padding-top: 1.1rem; }
 
-  /* generic pill toggle (same look as .merge-level button, used outside that panel) */
-  .pill-btn {
-    font-family: var(--font-display); font-weight: 600; font-size: .72rem;
-    padding: .3rem .75rem; border: 1px solid var(--card-edge); border-radius: 999px;
-    background: #fffdf8; color: var(--ink-soft); cursor: pointer;
+  /* ---- merge panel (units/topics) ---- */
+  .merge-level { display: flex; gap: var(--s1); margin: 0 0 var(--s2); flex-wrap: wrap; }
+
+  /* one pill recipe, shared by every small toggle/action button in the rack */
+  .merge-level button,
+  .pill-btn,
+  .merge-sugg button,
+  .merge-manual button,
+  #weakSpots button,
+  #graphCard button {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: var(--t-xs);
+    letter-spacing: .01em;
+    padding: .32rem .8rem;
+    border: 1px solid var(--rail-dark);
+    border-radius: 999px;
+    background: var(--card);
+    color: var(--ink);
+    cursor: pointer;
+    white-space: nowrap;
   }
-  .pill-btn:hover { background: #f1ecdf; }
-  .pill-btn.on { background: #f1ecdf; color: var(--ink); border-color: #c9c0aa; }
-  .merge-hint { margin: 0 0 .25rem; font-size: .78rem; color: var(--ink-soft); }
+  .merge-level button, .pill-btn { color: var(--ink-soft); }
+  .merge-level button:hover,
+  .pill-btn:hover,
+  .merge-sugg button:hover,
+  .merge-manual button:hover,
+  #weakSpots button:hover,
+  #graphCard button:hover { background: var(--paper-deep); }
+  .merge-level button.on, .pill-btn.on {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: var(--lcd);
+  }
+  /* the deck's own pill sits on graphite, so it inverts */
+  .deck .pill-btn {
+    background: #38352F;
+    border-color: #57524B;
+    color: var(--ink-on-panel);
+  }
+  .deck .pill-btn:hover { background: #45403A; }
+  .deck .pill-btn.on { background: var(--live); border-color: var(--live); color: #10221D; }
+
+  .merge-hint { margin: 0 0 var(--s1); font-size: var(--t-sm); color: var(--ink-soft); }
   .merge-sugg {
     display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
-    gap: .3rem .6rem; padding: .5rem 0; border-bottom: 1px solid #efe9db; font-size: .85rem;
+    gap: var(--s1) var(--s3); padding: var(--s2) 0;
+    border-bottom: 1px solid var(--rail-soft); font-size: var(--t-sm);
   }
   .merge-sugg em { font-style: normal; font-weight: 600; }
   .merge-cls {
-    font-family: var(--font-mono); font-size: .68rem;
+    font-family: var(--font-mono); font-size: var(--t-xs);
     color: var(--ink-soft); margin-left: .45rem;
   }
-  .merge-actions { display: flex; gap: .35rem; }
-  .merge-sugg button, .merge-manual button, #weakSpots button {
-    font-family: var(--font-display); font-weight: 600; font-size: .72rem;
-    padding: .3rem .75rem; border: 1px solid var(--card-edge); border-radius: 999px;
-    background: #fffdf8; color: var(--ink); cursor: pointer; white-space: nowrap;
+  .merge-actions { display: flex; gap: var(--s1); }
+  #weakSpots .gs-note { margin: 0 0 var(--s2); display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+
+  /* control cluster shared by Practice / Ask / Review / manual merge */
+  .merge-manual {
+    display: flex; flex-wrap: wrap; align-items: center;
+    gap: var(--s2); margin-top: var(--s2); font-size: var(--t-sm);
   }
-  .merge-sugg button:hover, .merge-manual button:hover, #weakSpots button:hover { background: #f1ecdf; }
-  #weakSpots .gs-note { margin: 0 0 .6rem; display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
-  .merge-manual { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .8rem; font-size: .8rem; }
   .merge-into { color: var(--ink-soft); }
-  .merge-manual select, .merge-manual input[type="text"] {
-    flex: 1; min-width: 8rem; max-width: 13rem; font-size: .8rem; padding: .3rem .4rem;
-    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
+  .merge-manual select,
+  .merge-manual input[type="text"] {
+    flex: 1; min-width: 8rem; max-width: 13rem;
+    font-family: inherit; font-size: var(--t-sm);
+    padding: .35rem .45rem;
+    border: 1px solid var(--rail-dark); border-radius: var(--radius-ctl);
+    background: var(--paper); color: var(--ink);
   }
+  .merge-manual select:hover, .merge-manual input[type="text"]:hover { border-color: var(--ink-soft); }
 
   /* ---- practice quizzes ---- */
-  .pq-row { display: flex; justify-content: space-between; gap: .5rem; padding: .4rem 0;
-    border-bottom: 1px solid #efe9db; font-size: .82rem; cursor: pointer; }
-  .pq-row:hover { background: #f1ecdf; }
-  .pq-score { font-family: var(--font-mono); font-size: .72rem; color: var(--ink-soft); }
-  .quiz { background: var(--card); border: 1px solid var(--card-edge);
-    border-radius: var(--radius-card); padding: 1rem 1.15rem; margin: 0 0 .85rem; }
-  .quiz .q { margin: .8rem 0; }
-  .quiz .q p { margin: 0 0 .35rem; font-weight: 600; }
-  .quiz label { display: block; font-size: .88rem; padding: .15rem 0; cursor: pointer; }
-  .quiz textarea { width: 100%; padding: .35rem .5rem; font-size: .82rem; font-family: inherit;
-    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; resize: vertical; }
-  .quiz .verdict { font-size: .8rem; margin: .25rem 0 0; }
-  .quiz .verdict.good { color: #226e5b; }
-  .quiz .verdict.bad { color: #8f2323; }
-  .quiz .quiz-head { display: flex; justify-content: space-between; align-items: baseline; }
-  .quiz .quiz-head button { border: none; background: none; cursor: pointer; color: var(--ink-soft); }
-  .quiz button.submit { padding: .35rem .8rem; font-size: .78rem; border: 0; border-radius: 6px;
-    cursor: pointer; background: var(--amber); color: #3a2c00; font-weight: 600; }
+  .pq-row {
+    display: flex; justify-content: space-between; gap: var(--s2);
+    padding: .4rem .35rem; margin: 0 -.35rem;
+    border-bottom: 1px solid var(--rail-soft);
+    font-size: var(--t-sm); cursor: pointer; border-radius: 5px;
+  }
+  .pq-row:hover { background: var(--paper-deep); }
+  .pq-score {
+    font-family: var(--font-mono); font-size: var(--t-xs);
+    font-variant-numeric: tabular-nums; color: var(--ink-soft);
+  }
+  .quiz {
+    background: var(--card); border: 1px solid var(--rail);
+    border-radius: var(--radius-card); padding: 1.1rem 1.2rem; margin: 0 0 var(--s3);
+  }
+  .quiz .q { margin: var(--s3) 0; }
+  .quiz .q p { margin: 0 0 var(--s1); font-weight: 600; }
+  .quiz label { display: block; font-size: var(--t-sm); padding: .18rem 0; cursor: pointer; }
+  .quiz textarea {
+    width: 100%; padding: .4rem .55rem; font-size: var(--t-sm); font-family: inherit;
+    border: 1px solid var(--rail-dark); border-radius: var(--radius-ctl);
+    background: var(--paper); resize: vertical;
+  }
+  .quiz .verdict { font-size: var(--t-sm); margin: var(--s1) 0 0; }
+  .quiz .verdict.good { color: #1F6A57; }
+  .quiz .verdict.bad { color: #8F2323; }
+  .quiz .quiz-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s2); }
+  .quiz .quiz-head button { border: none; background: none; cursor: pointer; color: var(--ink-soft); font-size: var(--t-sm); }
+
+  /* primary action — the one amber control per surface */
+  .quiz button.submit,
+  .split-actions button,
+  .labels button {
+    font-family: var(--font-display); font-weight: 600; font-size: var(--t-sm);
+    padding: .38rem .9rem; border: 0; border-radius: var(--radius-ctl);
+    cursor: pointer; background: var(--amber); color: var(--amber-ink);
+  }
+  /* one amber call-to-action per surface; everything alongside it stays quiet */
+  .split-actions button:last-child,
+  .labels button.ocr-btn { background: var(--paper-deep); color: var(--ink); }
+  .split-actions button:disabled { opacity: .55; cursor: default; }
 
   /* ---- graph color settings ---- */
-  #graphCard summary::before { content: "🎨 "; }
-  #graphCard summary { cursor: pointer; }
-  #graphCard .deck-label { display: inline; margin: 0; color: var(--ink-soft); opacity: 1; }
+  #graphCard summary { cursor: pointer; list-style: none; }
+  #graphCard summary::-webkit-details-marker { display: none; }
+  #graphCard .deck-label { margin: 0; }
+  #graphCard details[open] .deck-label { margin-bottom: var(--s3); }
   #gsLevel {
-    margin: .7rem 0 .3rem; font-size: .8rem; padding: .3rem .4rem;
-    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
+    margin: var(--s3) 0 var(--s1); font-size: var(--t-sm); padding: .35rem .45rem;
+    border: 1px solid var(--rail-dark); border-radius: var(--radius-ctl);
+    background: var(--paper); color: var(--ink); font-family: inherit;
   }
-  .gs-row { display: flex; align-items: center; gap: .6rem; margin: .3rem 0; font-size: .8rem; }
-  .gs-row label { flex: 0 0 9.5rem; }
-  .gs-row input[type="range"] { flex: 1; min-width: 0; accent-color: #837c6c; }
+  .gs-row { display: flex; align-items: center; gap: var(--s3); margin: var(--s1) 0; font-size: var(--t-sm); }
+  .gs-row label { flex: 0 0 9.5rem; color: var(--ink-soft); }
+  .gs-row input[type="range"] { flex: 1; min-width: 0; accent-color: var(--ink-soft); }
   .gs-val {
     flex: 0 0 3.2rem; text-align: right;
-    font-family: var(--font-mono); font-size: .72rem; color: var(--ink-soft);
+    font-family: var(--font-mono); font-size: var(--t-xs);
+    font-variant-numeric: tabular-nums; color: var(--ink-soft);
   }
-  .gs-note { margin: 0 0 .6rem; font-size: .72rem; color: var(--ink-soft); }
-  #graphCard button {
-    font-family: var(--font-display); font-weight: 600; font-size: .72rem;
-    padding: .3rem .75rem; border: 1px solid var(--card-edge); border-radius: 999px;
-    background: #fffdf8; color: var(--ink); cursor: pointer;
-  }
-  #graphCard button:hover { background: #f1ecdf; }
+  .gs-note { margin: 0 0 var(--s2); font-size: var(--t-xs); color: var(--ink-soft); line-height: 1.45; }
 
   /* ---- folder tree ---- */
-  .folders {
-    background: var(--card);
-    border: 1px solid var(--card-edge);
-    border-radius: var(--radius-card);
-    padding: 1rem 1.15rem;
-  }
-  .folders details { margin: .15rem 0; }
-  .folders details details { margin-left: 1.1rem; }
+  .folders details { margin: .1rem 0; }
+  .folders details details { margin-left: 1rem; padding-left: .55rem; border-left: 1px solid var(--rail-soft); }
   .folders summary {
     cursor: pointer;
     font-family: var(--font-display);
     font-weight: 600;
-    font-size: .92rem;
-    padding: .25rem .35rem;
-    border-radius: 6px;
+    font-size: var(--t-sm);
+    padding: .28rem .35rem;
+    border-radius: 5px;
     margin: 0;
+    list-style: none;
   }
-  .folders summary:hover { background: #f1ecdf; }
-  .folders summary::before { content: "📁 "; }
-  .folders details[open] > summary::before { content: "📂 "; }
+  .folders summary::-webkit-details-marker { display: none; }
+  .folders summary:hover { background: var(--paper-deep); }
+
+  /* engraved caret instead of an OS-dependent emoji folder */
+  #tree summary::before,
+  #merge summary::before {
+    content: "";
+    display: inline-block;
+    width: 0; height: 0;
+    margin-right: .5rem;
+    vertical-align: 1px;
+    border-left: 5px solid var(--ink-soft);
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    transition: transform .15s ease;
+  }
+  #tree details[open] > summary::before,
+  #merge details[open] > summary::before { transform: rotate(90deg); }
+  @media (prefers-reduced-motion: reduce) {
+    #tree summary::before, #merge summary::before { transition: none; }
+  }
+
   .folders .topic {
-    margin-left: 2.1rem;
-    padding: .2rem .35rem;
-    font-size: .85rem;
+    margin-left: 1.5rem;
+    padding: .22rem .35rem;
+    font-size: var(--t-sm);
+    border-radius: 5px;
   }
-  .folders .topic::before { content: "📄 "; }
+  .folders .topic:hover { background: var(--paper-deep); }
+  .folders .topic::before {
+    content: "";
+    display: inline-block;
+    width: 3px; height: 3px;
+    margin: 0 .55rem 0 .15rem;
+    vertical-align: 3px;
+    border-radius: 50%;
+    background: var(--ink-soft);
+  }
   .folders .topic .when {
     font-family: var(--font-mono);
-    font-size: .68rem;
+    font-size: var(--t-xs);
+    font-variant-numeric: tabular-nums;
     color: var(--ink-soft);
     margin-left: .4rem;
   }
-  .topic .pick { margin-right: .35rem; opacity: .35; }
+  .topic .pick { margin-right: .35rem; opacity: .35; accent-color: var(--ink); }
   .topic:hover .pick, .pick:checked { opacity: 1; }
   .tree-del {
     float: right; border: none; background: none; cursor: pointer;
-    color: var(--ink-soft); font-size: .78rem; padding: 0 .3rem; opacity: 0;
+    color: var(--ink-soft); font-size: var(--t-sm); padding: 0 .3rem; opacity: 0;
   }
   .folders summary:hover .tree-del, .folders .topic:hover .tree-del { opacity: 1; }
-  .tree-del:hover { color: #a8331f; }
+  .tree-del:hover { color: #A8331F; }
+  .tree-del:focus-visible { opacity: 1; }
   .folders summary.drag-over, .folders .topic.drag-over {
-    background: #f7e8cf; outline: 2px dashed #93670f; outline-offset: -2px;
+    background: #F7E8CF; outline: 2px dashed #93670F; outline-offset: -2px;
   }
   .folders summary.sel, .folders .topic.sel {
-    background: #f1ecdf; outline: 1px solid #93670f; outline-offset: -1px;
+    background: var(--paper-deep); outline: 1px solid var(--ink-soft); outline-offset: -1px;
   }
   .tree-menu {
     position: fixed;
     z-index: 1000;
-    min-width: 140px;
+    min-width: 150px;
     background: var(--card);
-    border: 1px solid var(--card-edge);
+    border: 1px solid var(--rail-dark);
     border-radius: 8px;
-    box-shadow: 0 4px 16px rgba(0,0,0,.18);
-    padding: .3rem 0;
-    font-size: .85rem;
+    box-shadow: 0 6px 20px rgba(0,0,0,.18);
+    padding: var(--s1) 0;
+    font-size: var(--t-sm);
   }
   .tree-menu-item {
     padding: .35rem .9rem;
     cursor: pointer;
     color: var(--ink);
   }
-  .tree-menu-item:hover { background: #f1ecdf; }
+  .tree-menu-item:hover { background: var(--paper-deep); }
+
   #tree:empty::before {
-    content: "Nothing filed yet — finished recordings appear here by semester / class / unit.";
+    content: "Nothing filed yet — finished recordings appear here by semester, class, then unit.";
     display: block;
-    font-size: .88rem;
+    font-size: var(--t-sm);
     color: var(--ink-soft);
-    padding: .5rem 0;
+    padding: var(--s2) 0;
   }
 
   #list:empty::before {
-    content: "No sessions yet — press record to start your first one.";
+    content: "No sessions yet. Press Record to start one.";
     display: block;
-    font-size: .88rem;
+    font-size: var(--t-sm);
     color: var(--ink-soft);
-    border: 1px dashed var(--card-edge);
+    border: 1px dashed var(--rail-dark);
     border-radius: var(--radius-card);
-    padding: 1.5rem;
+    padding: 1.75rem;
     text-align: center;
   }
 
+  /* ---- session strips: tape log entries ---- */
   .rec {
     background: var(--card);
-    border: 1px solid var(--card-edge);
+    border: 1px solid var(--rail);
+    border-left: 3px solid var(--rail-dark);
     border-radius: var(--radius-card);
-    padding: 1rem 1.15rem;
-    margin: 0 0 .85rem;
+    padding: .95rem 1.1rem;
+    margin: 0 0 var(--s3);
   }
   .rec b {
     font-family: var(--font-display);
     font-weight: 600;
-    font-size: 1rem;
+    font-size: var(--t-base);
+    letter-spacing: -.01em;
   }
+  .rec:has(.status[data-s="recording"])    { border-left-color: var(--rec); }
+  .rec:has(.status[data-s="transcribing"]) { border-left-color: var(--amber); }
+  .rec:has(.status[data-s="done"])         { border-left-color: var(--live); }
+  .rec:has(.status[data-s="error"])        { border-left-color: #8F2323; }
+
   .status {
     font-family: var(--font-mono);
-    font-size: .68rem;
+    font-size: var(--t-xs);
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: .06em;
-    padding: .15rem .5rem;
+    letter-spacing: .07em;
+    padding: .12rem .5rem;
     border-radius: 999px;
-    margin-left: .5rem;
+    margin-left: var(--s2);
     vertical-align: 1px;
-    background: #e9e4d6;
+    background: var(--paper-deep);
     color: var(--ink-soft);
+    white-space: nowrap;
   }
   .rec .del {
     float: right; border: none; background: none; cursor: pointer;
-    color: var(--ink-soft); font-size: .85rem; padding: .1rem .3rem;
+    color: var(--ink-soft); font-size: var(--t-sm); padding: .1rem .3rem;
   }
-  .rec .del:hover { color: #a8331f; }
-  .status[data-s="recording"]     { background: #fbe4e0; color: #a8331f; }
-  .status[data-s="transcribing"]  { background: #f7e8cf; color: #93670f; }
-  .status[data-s="done"]          { background: #dcf0ea; color: #226e5b; }
-  .status[data-s="error"]         { background: #f4d9d9; color: #8f2323; }
-  .status[data-s="split_pending"] { background: #f7e0b8; color: #8a5a10; }
+  .rec .del:hover { color: #A8331F; }
+  .status[data-s="recording"]     { background: #FBE4E0; color: #A8331F; }
+  .status[data-s="transcribing"]  { background: #F7E8CF; color: #93670F; }
+  .status[data-s="done"]          { background: #DCF0EA; color: #1F6A57; }
+  .status[data-s="error"]         { background: #F4D9D9; color: #8F2323; }
+  .status[data-s="split_pending"] { background: #F7E0B8; color: #8A5A10; }
 
-  .split-seg { padding: .5rem 0; border-bottom: 1px solid #efe9db; font-size: .85rem; }
+  .split-seg { padding: var(--s2) 0; border-bottom: 1px solid var(--rail-soft); font-size: var(--t-sm); }
   .split-seg:last-of-type { border-bottom: none; }
-  .split-seg p { margin: .2rem 0 0; color: var(--ink-soft); font-size: .8rem; }
-  .split-actions { display: flex; gap: .5rem; margin-top: .7rem; }
-  .split-actions button {
-    font-family: var(--font-display); font-weight: 600; font-size: .78rem;
-    padding: .35rem .8rem; border: 0; border-radius: 6px; cursor: pointer;
-    background: var(--amber); color: #3a2c00;
-  }
-  .split-actions button:last-child { background: #e9e4d6; color: var(--ink); }
-  .split-actions button:disabled { opacity: .6; cursor: default; }
+  .split-seg p { margin: .2rem 0 0; color: var(--ink-soft); font-size: var(--t-sm); }
+  .split-actions { display: flex; gap: var(--s2); margin-top: var(--s3); }
 
-  .progress { margin-top: .65rem; }
-  .bar { height: 6px; border-radius: 999px; background: #e9e4d6; overflow: hidden; }
+  .progress { margin-top: var(--s3); }
+  .bar { height: 5px; border-radius: 999px; background: var(--paper-deep); overflow: hidden; }
   .bar-fill { height: 100%; background: var(--amber); transition: width .4s ease; }
   .bar-fill.indeterminate { width: 35%; animation: indeterminate 1.3s ease-in-out infinite; }
   @keyframes indeterminate {
@@ -432,52 +600,60 @@
     100% { margin-left: 100%; }
   }
   .progress-label {
-    display: block; margin-top: .3rem; font-family: var(--font-mono); font-size: .7rem;
-    color: var(--ink-soft); text-transform: uppercase; letter-spacing: .04em;
+    display: block; margin-top: var(--s1);
+    font-family: var(--font-mono); font-size: var(--t-xs);
+    color: var(--ink-soft); text-transform: uppercase; letter-spacing: .05em;
   }
   .error-msg {
-    font-family: var(--font-mono); font-size: .82rem; color: #8f2323; background: #f4d9d9;
-    border-radius: 6px; padding: .5rem .7rem; margin: .6rem 0 0; white-space: pre-wrap;
+    font-family: var(--font-mono); font-size: var(--t-sm); color: #8F2323; background: #F4D9D9;
+    border-radius: var(--radius-ctl); padding: .55rem .7rem; margin: var(--s2) 0 0; white-space: pre-wrap;
   }
-  .tokens { font-family: var(--font-mono); font-size: .7rem; color: var(--ink-soft); margin: .5rem 0 0; }
+  .tokens {
+    font-family: var(--font-mono); font-size: var(--t-xs);
+    font-variant-numeric: tabular-nums; color: var(--ink-soft); margin: var(--s2) 0 0;
+  }
   .live-tx {
-    max-height: 6rem; overflow-y: auto; margin: .6rem 0 0; padding: .5rem .7rem;
-    font-family: var(--font-mono); font-size: .78rem; color: var(--ink-soft);
-    background: #fffdf8; border: 1px solid var(--card-edge); border-radius: 6px;
+    max-height: 6rem; overflow-y: auto; margin: var(--s2) 0 0; padding: .5rem .7rem;
+    font-family: var(--font-mono); font-size: var(--t-sm); line-height: 1.5; color: var(--ink-soft);
+    background: var(--paper); border: 1px solid var(--rail); border-radius: var(--radius-ctl);
     white-space: pre-wrap;
   }
-  .seg { cursor: pointer }
-  .seg:hover { background: #f1ecdf }
-  audio { width: 100%; margin-top: .4rem }
-  .src { font-family: var(--font-mono); font-size: .62rem; text-transform: uppercase; letter-spacing: .05em;
-    background: #e6def5; color: #5b3f8f; border-radius: 999px; padding: .12rem .5rem; }
+  .seg { cursor: pointer; border-radius: 5px; padding: 0 .25rem; margin: 0 -.25rem; }
+  .seg:hover { background: var(--paper-deep); }
+  audio { width: 100%; margin-top: var(--s1); }
+  .src {
+    font-family: var(--font-mono); font-size: var(--t-xs); text-transform: uppercase; letter-spacing: .06em;
+    background: #E6DEF5; color: #5B3F8F; border-radius: 999px; padding: .1rem .5rem;
+  }
 
-  .labels { display: flex; flex-wrap: wrap; gap: .4rem; margin: .7rem 0 .2rem; }
+  .labels { display: flex; flex-wrap: wrap; gap: var(--s2); margin: var(--s3) 0 var(--s1); }
   .labels input {
-    flex: 1 1 8rem; min-width: 6rem; padding: .35rem .5rem; font-size: .82rem;
-    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
+    flex: 1 1 8rem; min-width: 6rem; padding: .38rem .5rem; font-size: var(--t-sm); font-family: inherit;
+    border: 1px solid var(--rail-dark); border-radius: var(--radius-ctl); background: var(--paper); color: var(--ink);
   }
   .labels textarea {
-    flex: 1 1 100%; padding: .35rem .5rem; font-size: .82rem; font-family: inherit;
-    border: 1px solid #d8d2c2; border-radius: 6px; background: #fffdf8; color: var(--ink);
+    flex: 1 1 100%; padding: .38rem .5rem; font-size: var(--t-sm); font-family: inherit;
+    border: 1px solid var(--rail-dark); border-radius: var(--radius-ctl); background: var(--paper); color: var(--ink);
     resize: vertical;
   }
-  .labels button {
-    padding: .35rem .8rem; font-size: .78rem; border: 0; border-radius: 6px; cursor: pointer;
-    background: var(--amber); color: #3a2c00; font-weight: 600;
-  }
-  .lbl-hint { flex: 1 1 100%; font-size: .68rem; color: var(--ink-soft); font-style: italic; }
+  .lbl-hint { flex: 1 1 100%; font-size: var(--t-xs); color: var(--ink-soft); }
 
-  h4 { font-family: var(--font-display); font-size: .8rem; margin: .8rem 0 .3rem; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .06em; }
-  pre { white-space: pre-wrap; word-wrap: break-word; font-size: .88rem; margin: 0; }
-  .md { font-size: .88rem; }
-  .md h2, .md h3 { margin: .6rem 0 .25rem; font-size: 1rem; }
-  .md h3 { font-size: .92rem; }
-  .md ul, .md ol { margin: .2rem 0 .4rem; padding-left: 1.3rem; }
-  .md p { margin: .3rem 0; }
+  h4 {
+    font-family: var(--font-display); font-size: var(--t-xs); font-weight: 700;
+    margin: var(--s3) 0 var(--s1); color: var(--ink-soft);
+    text-transform: uppercase; letter-spacing: .1em;
+  }
+  pre { white-space: pre-wrap; word-wrap: break-word; font-size: var(--t-sm); margin: 0; }
+  .md { font-size: var(--t-sm); line-height: 1.6; }
+  .md h2, .md h3 {
+    font-family: var(--font-display); font-weight: 700;
+    margin: var(--s3) 0 var(--s1); font-size: var(--t-base); letter-spacing: -.01em;
+  }
+  .md h3 { font-size: var(--t-sm); }
+  .md ul, .md ol { margin: var(--s1) 0 var(--s2); padding-left: 1.3rem; }
+  .md p { margin: var(--s1) 0; }
   .md .katex-display { overflow-x: auto; }
-  details summary { cursor: pointer; font-size: .82rem; color: var(--ink-soft); margin-top: .6rem; }
-  details summary:focus-visible { outline: 2px solid var(--live); outline-offset: 2px; }
+  details summary { cursor: pointer; font-size: var(--t-sm); color: var(--ink-soft); margin-top: var(--s2); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.css">
@@ -485,24 +661,28 @@
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/contrib/auto-render.min.js"></script>
 </head>
 <body>
-<div class="brand">
+<header class="brand">
   <h1>listen</h1>
   <p class="tagline">lecture &amp; meeting transcriber</p>
-</div>
+</header>
 
 <section class="deck" aria-label="Recording console">
   <div class="deck-row">
     <div class="deck-group">
       <span class="deck-label">Transport</span>
       <div id="controls">
-        <button id="btn">● Record</button>
+        <button id="btn">&#9679; Record</button>
         <button id="pauseBtn" hidden>&#10074;&#10074; Pause</button>
         <span id="timer" class="timer">0:00</span>
         <select id="micSelect" title="Microphone"></select>
         <button id="liveTx" class="pill-btn" title="Show rolling transcript while recording — uses noticeably more battery (extra Whisper decodes)">Live transcript</button>
       </div>
     </div>
-    <div class="deck-group">
+    <div class="deck-group signal">
+      <span class="deck-label">Signal</span>
+      <span id="mic" class="mic"></span>
+    </div>
+    <div class="deck-group upload">
       <span class="deck-label">Upload</span>
       <button id="uploadBtn" class="upload-btn" title="Upload audio, PDF, PowerPoint, or Word (or drop it anywhere on the page)">&#8686; Audio / Docs</button>
       <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg,.pdf,.pptx,.docx" hidden>
@@ -510,12 +690,8 @@
       <input type="file" id="hwInput" accept=".pdf,image/*" hidden>
       <button id="ytBtn" class="upload-btn" title="Add a YouTube video — save the link as a reference note, or transcribe it like a lecture">&#9654; YouTube</button>
     </div>
-    <div class="deck-group signal">
-      <span class="deck-label">Signal</span>
-      <span id="mic" class="mic"></span>
-    </div>
   </div>
-  <canvas id="wave"></canvas>
+  <canvas id="wave" aria-hidden="true"></canvas>
 </section>
 
 <div class="main">
@@ -532,6 +708,45 @@
       <div id="tree"></div>
     </section>
     <section class="folders" id="merge" hidden></section>
+    <section class="folders" id="practice">
+      <span class="deck-label">Practice</span>
+      <div class="merge-manual">
+        <select id="pSem" onchange="pScope()" title="Filter by semester"></select>
+        <select id="pClass" onchange="pScope()"></select>
+        <select id="pUnit"></select>
+        <select id="pKind">
+          <option value="quiz">Quiz — 10 q</option>
+          <option value="test">Test — 20 q</option>
+        </select>
+        <select id="pFormat">
+          <option value="mcq">MCQ</option>
+          <option value="frq">FRQ — write on paper</option>
+        </select>
+        <button onclick="genQuiz(this)">Generate</button>
+      </div>
+      <div id="weakSpots"></div>
+      <div id="pastQuizzes"></div>
+    </section>
+    <section class="folders" id="review">
+      <span class="deck-label">Review</span>
+      <div class="merge-manual">
+        <select id="rSem" onchange="rScope()" title="Filter by semester"></select>
+        <select id="rClass" onchange="rScope()"></select>
+        <select id="rUnit"></select>
+        <button onclick="genCards(this)">Make cards</button>
+        <button onclick="dlCheat()">Cheat sheet</button>
+      </div>
+      <div id="dueCount"></div>
+      <p class="rack-foot"><a class="obs" href="/cards_due.ics">Flashcard due dates (.ics)</a></p>
+    </section>
+    <section class="folders" id="ask">
+      <span class="deck-label">Ask my notes</span>
+      <div class="merge-manual">
+        <input type="text" id="askQ" placeholder="Ask a question about your notes…">
+        <button onclick="askNotes(this)">Ask</button>
+      </div>
+      <div id="askAnswer"></div>
+    </section>
     <section class="folders" id="graphCard">
       <details>
         <summary class="deck-label">Graph colors</summary>
@@ -553,45 +768,6 @@
         <p class="gs-note">Semester hubs stay white. Fades scale with hue warmth — warm colors calm down more.</p>
         <button onclick="saveGraphSettings(this)">Save &amp; recolor</button>
       </details>
-    </section>
-    <section class="folders" id="practice">
-      <span class="deck-label">Practice</span>
-      <div class="merge-manual">
-        <select id="pSem" onchange="pScope()" title="Filter by semester"></select>
-        <select id="pClass" onchange="pScope()"></select>
-        <select id="pUnit"></select>
-        <select id="pKind">
-          <option value="quiz">Quiz — 10 q</option>
-          <option value="test">Test — 20 q</option>
-        </select>
-        <select id="pFormat">
-          <option value="mcq">MCQ</option>
-          <option value="frq">FRQ — write on paper</option>
-        </select>
-        <button onclick="genQuiz(this)">Generate</button>
-      </div>
-      <div id="weakSpots"></div>
-      <div id="pastQuizzes"></div>
-    </section>
-    <section class="folders" id="ask">
-      <span class="deck-label">Ask my notes</span>
-      <div class="merge-manual">
-        <input type="text" id="askQ" placeholder="Ask a question about your notes…">
-        <button onclick="askNotes(this)">Ask</button>
-      </div>
-      <div id="askAnswer"></div>
-    </section>
-    <section class="folders" id="review">
-      <span class="deck-label">Review</span>
-      <div class="merge-manual">
-        <select id="rSem" onchange="rScope()" title="Filter by semester"></select>
-        <select id="rClass" onchange="rScope()"></select>
-        <select id="rUnit"></select>
-        <button onclick="genCards(this)">Make cards</button>
-        <button onclick="dlCheat()">Cheat sheet</button>
-      </div>
-      <div id="dueCount"></div>
-      <p><a href="/cards_due.ics">&#128197; Flashcard due dates (.ics)</a></p>
     </section>
   </div>
 </div>
@@ -640,8 +816,8 @@ function drawWave() {
   // peak deviation from the 128 silence baseline → is the mic actually hearing anything?
   let peak = 0;
   for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128));
-  if (peak > 3) { mic.textContent = '🎤 receiving audio'; mic.style.color = '#3FA78C'; }
-  else { mic.textContent = '🔇 no input'; mic.style.color = '#D9432F'; }
+  if (peak > 3) { mic.textContent = '● receiving audio'; mic.style.color = '#3FA78C'; }
+  else { mic.textContent = '● no input'; mic.style.color = '#D9432F'; }
   // size the backing store to the displayed size so the line isn't stretched
   canvas.width = canvas.clientWidth;
   canvas.height = canvas.clientHeight;
@@ -679,6 +855,8 @@ function stopMeters() {
   cancelAnimationFrame(rafId);
   clearInterval(timerId);
   canvas.classList.remove('on');
+  // the scope well is always on screen now, so wipe the last frame instead of hiding it
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   timer.classList.remove('on');
   mic.classList.remove('on');
   if (audioCtx) audioCtx.close();
@@ -781,6 +959,7 @@ function labelEditor(r) {
     <input class="lbl-unit"  list="dl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
     <input class="lbl-topic" list="dl-topic" placeholder="topic" value="${escAttr(r.topic)}">
     <textarea class="lbl-notes" rows="2" oninput="localStorage.setItem('notes-draft-${r.id}', this.value)"
+      onblur="if (localStorage.getItem('notes-draft-${r.id}') !== null) saveLabels('${r.id}')"
       ${r.status === 'recording' ? 'onkeydown="stampNote(event, this)"' : ''}
       placeholder="your notes — woven into the AI summary on save">${esc(localStorage.getItem('notes-draft-' + r.id) ?? r.notes ?? '')}</textarea>
     <button onclick="saveLabels('${r.id}')">${filed ? 'Update note' : live ? 'Save labels' : 'Save to Obsidian'}</button>
@@ -879,6 +1058,16 @@ async function uploadFile(f, forceKind) {
     { method: 'POST', body: f })).json();
   if (resp.error) alert(resp.error);
   // focus may still sit inside #list (same trap as deleteRec) — blur or refresh() skips
+  document.activeElement.blur();
+  refresh();
+}
+
+// Tab closed / browser died mid-lecture leaves the row stuck in "recording" with
+// no client left to call /stop. The 10s chunk uploads mean the audio up to that
+// point is already on disk, so treat the crash as the stop — same thing the
+// server's startup resume_stuck() sweep does, minus the restart.
+async function finishStuck(id) {
+  await fetch(`/stop/${id}`, { method: 'POST' });
   document.activeElement.blur();
   refresh();
 }
@@ -996,6 +1185,7 @@ async function refresh() {
       <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.obsidian_uri ? ` <a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">&#8599; Obsidian</a>` : ''}${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload'))}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
       ${r.status === 'transcribing' ? progressBar(r) : ''}
       ${r.status === 'recording' && r.live_transcript ? `<div class="live-tx">${esc(r.live_transcript)}</div>` : ''}
+      ${r.status === 'recording' && r.id !== rid ? `<p><button class="pill-btn" title="This tab isn't recording it — transcribe the audio saved so far" onclick="finishStuck('${r.id}')">Finish &amp; transcribe</button></p>` : ''}
       ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
       ${r.status === 'split_pending' ? splitCard(r) : r.status !== 'error' ? labelEditor(r) : ''}
@@ -1028,13 +1218,19 @@ function updateDatalists(rows) {
   }
 }
 
-// ---- tree drag-drop merge: drag a unit summary or topic div onto a sibling of the
-// same kind to merge (reuses doMerge, same confirm). dragItem/treeDragging are module-level
+// ---- tree drag-drop: drag a unit summary or topic div onto a sibling of the same kind
+// to merge, or a topic onto another unit's summary to move it there (same class only).
+// Both reuse doMerge/-> /merge_topics, which already handles the cross-unit case. dragItem/treeDragging are module-level
 // since dataTransfer payloads are unreliable for same-page drags in some browsers.
 let dragItem = null;      // {kind: 'unit'|'topic', k, name} of the node being dragged
 let treeDragging = false; // sat true from dragstart to dragend — pauses renderTree mid-drag
 function canDrop(drag, target) {
-  return !!drag && !!target && drag.kind === target.kind && drag.k === target.k && drag.name !== target.name;
+  if (!drag || !target || drag.k !== target.k) return false;
+  // topic -> unit summary: move the topic into that unit (same class). drag.name is
+  // "unit||topic", so compare the unit segment — comparing the whole name would let a
+  // topic drop onto its own unit and post a no-op merge.
+  if (drag.kind === 'topic' && target.kind === 'unit') return drag.name.split('||')[0] !== target.name;
+  return drag.kind === target.kind && drag.name !== target.name;
 }
 
 // ---- tree multi-select + right-click study menu. Keys are "sem||cls||unit" (unit) or
@@ -1208,7 +1404,12 @@ treeEl.addEventListener('drop', e => {
   if (!canDrop(dragItem, target)) return;
   e.preventDefault();
   e.stopPropagation(); // don't let the page-level file-drop handler also fire
-  doMerge(dragItem.kind, dragItem.k, dragItem.name, target.name);
+  // topic dropped on a unit: keep the topic name, swap its unit — doMerge's topic branch
+  // wants "unit||topic" on both sides, and a unit summary's name is just the unit.
+  const to = dragItem.kind === 'topic' && target.kind === 'unit'
+    ? target.name + '||' + dragItem.name.split('||')[1]
+    : target.name;
+  doMerge(dragItem.kind, dragItem.k, dragItem.name, to);
 });
 treeEl.addEventListener('dragend', () => {
   // fires on both a completed drop and a cancelled drag — always clear
@@ -1292,9 +1493,12 @@ function closeTreeMenu() { menuEl?.remove(); menuEl = null; }
 
 function openTreeMenu(x, y) {
   closeTreeMenu();
+  // quiz/test carry the same mcq|frq choice the Practice builder offers, as flat items
   const items = [
-    ['Quiz', el => genStudy('quiz', el)],
-    ['Test', el => genStudy('test', el)],
+    ['Quiz — MCQ', el => genStudy('quiz', el, 'mcq')],
+    ['Quiz — FRQ', el => genStudy('quiz', el, 'frq')],
+    ['Test — MCQ', el => genStudy('test', el, 'mcq')],
+    ['Test — FRQ', el => genStudy('test', el, 'frq')],
     ['Flashcards', el => genStudy('flashcards', el)],
     ['Cheat sheet', el => genStudy('cheatsheet', el)],
   ];
@@ -1321,7 +1525,7 @@ function studyScopes() {
   });
 }
 
-async function genStudy(kind, itemEl) {
+async function genStudy(kind, itemEl, fmt = 'mcq') {
   if (genBusy) return;
   genBusy = true;
   itemEl.textContent = '…';
@@ -1329,7 +1533,7 @@ async function genStudy(kind, itemEl) {
   try {
     const resp = await (await fetch('/study/generate', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind, semester: sem, class: cls, scopes: studyScopes() }),
+      body: JSON.stringify({ kind, format: fmt, semester: sem, class: cls, scopes: studyScopes() }),
     })).json();
     if (resp.error) { alert(resp.error); return; }
     if (kind === 'quiz' || kind === 'test') { pastLoaded = 0; renderQuizForm(resp); }
@@ -1456,7 +1660,9 @@ async function doMerge(level, k, from, to) {
   } else {
     const [fu, ft] = from.split('||'), [tu, tt] = to.split('||');
     body = { semester: sem, class: cls, from_unit: fu, from_topic: ft, to_unit: tu, to_topic: tt };
-    msg = `Merge topic "${ft}" (${fu}) into "${tt}" (${tu})?`;
+    msg = ft === tt
+      ? `Move topic "${ft}" from "${fu}" to "${tu}"?`
+      : `Merge topic "${ft}" (${fu}) into "${tt}" (${tu})?`;
   }
   if (!confirm(msg)) return;
   const resp = await (await fetch(level === 'unit' ? '/merge_units' : '/merge_topics', {
