@@ -136,10 +136,12 @@ def test_write_quiz_note():
         path = app.write_quiz_note(quiz, questions, results, 75)
         p = pathlib.Path(path)
         assert p.parent == pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / app.PREP_DIR, path
-        assert p.name.startswith("quiz ") and p.name.endswith("— 75%.md"), path
+        # filename is score-free (stable across grade re-writes); score lives in the note
+        assert p.name.startswith("quiz ") and p.name.endswith(".md") and "%" not in p.name, path
         text = p.read_text(encoding="utf-8")
         assert "class: Biology" in text and "kind: quiz" in text, text
-        assert "score: 75" in text and "tags: [practice]" in text, text
+        assert "score: 75%" in text and "tags: [practice]" in text, text
+        assert "# Quiz — 75%" in text, text
         assert "### Q1" in text and "2+2?" in text, text
         assert "(correct, your pick)" in text, text  # mcq: correct choice was also the student's pick
         assert "### Q2" in text and "Explain mitosis." in text, text

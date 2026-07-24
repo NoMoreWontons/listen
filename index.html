@@ -1235,8 +1235,7 @@ function canDrop(drag, target) {
 
 // ---- tree multi-select + right-click study menu. Keys are "sem||cls||unit" (unit) or
 // "sem||cls||unit||topic" (topic) — el.dataset.k + '||' + el.dataset.name builds them directly.
-let treeSel = new Set();  // selected keys, all within selClass
-let selClass = null;      // "sem||cls" the selection belongs to — a new class clears it
+let treeSel = new Set();  // selected tree keys (sem||cls||unit[||topic]); may span classes
 let menuEl = null;        // the open context menu, or null — also gates renderTree (like treeDragging)
 let genBusy = false;      // true while a /study/generate request is in flight
 function applyTreeSel() {
@@ -1437,10 +1436,8 @@ treeEl.addEventListener('click', async e => {
     const el = e.target.closest('[data-kind]');
     if (!el) return;
     e.preventDefault(); // don't toggle the <details> or follow an obsidian link on ctrl-click
-    const cls = el.dataset.k, key = cls + '||' + el.dataset.name;
-    if (selClass !== cls) { treeSel.clear(); selClass = cls; }
+    const key = el.dataset.k + '||' + el.dataset.name;
     treeSel.has(key) ? treeSel.delete(key) : treeSel.add(key);
-    if (!treeSel.size) selClass = null;
     applyTreeSel();
     return;
   }
@@ -1479,8 +1476,8 @@ treeEl.addEventListener('contextmenu', e => {
   const el = e.target.closest('[data-kind]');
   if (!el) return;
   e.preventDefault();
-  const cls = el.dataset.k, key = cls + '||' + el.dataset.name;
-  if (!treeSel.has(key)) { treeSel = new Set([key]); selClass = cls; } // outside selection: select just this
+  const key = el.dataset.k + '||' + el.dataset.name;
+  if (!treeSel.has(key)) treeSel = new Set([key]); // outside selection: select just this
   applyTreeSel();
   openTreeMenu(e.clientX, e.clientY);
 });
@@ -1516,42 +1513,78 @@ function openTreeMenu(x, y) {
   });
 }
 
-// scopes: a selected unit is sent whole ({unit}), a selected topic narrows to it ({unit, topic}) —
-// backend dedupes any overlap, so a unit + one of its topics both selected isn't double-counted here.
-function studyScopes() {
-  return [...treeSel].map(k => {
-    const rest = k.split('||').slice(2);
-    return rest.length > 1 ? { unit: rest[0], topic: rest[1] } : { unit: rest[0] };
-  });
+// Group the selection by class -> scopes. A selected unit is sent whole ({unit}),
+// a selected topic narrows to it ({unit, topic}); backend dedupes overlap. The
+// selection may span classes, so each class gets its own /study/generate call.
+function studyByClass() {
+  const m = new Map();  // "sem||cls" -> [scopes]
+  for (const k of treeSel) {
+    const [sem, cls, ...rest] = k.split('||');
+    const sc = sem + '||' + cls;
+    if (!m.has(sc)) m.set(sc, []);
+    m.get(sc).push(rest.length > 1 ? { unit: rest[0], topic: rest[1] } : { unit: rest[0] });
+  }
+  return m;
 }
 
 async function genStudy(kind, itemEl, fmt = 'mcq') {
   if (genBusy) return;
   genBusy = true;
   itemEl.textContent = '…';
-  const [sem, cls] = selClass.split('||');
   try {
-    const resp = await (await fetch('/study/generate', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind, format: fmt, semester: sem, class: cls, scopes: studyScopes() }),
-    })).json();
-    if (resp.error) { alert(resp.error); return; }
-    if (kind === 'quiz' || kind === 'test') { pastLoaded = 0; renderQuizForm(resp); }
-    else if (kind === 'flashcards') { alert(`Made ${resp.count} cards.`); }
-    else {
-      const blob = new Blob([resp.markdown], { type: 'text/markdown' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = resp.filename;
-      a.click();
-      URL.revokeObjectURL(a.href);
+    const out = [];  // {cls, resp} per class that generated something
+    for (const [sc, scopes] of studyByClass()) {
+      const [sem, cls] = sc.split('||');
+      const resp = await (await fetch('/study/generate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, format: fmt, semester: sem, class: cls, scopes }),
+      })).json();
+      if (resp.error) { alert(`${cls}: ${resp.error}`); continue; }
+      out.push({ cls, resp });
+    }
+    if (!out.length) return;
+    if (kind === 'quiz' || kind === 'test') {
+      pastLoaded = 0;               // the rest show up in the past-quizzes list
+      renderQuizForm(out[0].resp);
+    } else if (kind === 'flashcards') {
+      alert(out.map(o => `${o.cls}: ${o.resp.count} cards`).join('\n'));
+    } else {
+      renderCheatsheets(out);       // in-app view; each is also filed to Obsidian
     }
   } finally { genBusy = false; closeTreeMenu(); }
 }
 
+// Cheat sheets render in the quiz area (one card per class), each with a download
+// and an Obsidian-open link. The note is already filed under the class's Exam Prep.
+function renderCheatsheets(list) {
+  const area = document.getElementById('quizArea');
+  area.innerHTML = `<div class="quiz-head"><b>Cheat sheet${list.length > 1 ? 's' : ''}</b>`
+    + `<button onclick="closeQuiz()" title="Close">&#10005;</button></div>`;
+  for (const { cls, resp } of list) {
+    const card = document.createElement('div');
+    card.className = 'quiz cheatsheet';
+    card.innerHTML = `<div class="quiz-head"><b>${esc(cls)}</b><span class="cs-actions">`
+      + (resp.obsidian ? `<a href="${escAttr(resp.obsidian)}">Open in Obsidian</a>` : '')
+      + `</span></div>${md(resp.markdown)}`;
+    const dl = document.createElement('button');
+    dl.textContent = 'Download .md';
+    dl.onclick = () => downloadMd(resp.markdown, resp.filename);
+    card.querySelector('.cs-actions').prepend(dl);
+    area.appendChild(card);
+  }
+  area.scrollIntoView({ behavior: 'smooth' });
+}
+
+function downloadMd(markdown, filename) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown' }));
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function renameSel() {
-  const [sem, cls] = selClass.split('||');
-  const rest = [...treeSel][0].split('||').slice(2);
+  const [sem, cls, ...rest] = [...treeSel][0].split('||');
   closeTreeMenu();
   const isTopic = rest.length > 1;
   const oldName = rest.at(-1);
@@ -1564,17 +1597,18 @@ function renameSel() {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   }).then(r => r.json()).then(resp => {
     if (!resp.ok) { alert(resp.error || 'rename failed'); return; }
-    treeSel.clear(); selClass = null; refresh();
+    treeSel.clear(); refresh();
   });
 }
 
 // reuses the existing per-row delete button (and its confirm) instead of duplicating that logic
 function deleteSel() {
-  const name = [...treeSel][0].split('||').slice(2).join('||');
+  const [sem, cls, ...rest] = [...treeSel][0].split('||');
+  const name = rest.join('||');
   closeTreeMenu();
-  const el = [...treeEl.querySelectorAll('[data-kind]')].find(x => x.dataset.k === selClass && x.dataset.name === name);
+  const el = [...treeEl.querySelectorAll('[data-kind]')].find(x => x.dataset.k === sem + '||' + cls && x.dataset.name === name);
   el?.querySelector('.tree-del')?.click();
-  treeSel.clear(); selClass = null;
+  treeSel.clear();
 }
 
 // ---- merge panel: units or topics — suggests near-duplicates, lets the user merge any two ----

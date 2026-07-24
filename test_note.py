@@ -358,6 +358,116 @@ def test_write_exam_note_undated_no_format_overwrites():
     print("ok: write_exam_note handles missing date/format/topics, overwrites on re-detection")
 
 
+def test_exam_covers_match_by_word_overlap():
+    """Claude writes Covers as free text, not the labels it filed lectures
+    under ('Relative velocity' vs the note 'Relative Motion and Velocity'), so
+    entries resolve on shared words. Exact matching hit 1 of 7 on the real vault."""
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        phys = pathlib.Path(d) / "Bridge" / "Physics"
+        for unit, notes in {
+            "Kinematics and Motion": ["Relative Motion and Velocity", "Projectile Motion"],
+            "Rotational Motion": ["Angular velocity and acceleration"],
+        }.items():
+            (phys / unit).mkdir(parents=True)
+            for n in notes + [unit]:
+                (phys / unit / f"{n}.md").write_text("x", encoding="utf-8")
+
+        # two units -> files under the better-matching one (2 hits vs 1)
+        exam = {"title": "Midterm 1", "kind": "exam", "due_date": "2026-10-01", "format": "",
+                "topics": ["Relative velocity", "Projectile motion", "Angular momentum"]}
+        path = pathlib.Path(app.write_exam_note("Bridge", "Physics", exam))
+        assert path.parent == phys / "Kinematics and Motion" / app.PREP_DIR, path
+        text = path.read_text(encoding="utf-8")
+        # label keeps the exam's wording, target is the resolved unit hub
+        assert "- [[Bridge/Physics/Kinematics and Motion/Kinematics and Motion|Relative velocity]]" in text, text
+        assert "- [[Bridge/Physics/Rotational Motion/Rotational Motion|Angular momentum]]" in text, text
+    print("ok: exam Covers resolve to units by word overlap, file under the best match")
+
+
+def test_wide_exam_stays_class_level():
+    """A comprehensive final spanning 3+ units isn't about any single unit."""
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        bio = pathlib.Path(d) / "Fall 26" / "Biology"
+        for unit in ("Cells", "Genetics", "Ecology"):
+            (bio / unit).mkdir(parents=True)
+        exam = {"title": "Final", "kind": "exam", "due_date": "", "format": "",
+                "topics": ["Cells", "Genetics", "Ecology"]}
+        path = pathlib.Path(app.write_exam_note("Fall 26", "Biology", exam))
+        assert path.parent == bio / app.PREP_DIR, path
+    print("ok: exam spanning 3+ units stays class-level")
+
+
+def test_prep_note_links_every_matching_exam():
+    """Study material carries an `Exam:` wikilink per exam covering its scope —
+    the graph edge that hangs a cheat sheet off the midterm AND the final."""
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        bio = pathlib.Path(d) / "Fall 26" / "Biology"
+        (bio / "Cells").mkdir(parents=True)
+        for title, topics in (("Midterm 1", ["Cells"]), ("Final", ["Cells", "Genetics", "Ecology"])):
+            app.write_exam_note("Fall 26", "Biology", {
+                "title": title, "kind": "exam", "due_date": "", "format": "", "topics": topics})
+
+        path = app.write_prep_note("Fall 26", "Biology", "Cells", "sheet.md", "# body\n", ["Cells"])
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+        assert "Exam: " in text, text
+        assert "|Midterm 1]]" in text and "|Final]]" in text, text  # both, not the more recent one
+
+        # material outside every exam's Covers gets no link
+        plain = app.write_prep_note("Fall 26", "Biology", "Cells", "other.md", "# body\n", ["Photosynthesis"])
+        assert "Exam:" not in pathlib.Path(plain).read_text(encoding="utf-8")
+    print("ok: prep notes link every exam covering their scope, none when nothing matches")
+
+
+def test_legacy_exams_folder_migrates_and_refiles():
+    """Old 'Exams' folders fold into Exam Prep, then class-level exam notes lift
+    to the unit they cover — with their Covers bullets relinked."""
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        phys = pathlib.Path(d) / "Bridge" / "Physics"
+        (phys / "Kinematics and Motion").mkdir(parents=True)
+        (phys / "Kinematics and Motion" / "Projectile Motion.md").write_text("x", encoding="utf-8")
+        legacy = phys / "Exams"
+        legacy.mkdir()
+        (legacy / "Midterm 1.md").write_text(
+            "---\nclass: Physics\nkind: exam\ntags: [exam]\n---\n\n# Midterm 1\n\n"
+            "## Covers\n\n- Projectile Motion\n- Vectors\n", encoding="utf-8")
+
+        app._migrate_prep_dirs()
+        app._refile_exam_notes()
+
+        assert not legacy.exists()
+        moved = phys / "Kinematics and Motion" / app.PREP_DIR / "Midterm 1.md"
+        assert moved.exists(), list(phys.rglob("*.md"))
+        text = moved.read_text(encoding="utf-8")
+        assert "- [[Bridge/Physics/Kinematics and Motion/Kinematics and Motion|Projectile Motion]]" in text, text
+        assert "- Vectors" in text, text  # unresolvable entry stays a plain bullet
+        # a study note filed before exam matching existed gets linked to the exam
+        old = phys / "Kinematics and Motion" / app.PREP_DIR / "quiz 2026-07-01 0900.md"
+        old.write_text("---\nclass: Physics\ntags: [practice]\n---\n\n# Quiz\n", encoding="utf-8")
+        app._backfill_prep_links()
+        assert "Exam: [[Bridge/Physics/Kinematics and Motion/Exam Prep/Midterm 1|Midterm 1]]" \
+            in old.read_text(encoding="utf-8"), old.read_text(encoding="utf-8")
+
+        # class-level prep note (material spanning units) is backfilled too —
+        # its folder is <sem>/<cls>/Exam Prep, one level shallower
+        wide = phys / app.PREP_DIR / "Physics cheatsheet.md"
+        wide.parent.mkdir(parents=True, exist_ok=True)
+        wide.write_text("---\nclass: Physics\n---\n\n# Sheet\n", encoding="utf-8")
+        app._backfill_prep_links()
+        assert "Exam: [[Bridge/Physics/Kinematics and Motion/Exam Prep/Midterm 1|Midterm 1]]" \
+            in wide.read_text(encoding="utf-8"), wide.read_text(encoding="utf-8")
+
+        before = old.read_text(encoding="utf-8")
+        app._migrate_prep_dirs()
+        app._refile_exam_notes()
+        app._backfill_prep_links()  # all idempotent
+        assert old.read_text(encoding="utf-8") == before  # no second Exam: line
+    print("ok: legacy Exams folders migrate, exams refile to their unit, old prep notes link")
+
+
 def test_addendum_renders_without_resummary():
     with tempfile.TemporaryDirectory() as d:
         app.OBSIDIAN_VAULT = pathlib.Path(d)
@@ -390,4 +500,8 @@ if __name__ == "__main__":
     test_parse_exams_defensive()
     test_write_exam_note_links_matching_units()
     test_write_exam_note_undated_no_format_overwrites()
+    test_exam_covers_match_by_word_overlap()
+    test_wide_exam_stays_class_level()
+    test_prep_note_links_every_matching_exam()
+    test_legacy_exams_folder_migrates_and_refiles()
     test_addendum_renders_without_resummary()

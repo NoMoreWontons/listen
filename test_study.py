@@ -11,6 +11,11 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "x")
 
 import app
 
+# study_generate files notes as a side effect (quizzes included, since they're
+# written at generation) — pin the vault to a throwaway dir so a test that
+# doesn't care about paths can't write into the real one.
+app.OBSIDIAN_VAULT = pathlib.Path(tempfile.mkdtemp(prefix="listen-test-vault-"))
+
 
 class FakeResult:
     def __init__(self, data):
@@ -195,7 +200,26 @@ def test_cheatsheet():
         assert p == (pathlib.Path(d) / "Untitled" / "Biology" / "Cells" / app.PREP_DIR
                      / "Biology Cells cheatsheet.md"), p
         assert p.read_text(encoding="utf-8") == out["markdown"]
+        # in-app view opens the same note in Obsidian
+        assert out["obsidian"].startswith("obsidian://open"), out
     print("ok: cheatsheet returns markdown and files a copy under Exam Prep")
+
+
+def test_quiz_files_ungraded():
+    """A generated-but-not-yet-graded quiz/test still lands under Exam Prep,
+    marked ungraded — matching cheatsheets/flashcards, which file at generation.
+    Grading later overwrites the same file (stable name from created_at)."""
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        app.sb = FakeSB([mkrow("Cells", "Mitosis", summary="Mitosis is cell division.")])
+        app.claude.messages.create = fake_quiz_msg
+        out = app.study_generate({"kind": "test", "class": "Biology", "scopes": [{"unit": "Cells"}]})
+        assert out["kind"] == "test", out
+        notes = list(pathlib.Path(d).rglob("test *.md"))
+        assert len(notes) == 1, notes
+        assert notes[0].parent.name == app.PREP_DIR, notes[0]
+        assert "ungraded" in notes[0].read_text(encoding="utf-8")
+    print("ok: generated-but-ungraded test files under Exam Prep")
 
 
 def test_semester_falls_back_to_rows():
@@ -249,6 +273,7 @@ if __name__ == "__main__":
     test_quiz_format_passthrough()
     test_flashcards()
     test_cheatsheet()
+    test_quiz_files_ungraded()
     test_semester_falls_back_to_rows()
     test_migrate_prep_dirs()
     print("test_study: OK")
