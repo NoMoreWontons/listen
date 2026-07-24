@@ -36,12 +36,6 @@ OBSIDIAN_VAULT = pathlib.Path(
 # flashcard decks — files under this folder inside the unit (class-level when
 # the scope spans units). Was "Practice"; _migrate_prep_dirs renames old ones.
 PREP_DIR = "Exam Prep"
-# Notion fallback: user records lectures with Notion's AI meeting-note taker into
-# a dedicated database; we poll it, pull transcripts, run the same Claude pipeline.
-# Off unless NOTION_TOKEN is set (an internal-integration secret shared with the DB).
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
-NOTION_DB_ID = os.getenv("NOTION_DB_ID", "658a290d-8e82-4cb5-bfcc-79f19a2724aa")
-NOTION_POLL_MIN = int(os.getenv("NOTION_POLL_MIN", "10"))
 
 sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 claude = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
@@ -180,127 +174,7 @@ def get_model():
     return _model
 
 
-# --- Notion fallback: pull AI-meeting-note transcripts into the same pipeline ---
-import httpx
-
-_NOTION_API = "https://api.notion.com/v1"
-
-
-def _notion_headers():
-    return {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
-    }
-
-
-def _notion_block_text(block_id, depth=0):
-    """Recursively concatenate all rich-text under a block/page. Meeting-note
-    transcripts nest under child blocks, so recursion picks them up as text."""
-    if depth > 6:  # ponytail: guard pathological nesting; lectures never go this deep
-        return ""
-    out, cursor = [], None
-    while True:
-        params = {"page_size": 100}
-        if cursor:
-            params["start_cursor"] = cursor
-        r = httpx.get(f"{_NOTION_API}/blocks/{block_id}/children",
-                      headers=_notion_headers(), params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        for b in data["results"]:
-            body = b.get(b["type"], {})
-            for rt in body.get("rich_text", []):
-                out.append(rt.get("plain_text", ""))
-            if body.get("rich_text"):
-                out.append("\n")
-            if b.get("has_children"):
-                out.append(_notion_block_text(b["id"], depth + 1))
-        if not data.get("has_more"):
-            break
-        cursor = data["next_cursor"]
-    return "".join(out)
-
-
-def _notion_page_split(page_id):
-    """(transcript, notes): the subtree under the top-level block titled
-    'Transcript' is the transcript; all other page text (the user's own notes,
-    Notion's AI summary) is notes. No such block -> whole page is the
-    transcript, notes empty (pre-notes behavior)."""
-    transcript, other, cursor = [], [], None
-    while True:
-        params = {"page_size": 100}
-        if cursor:
-            params["start_cursor"] = cursor
-        r = httpx.get(f"{_NOTION_API}/blocks/{page_id}/children",
-                      headers=_notion_headers(), params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        for b in data["results"]:
-            body = b.get(b["type"], {})
-            text = "".join(rt.get("plain_text", "") for rt in body.get("rich_text", []))
-            if b.get("has_children") and text.strip().lower() == "transcript":
-                transcript.append(_notion_block_text(b["id"], 1))
-                continue
-            if text:
-                other.append(text + "\n")
-            if b.get("has_children"):
-                other.append(_notion_block_text(b["id"], 1))
-        if not data.get("has_more"):
-            break
-        cursor = data["next_cursor"]
-    if transcript:
-        return "".join(transcript), "".join(other)
-    return "".join(other), ""
-
-
-def _notion_new_pages():
-    """Database rows whose notion_id isn't already in Supabase."""
-    seen = {r["notion_id"] for r in
-            sb.table("recordings").select("notion_id").not_.is_("notion_id", "null").execute().data}
-    r = httpx.post(f"{_NOTION_API}/databases/{NOTION_DB_ID}/query",
-                   headers=_notion_headers(), json={"page_size": 100}, timeout=30)
-    r.raise_for_status()
-    pages = []
-    for p in r.json()["results"]:
-        if p["id"] in seen:
-            continue
-        title = "".join(t.get("plain_text", "")
-                        for prop in p["properties"].values() if prop["type"] == "title"
-                        for t in prop["title"]) or "Untitled lecture"
-        pages.append({"id": p["id"], "title": title, "created_time": p["created_time"]})
-    return pages
-
-
-def import_notion_once():
-    if not NOTION_TOKEN:
-        return
-    try:
-        pages = _notion_new_pages()
-    except Exception as e:
-        print(f"[listen] notion poll failed: {e}")
-        return
-    for pg in pages:
-        try:
-            transcript, notes = _notion_page_split(pg["id"])
-            transcript, notes = transcript.strip(), notes.strip()
-            if not transcript:
-                continue  # empty note, nothing to import yet
-            row = sb.table("recordings").insert({
-                "title": pg["title"], "status": "transcribing",
-                "source": "notion", "notion_id": pg["id"],
-                "notes": notes or None,  # finalize reads it back and feeds analyze
-            }).execute().data[0]
-            finalize(row["id"], transcript, created_at=pg["created_time"])
-            print(f"[listen] imported notion lecture '{pg['title']}'")
-        except Exception as e:
-            print(f"[listen] notion import '{pg['title']}' failed: {e}")
-
-
-def _notion_poll_loop():
-    while True:
-        import_notion_once()
-        time.sleep(NOTION_POLL_MIN * 60)
+import httpx  # used by the youtube oembed lookup below
 
 
 def sweep_old_audio(directory=AUDIO_DIR, days=RETENTION_DAYS):
@@ -342,8 +216,6 @@ async def lifespan(app):
     # doesn't cold-start the download; server still starts immediately.
     threading.Thread(target=_warm_model, daemon=True).start()
     resume_stuck()
-    if NOTION_TOKEN:
-        threading.Thread(target=_notion_poll_loop, daemon=True).start()
     yield
 
 
@@ -866,7 +738,7 @@ def live_preview(rid):
 
 
 def finalize(rid, transcript, created_at=None):
-    """Shared tail for any transcript source (whisper, upload, or Notion):
+    """Shared tail for any transcript source (whisper or upload):
     summarize + label with Claude, then either write the row done and file
     the Obsidian note (single topic), or park it split_pending with the
     proposed segments for the user to confirm via /split (multiple topics).
