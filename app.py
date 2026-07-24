@@ -32,12 +32,10 @@ MODEL_LOAD_STALL_S = int(os.getenv("MODEL_LOAD_STALL_S", "300"))
 OBSIDIAN_VAULT = pathlib.Path(
     os.getenv("OBSIDIAN_VAULT", str(pathlib.Path.home() / "College Lectures"))
 )
-# Notion fallback: user records lectures with Notion's AI meeting-note taker into
-# a dedicated database; we poll it, pull transcripts, run the same Claude pipeline.
-# Off unless NOTION_TOKEN is set (an internal-integration secret shared with the DB).
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
-NOTION_DB_ID = os.getenv("NOTION_DB_ID", "658a290d-8e82-4cb5-bfcc-79f19a2724aa")
-NOTION_POLL_MIN = int(os.getenv("NOTION_POLL_MIN", "10"))
+# Every study artifact — announced exams, graded quizzes/tests, cheat sheets,
+# flashcard decks — files under this folder inside the unit (class-level when
+# the scope spans units). Was "Practice"; _migrate_prep_dirs renames old ones.
+PREP_DIR = "Exam Prep"
 
 sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 claude = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
@@ -176,127 +174,7 @@ def get_model():
     return _model
 
 
-# --- Notion fallback: pull AI-meeting-note transcripts into the same pipeline ---
-import httpx
-
-_NOTION_API = "https://api.notion.com/v1"
-
-
-def _notion_headers():
-    return {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
-    }
-
-
-def _notion_block_text(block_id, depth=0):
-    """Recursively concatenate all rich-text under a block/page. Meeting-note
-    transcripts nest under child blocks, so recursion picks them up as text."""
-    if depth > 6:  # ponytail: guard pathological nesting; lectures never go this deep
-        return ""
-    out, cursor = [], None
-    while True:
-        params = {"page_size": 100}
-        if cursor:
-            params["start_cursor"] = cursor
-        r = httpx.get(f"{_NOTION_API}/blocks/{block_id}/children",
-                      headers=_notion_headers(), params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        for b in data["results"]:
-            body = b.get(b["type"], {})
-            for rt in body.get("rich_text", []):
-                out.append(rt.get("plain_text", ""))
-            if body.get("rich_text"):
-                out.append("\n")
-            if b.get("has_children"):
-                out.append(_notion_block_text(b["id"], depth + 1))
-        if not data.get("has_more"):
-            break
-        cursor = data["next_cursor"]
-    return "".join(out)
-
-
-def _notion_page_split(page_id):
-    """(transcript, notes): the subtree under the top-level block titled
-    'Transcript' is the transcript; all other page text (the user's own notes,
-    Notion's AI summary) is notes. No such block -> whole page is the
-    transcript, notes empty (pre-notes behavior)."""
-    transcript, other, cursor = [], [], None
-    while True:
-        params = {"page_size": 100}
-        if cursor:
-            params["start_cursor"] = cursor
-        r = httpx.get(f"{_NOTION_API}/blocks/{page_id}/children",
-                      headers=_notion_headers(), params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        for b in data["results"]:
-            body = b.get(b["type"], {})
-            text = "".join(rt.get("plain_text", "") for rt in body.get("rich_text", []))
-            if b.get("has_children") and text.strip().lower() == "transcript":
-                transcript.append(_notion_block_text(b["id"], 1))
-                continue
-            if text:
-                other.append(text + "\n")
-            if b.get("has_children"):
-                other.append(_notion_block_text(b["id"], 1))
-        if not data.get("has_more"):
-            break
-        cursor = data["next_cursor"]
-    if transcript:
-        return "".join(transcript), "".join(other)
-    return "".join(other), ""
-
-
-def _notion_new_pages():
-    """Database rows whose notion_id isn't already in Supabase."""
-    seen = {r["notion_id"] for r in
-            sb.table("recordings").select("notion_id").not_.is_("notion_id", "null").execute().data}
-    r = httpx.post(f"{_NOTION_API}/databases/{NOTION_DB_ID}/query",
-                   headers=_notion_headers(), json={"page_size": 100}, timeout=30)
-    r.raise_for_status()
-    pages = []
-    for p in r.json()["results"]:
-        if p["id"] in seen:
-            continue
-        title = "".join(t.get("plain_text", "")
-                        for prop in p["properties"].values() if prop["type"] == "title"
-                        for t in prop["title"]) or "Untitled lecture"
-        pages.append({"id": p["id"], "title": title, "created_time": p["created_time"]})
-    return pages
-
-
-def import_notion_once():
-    if not NOTION_TOKEN:
-        return
-    try:
-        pages = _notion_new_pages()
-    except Exception as e:
-        print(f"[listen] notion poll failed: {e}")
-        return
-    for pg in pages:
-        try:
-            transcript, notes = _notion_page_split(pg["id"])
-            transcript, notes = transcript.strip(), notes.strip()
-            if not transcript:
-                continue  # empty note, nothing to import yet
-            row = sb.table("recordings").insert({
-                "title": pg["title"], "status": "transcribing",
-                "source": "notion", "notion_id": pg["id"],
-                "notes": notes or None,  # finalize reads it back and feeds analyze
-            }).execute().data[0]
-            finalize(row["id"], transcript, created_at=pg["created_time"])
-            print(f"[listen] imported notion lecture '{pg['title']}'")
-        except Exception as e:
-            print(f"[listen] notion import '{pg['title']}' failed: {e}")
-
-
-def _notion_poll_loop():
-    while True:
-        import_notion_once()
-        time.sleep(NOTION_POLL_MIN * 60)
+import httpx  # used by the youtube oembed lookup below
 
 
 def sweep_old_audio(directory=AUDIO_DIR, days=RETENTION_DAYS):
@@ -338,8 +216,6 @@ async def lifespan(app):
     # doesn't cold-start the download; server still starts immediately.
     threading.Thread(target=_warm_model, daemon=True).start()
     resume_stuck()
-    if NOTION_TOKEN:
-        threading.Thread(target=_notion_poll_loop, daemon=True).start()
     yield
 
 
@@ -723,16 +599,25 @@ def _report_model_progress(rid, stop_event):
             last = pct
 
 
+def _cap_entries(entries):
+    """ponytail: past ~2000 entries (very long lectures) truncate text to 200
+    chars instead of dropping entries -- keeps every timestamp, just bounds
+    jsonb size. Returns copies so the caller's working list keeps full text."""
+    if len(entries) > 2000:
+        return [{**e, "t": e["t"][:200]} for e in entries]
+    return entries
+
+
 def _seg_entries(segs):
     """Whisper segments -> compact {s,e,t} timestamp dicts for the `segments`
-    jsonb column. ponytail: past ~2000 entries (very long lectures) truncate
-    text to 200 chars instead of dropping entries -- keeps every timestamp,
-    just bounds jsonb size."""
-    entries = [{"s": round(s.start, 1), "e": round(s.end, 1), "t": s.text.strip()} for s in segs]
-    if len(entries) > 2000:
-        for e in entries:
-            e["t"] = e["t"][:200]
-    return entries
+    jsonb column."""
+    return _cap_entries([{"s": round(s.start, 1), "e": round(s.end, 1), "t": s.text.strip()}
+                         for s in segs])
+
+
+def _resume_at(entries):
+    """Second to restart whisper from, given already-checkpointed segments."""
+    return entries[-1]["e"] if entries else 0
 
 
 def process(rid):
@@ -746,21 +631,39 @@ def process(rid):
         finally:
             stop.set()
 
+        # ponytail: crash/shutdown recovery is just the checkpoint below read back —
+        # `segments` holds every decoded entry so far, so restart resumes at the last
+        # one's end instead of re-decoding the whole lecture. clip_timestamps keeps
+        # seg.end and info.duration absolute/full-file, so the progress math is unchanged.
+        # ponytail: a >2000-segment lecture that crashes rebuilds its prefix from the
+        # DB copy, whose text _cap_entries truncated to 200 chars -- resumed transcript
+        # for those is lossy. Store the untruncated text elsewhere if that ever bites.
+        done = (sb.table("recordings").select("segments").eq("id", rid)
+                .single().execute().data or {}).get("segments") or []
         _set(rid, stage="transcribing", progress=0)
         with _transcribe_lock:
-            segments, info = model.transcribe(str(audio_path(rid)))
+            # condition_on_previous_text=False: whisper's default feeds each
+            # window its own last output, so on muffled/narrowband audio one
+            # hallucinated line seeds a loop that runs for minutes. Measured on
+            # the 2026-07-23 lecture: repeated sentences 12 -> 2 (first 4 min)
+            # and 37 -> 4 (last 4.5 min). Costs a little cross-window context.
+            # vad_filter=True cuts the loops further but drops real quiet speech
+            # on this audio — not worth it.
+            segments, info = model.transcribe(str(audio_path(rid)),
+                                              clip_timestamps=str(_resume_at(done)),
+                                              condition_on_previous_text=False)
             duration = max(info.duration, 1)
-            parts, raw_segs, last_pct = [], [], -1
+            entries, last_pct = list(done), -1
             for seg in segments:
                 _gate(rid).wait()  # paused -> block before decoding further
-                parts.append(seg.text)
-                raw_segs.append(seg)
+                entries.append({"s": round(seg.start, 1), "e": round(seg.end, 1),
+                                "t": seg.text.strip()})
                 pct = min(99, int(seg.end / duration * 100) // 5 * 5)
                 if pct != last_pct:
-                    _set(rid, progress=pct)
+                    _set(rid, progress=pct, segments=_cap_entries(entries))
                     last_pct = pct
-        transcript = "".join(parts).strip()
-        _set(rid, segments=_seg_entries(raw_segs))
+        transcript = " ".join(e["t"] for e in entries).strip()
+        _set(rid, segments=_cap_entries(entries))
         finalize(rid, transcript)
     except Exception as e:
         _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]", live_transcript=None)
@@ -808,7 +711,7 @@ def live_preview(rid):
                 try:
                     if model is None:  # load lazily -- only after ffmpeg's confirmed present
                         model = get_model()
-                    segments, info = model.transcribe(tmp_path)
+                    segments, info = model.transcribe(tmp_path, condition_on_previous_text=False)
                     # segments is a lazy generator — drain it INSIDE the lock,
                     # decoding is the actual model work
                     text = " ".join(seg.text.strip() for seg in segments).strip()
@@ -835,7 +738,7 @@ def live_preview(rid):
 
 
 def finalize(rid, transcript, created_at=None):
-    """Shared tail for any transcript source (whisper, upload, or Notion):
+    """Shared tail for any transcript source (whisper or upload):
     summarize + label with Claude, then either write the row done and file
     the Obsidian note (single topic), or park it split_pending with the
     proposed segments for the user to confirm via /split (multiple topics).
@@ -1249,13 +1152,14 @@ def quiz_generate(payload: dict = Body(...)):
     fmt = payload.get("format") if payload.get("format") in ("mcq", "frq") else "mcq"
     if not cls:
         return {"error": "class required"}
-    q = (sb.table("recordings").select("topic,title,summary")
+    q = (sb.table("recordings").select("topic,title,summary,semester")
          .eq("status", "done").eq("class", cls))
     if sem:
         q = q.eq("semester", sem)
     if unit:
         q = q.eq("unit", unit)
     rows = q.execute().data
+    sem = sem or _rows_semester(rows)
     topics = payload.get("topics")
     if topics:
         rows = [r for r in rows if r.get("topic") in topics]
@@ -1398,6 +1302,7 @@ def study_generate(payload: dict = Body(...)):
     sem = (payload.get("semester") or "").strip()
     cls = (payload.get("class") or "").strip()
     kind = payload.get("kind")
+    fmt = payload.get("format") if payload.get("format") in ("mcq", "frq") else "mcq"
     scopes = payload.get("scopes")
     if kind not in ("quiz", "test", "flashcards", "cheatsheet"):
         return {"error": "bad kind"}
@@ -1407,26 +1312,34 @@ def study_generate(payload: dict = Body(...)):
             isinstance(s, dict) and (s.get("unit") or "").strip() for s in scopes):
         return {"error": "scopes required"}
 
-    q = (sb.table("recordings").select("topic,title,summary,unit")
+    q = (sb.table("recordings").select("topic,title,summary,unit,semester")
          .eq("status", "done").eq("class", cls))
     if sem:
         q = q.eq("semester", sem)
     rows = _scope_rows(q.execute().data, scopes)
+    sem = sem or _rows_semester(rows)
     if not any((r.get("summary") or "").strip() for r in rows):
         return {"error": "no filed notes for that scope yet"}
 
     units = {s["unit"] for s in scopes}
     unit = next(iter(units)) if len(units) == 1 else None
+    # every unit/topic the material draws on — what exam matching is done against
+    labels = sorted(units | {r.get("topic") for r in rows if r.get("topic")})
 
     if kind in ("quiz", "test"):
         try:
-            questions = generate_quiz(rows, kind)
+            questions = generate_quiz(rows, kind, fmt)
         except Exception as e:
             return {"error": f"generation failed: {e}"}
-        return sb.table("quizzes").insert({
+        row = sb.table("quizzes").insert({
             "kind": kind, "semester": sem or None, "class": cls, "unit": unit,
             "questions": questions,
         }).execute().data[0]
+        try:  # file the blank test now so it lands under Exam Prep even before grading
+            write_quiz_note(row, questions, [], None)
+        except Exception as e:
+            print(f"[listen] blank quiz note write failed (quiz itself is saved): {e}")
+        return row
 
     if kind == "flashcards":
         try:
@@ -1442,11 +1355,14 @@ def study_generate(payload: dict = Body(...)):
         if not valid:
             return {"error": "no usable cards generated"}
         sb.table("cards").insert(valid).execute()
-        return {"count": len(valid)}
+        return {"count": len(valid), "path": write_cards_note(sem, cls, unit or "", labels)}
 
     md = build_cheatsheet(rows, cls, unit or "")
     fname = _slug(f"{cls} {unit or ''}".strip()) + " cheatsheet.md"
-    return {"filename": fname, "markdown": md}
+    # filed in the vault (opens in Obsidian) as well as returned for the in-app view
+    path = write_prep_note(sem, cls, unit or "", fname, md, labels)
+    return {"filename": fname, "markdown": md,
+            "path": path, "obsidian": _obsidian_uri(path)}
 
 
 # --- flashcards / spaced repetition (SM-2) ---
@@ -1498,6 +1414,7 @@ def cards_generate(payload: dict = Body(...)):
     if unit:
         q = q.eq("unit", unit)
     rows = q.execute().data
+    sem = sem or _rows_semester(rows)
     if not any((r.get("summary") or "").strip() for r in rows):
         return {"error": "no filed notes for that scope yet"}
     try:
@@ -1513,7 +1430,7 @@ def cards_generate(payload: dict = Body(...)):
     if not valid:
         return {"error": "no usable cards generated"}
     sb.table("cards").insert(valid).execute()
-    return {"count": len(valid)}
+    return {"count": len(valid), "path": write_cards_note(sem, cls, unit)}
 
 
 @app.get("/cards/due")
@@ -1590,15 +1507,17 @@ def cheatsheet(class_: str = Query("", alias="class"), unit: str = "", semester:
     unit = unit.strip()
     if not cls:
         return Response("class required", media_type="text/plain", status_code=400)
-    q = (sb.table("recordings").select("topic,title,summary")
+    q = (sb.table("recordings").select("topic,title,summary,semester")
          .eq("status", "done").eq("class", cls))
     if sem:
         q = q.eq("semester", sem)
     if unit:
         q = q.eq("unit", unit)
     rows = q.execute().data
+    sem = sem or _rows_semester(rows)
     md = build_cheatsheet(rows, cls, unit)
     fname = _slug(f"{cls} {unit}".strip()) + " cheatsheet.md"
+    write_prep_note(sem, cls, unit, fname, md)  # file it, then serve the download
     return Response(md, media_type="text/markdown",
                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
@@ -1773,25 +1692,39 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
     return (*parts, msg.usage.input_tokens, msg.usage.output_tokens)
 
 
+def _json_obj(raw):
+    """The first JSON object in raw, ignoring any prose the model appended
+    after it. json.JSONDecoder().raw_decode stops at the end of the object, so
+    trailing '---\n**Note on transcript quality:** ...' commentary no longer
+    poisons the parse. Returns {} when there is no JSON object at all.
+    Deliberately NOT brace-counting/regex brace-matching: summaries contain
+    LaTeX with literal braces (\\frac{1}{2}, x^{2}) that would break that."""
+    start = raw.find("{")
+    if start == -1:
+        return {}
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(raw, start)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
 def _parse_segments(raw):
     """Parses analyze()'s {"segments": [...]} JSON reply into a list of
     {class, unit, topic, summary} dicts. Pure — no network/DB — so it's
     directly testable. Falls back to one segment holding the raw text as the
     summary, Unsorted/Untitled labels, if the JSON is unparseable or empty —
     mirrors the pre-split single-object fallback."""
-    try:
-        segments = json.loads(raw).get("segments") or []
-        if not segments:
-            raise ValueError("empty segments")
-        return [
-            {"class": s.get("class", ""), "unit": s.get("unit", ""),
-             "topic": s.get("topic", ""), "summary": s.get("summary", "")}
-            for s in segments
-        ]
-    except (json.JSONDecodeError, AttributeError, ValueError):
+    segments = _json_obj(raw).get("segments") or []
+    if not segments:
         # ponytail: model ignored the JSON ask — keep its text as the summary,
         # drop into an Unsorted bucket the user can re-file from the UI.
         return [{"class": "Unsorted", "unit": "Unsorted", "topic": "Untitled", "summary": raw}]
+    return [
+        {"class": s.get("class", ""), "unit": s.get("unit", ""),
+         "topic": s.get("topic", ""), "summary": s.get("summary", "")}
+        for s in segments
+    ]
 
 
 def _norm_words(s):
@@ -1840,11 +1773,8 @@ def _parse_exams(raw):
     """Parses analyze()'s {"exams": [...]} JSON reply defensively — missing
     key, non-list, or unparseable JSON all fall back to no exams detected.
     Pure — no network/DB — so it's directly testable."""
-    try:
-        exams = json.loads(raw).get("exams")
-        return exams if isinstance(exams, list) else []
-    except (json.JSONDecodeError, AttributeError):
-        return []
+    exams = _json_obj(raw).get("exams")
+    return exams if isinstance(exams, list) else []
 
 
 def analyze(transcript, notes="", created_at=None):
@@ -1885,14 +1815,21 @@ def analyze(transcript, notes="", created_at=None):
                     "moves to a genuinely different one that a student would file as "
                     "its own note (e.g. 'derivatives of inverse functions' then "
                     "'applications of derivatives'). Segments are CONCEPTS, not "
-                    "examples: several worked problems, asides, or recaps on the same "
-                    "concept all belong to one segment, and a run of small topics that "
-                    "share a theme is ONE segment covering that theme (e.g. assorted "
-                    "application problems = one 'Applications of Derivatives' segment). "
+                    "examples: several worked problems, asides, tangents, off-topic "
+                    "chatter, or recaps on the same concept all belong to one segment. "
+                    "A distinct named technique, method, rule, or theorem that the "
+                    "lecturer introduces and teaches in its own right IS its own segment, "
+                    "even when it shares a unit with what came before (e.g. "
+                    "'antiderivatives' then 'u-substitution' = two segments, both in the "
+                    "Integration unit). Test: if the topic label you'd write needs an "
+                    "'and' to cover what happened (e.g. 'Antiderivatives and "
+                    "u-substitution'), that is TWO segments, not one — split it and give "
+                    "each half its own label.\n"
                     "Lectures often OPEN by reviewing the previous class — an opening "
                     "recap is NEVER its own segment, even when its subject differs from "
                     "today's material: fold it into the first new-material segment.\n"
-                    "Most lectures are 1 segment, sometimes 2 — NEVER more than 3.\n"
+                    "Usually 1-2 segments, sometimes 3 — NEVER more than 4. When torn "
+                    "between one compound segment and two clean ones, SPLIT.\n"
                     "Return ONLY a JSON object with keys: segments, exams.\n"
                     "segments is an array of one object per topic segment, each with "
                     "keys class, unit, topic, summary.\n"
@@ -2103,7 +2040,9 @@ def write_graph_config():
     for i, (sem, c) in enumerate(classes):
         hue = i / n
         fc = drop(st["class_drop_min"], st["class_drop_max"], hue)  # class S/V, faded off full
-        units = sorted(p for p in c.iterdir() if p.is_dir())
+        # Exam Prep is study material, not a unit: it has no hub note, and
+        # counting it shifts the hue spread of every real unit in the class
+        units = sorted(p for p in c.iterdir() if p.is_dir() and p.name != PREP_DIR)
         m = len(units)
         for j, u in enumerate(units):
             hu = hue + st["unit_hue_shift"] * (2 * j / (m - 1) - 1 if m > 1 else 0)
@@ -2224,16 +2163,252 @@ def write_note(row):
     return dest
 
 
+def _rows_semester(rows):
+    """Semester to file under when the caller didn't pick one — every scope
+    selector defaults to 'All semesters', and an empty semester would slug to
+    'Untitled' and strand the note at the vault root, off the graph."""
+    return next((r.get("semester") for r in rows if r.get("semester")), "")
+
+
+def write_prep_note(sem, cls, unit, filename, body, labels=()):
+    """Writes a study artifact into the unit's Exam Prep folder --
+    <vault>/<sem>/<cls>/<unit>/Exam Prep/<filename>, class-level when unit is
+    empty (a scope spanning units). Shared by the cheat-sheet and flashcard
+    exports; quizzes/exams build their own paths since they reuse existing
+    notes. `labels` are the units/topics the material was built from — any exam
+    covering them gets an `Exam:` wikilink. Returns the path (str)."""
+    body += _exam_links(sem, cls, labels or ([unit] if unit else []))
+    base = OBSIDIAN_VAULT / _slug(sem) / _slug(cls)
+    if unit:
+        base = base / _slug(unit)
+    path = base / PREP_DIR / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+def write_cards_note(sem, cls, unit, labels=()):
+    """Readable snapshot of a scope's flashcard deck in its Exam Prep folder.
+    The DB stays the source of truth for SM-2 scheduling — this is rewritten
+    whole on each generation so a second batch doesn't split across notes."""
+    q = sb.table("cards").select("front,back").eq("class", cls)
+    if sem:
+        q = q.eq("semester", sem)
+    if unit:
+        q = q.eq("unit", unit)
+    cards = q.execute().data or []
+    body = (f"---\nclass: {cls}\ntags: [flashcards]\n---\n\n"
+            f"# Flashcards — {unit or cls}\n\n"
+            + "".join(f"- **{c.get('front', '')}** — {c.get('back', '')}\n" for c in cards)
+            + f"\nClass: [[{_slug(sem)}/{_slug(cls)}/{_slug(cls)}|{_slug(cls)}]]\n")
+    return write_prep_note(sem, cls, unit, "Flashcards.md", body, labels)
+
+
+def _migrate_prep_dirs():
+    """One-time rename of the old 'Practice' and 'Exams' folders to PREP_DIR so
+    old and new study notes don't sit in separate folders. Exam notes land in
+    the class-level Exam Prep; _refile_exam_notes then moves them to the unit
+    they cover. ponytail: runs on every import — a no-op once neither name is
+    left under the vault."""
+    if not OBSIDIAN_VAULT.is_dir():
+        return
+    for old in ("Practice", "Exams"):
+        for p in list(OBSIDIAN_VAULT.rglob(old)):
+            if not p.is_dir():
+                continue
+            dest = p.with_name(PREP_DIR)
+            try:
+                if dest.exists():
+                    for f in p.iterdir():
+                        f.replace(dest / f.name)  # same filename = same note, overwrite
+                    p.rmdir()
+                else:
+                    p.rename(dest)
+            except OSError as e:
+                print(f"[listen] {old} -> {PREP_DIR} migration skipped for {p}: {e}")
+
+
+def _refile_exam_notes():
+    """Moves class-level exam notes into the unit their Covers resolve to (1-2
+    units; 3+ stays class-level, see write_exam_note). Exams filed before Covers
+    were matched by word overlap all landed class-level — this lifts them
+    without waiting for the exam to be re-detected in a later lecture."""
+    if not OBSIDIAN_VAULT.is_dir():
+        return
+    for cls_dir in OBSIDIAN_VAULT.glob("*/*"):
+        prep = cls_dir / PREP_DIR
+        if not prep.is_dir():
+            continue
+        labels = _class_labels(cls_dir)
+        s_sem, s_cls = cls_dir.parent.name, cls_dir.name
+        for note, _title, covers in _exam_notes(cls_dir):
+            if not covers:
+                continue  # nothing to resolve
+            try:
+                # Relink Covers in place — bullets written before word-overlap
+                # matching are plain text, so the exam has no graph edges yet.
+                # Covers is the last section write_exam_note emits, so rebuilding
+                # from the heading down loses nothing.
+                head, sep, _ = note.read_text(encoding="utf-8").partition("## Covers")
+                if sep:
+                    bullets = _covers_bullets(covers, s_sem, s_cls, labels)
+                    note.write_text(f"{head}## Covers\n\n{bullets}\n", encoding="utf-8")
+                if note.parent != prep:
+                    continue  # already filed under a unit — relink was the job
+                hit = _exam_units(covers, labels, cls_dir)
+                if 1 <= len(hit) <= 2:
+                    dest = cls_dir / hit[0] / PREP_DIR / note.name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    note.replace(dest)
+            except OSError as e:
+                print(f"[listen] exam refile skipped for {note}: {e}")
+
+
+# --- exam <-> study-material matching -------------------------------------
+# Claude writes an exam's Covers entries as free text ("Relative velocity",
+# "Collisions (elastic and inelastic)"), not as the unit/topic labels it filed
+# the lectures under. On the real vault, exact matching resolved 1 of 3 Covers
+# entries on one exam and 1 of 7 on another — so these match on shared words,
+# the same dupe heuristic the merge panel uses on unit/topic names.
+
+def _kw(s):
+    """Significant words of a label: lowercased, de-pluralized, short words
+    dropped so 'and'/'of' can't create a match."""
+    return {w.rstrip("s") for w in re.split(r"[^a-z0-9]+", (s or "").lower()) if len(w) >= 4}
+
+
+def _class_labels(cls_dir):
+    """{label: unit} for every unit folder and topic note under a class — the
+    vocabulary a free-text Covers entry is resolved against."""
+    labels = {}
+    if not cls_dir.is_dir():
+        return labels
+    for u in cls_dir.iterdir():
+        if not u.is_dir() or u.name == PREP_DIR:
+            continue
+        labels[u.name] = u.name
+        for note in u.glob("*.md"):
+            labels.setdefault(note.stem, u.name)
+    return labels
+
+
+def _match_unit(label, labels):
+    """The unit whose name or topic note shares the most words with `label`,
+    or None when nothing overlaps.
+    ponytail: bag of words, so the commoner word wins an ambiguous phrase —
+    "Angular momentum" lands on Momentum and Collisions, not Rotational Motion.
+    Per-topic embeddings if that starts costing real study time."""
+    words, best, score = _kw(label), None, 0
+    for name, unit in labels.items():
+        n = len(words & _kw(name))
+        if n > score:
+            best, score = unit, n
+    return best
+
+
+def _exam_units(topics, labels, cls_dir):
+    """Units an exam's Covers entries point at, most-covered first. Ties go to
+    the unit touched most recently — the one being studied now."""
+    votes = {}
+    for t in topics:
+        u = _match_unit(t, labels)
+        if u:
+            votes[u] = votes.get(u, 0) + 1
+    return sorted(votes, key=lambda u: (-votes[u], -(cls_dir / u).stat().st_mtime))
+
+
+# "- [[Fall 26/Bio/Cells/Cells|Cells]]" -> "Cells";  "- Vectors" -> "Vectors"
+_COVERS_BULLET = re.compile(r"^- (?:\[\[[^|\]]+\|)?([^\]]+?)\]{0,2}$", re.M)
+
+
+def _covers_bullets(topic_names, s_sem, s_cls, labels):
+    """Covers list for an exam note: each entry links the unit it resolves to
+    (keeping the exam's own wording as the label), so a wide exam shows a graph
+    edge to every unit it spans. Unresolvable entries stay plain bullets."""
+    return "\n".join(
+        f"- [[{s_sem}/{s_cls}/{u}/{u}|{t}]]" if (u := _match_unit(t, labels)) else f"- {t}"
+        for t in topic_names
+    )
+
+
+def _exam_notes(cls_dir):
+    """(path, title, covers) for every exam note filed under this class, unit
+    folders first. Reads the notes back rather than a table: the vault is where
+    exams live (the assignments table holds only dated rows, without topics)."""
+    out = []
+    for note in sorted(cls_dir.glob(f"*/{PREP_DIR}/*.md")) + sorted(cls_dir.glob(f"{PREP_DIR}/*.md")):
+        try:
+            text = note.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "tags: [exam]" not in text:
+            continue  # a quiz/cheatsheet/deck sitting in the same folder
+        covers = _COVERS_BULLET.findall(text.split("## Covers", 1)[1]) if "## Covers" in text else []
+        m = re.search(r"^# (.+)$", text, re.M)
+        out.append((note, m.group(1).strip() if m else note.stem, covers))
+    return out
+
+
+def _exam_links(sem, cls, labels):
+    """An `Exam:` wikilink line for every exam whose Covers overlap `labels`
+    (the units/topics the study material was built from) — the graph edge that
+    hangs a practice quiz or cheat sheet off the midterm it's prep for.
+    Material spanning two exams links to both. "" when nothing matches."""
+    cls_dir = OBSIDIAN_VAULT / _slug(sem) / _slug(cls)
+    if not cls_dir.is_dir():
+        return ""
+    mine = set()
+    for l in labels:
+        mine |= _kw(l)
+    links = []
+    for note, title, covers in _exam_notes(cls_dir):
+        if not any(mine & _kw(c) for c in covers):
+            continue
+        rel = note.relative_to(OBSIDIAN_VAULT).with_suffix("").as_posix()
+        links.append(f"[[{rel}|{title}]]")
+    return f"\nExam: {', '.join(links)}\n" if links else ""
+
+
+def _backfill_prep_links():
+    """Adds the `Exam:` wikilink to study notes filed before exam matching
+    existed. Runs after _refile_exam_notes so links point at each exam's final
+    home. Scope is the note's own unit folder — the finer topic labels aren't
+    recoverable from a written note. ponytail: no-op once every note has a line."""
+    if not OBSIDIAN_VAULT.is_dir():
+        return
+    # both shapes: <sem>/<cls>/Exam Prep (material spanning units) and
+    # <sem>/<cls>/<unit>/Exam Prep
+    for prep in (list(OBSIDIAN_VAULT.glob(f"*/*/{PREP_DIR}"))
+                 + list(OBSIDIAN_VAULT.glob(f"*/*/*/{PREP_DIR}"))):
+        parts = prep.relative_to(OBSIDIAN_VAULT).parts
+        sem, cls = parts[0], parts[1]
+        unit = parts[2] if len(parts) == 4 else ""
+        # class-level notes have no one unit — match on every unit in the class
+        scope = [unit] if unit else [p.name for p in prep.parent.iterdir()
+                                     if p.is_dir() and p.name != PREP_DIR]
+        for note in prep.glob("*.md"):
+            try:
+                text = note.read_text(encoding="utf-8")
+                if "tags: [exam]" in text or "\nExam: " in text:
+                    continue  # an exam itself, or already linked
+                links = _exam_links(sem, cls, scope)
+                if links:
+                    note.write_text(text.rstrip("\n") + "\n" + links, encoding="utf-8")
+            except OSError as e:
+                print(f"[listen] prep link backfill skipped for {note}: {e}")
+
+
 def write_exam_note(sem, cls, exam):
-    """Files a detected/announced exam or quiz under a Practice folder:
-    <vault>/<sem>/<cls>/<unit>/Practice/<title>.md when exactly one 'topics'
-    entry matches an existing unit folder, else class-level
-    <vault>/<sem>/<cls>/Practice/<title>.md. Same title -> same slug ->
+    """Files a detected/announced exam or quiz under the Exam Prep folder:
+    <vault>/<sem>/<cls>/<unit>/Exam Prep/<title>.md when its Covers entries
+    resolve to one or two units, else class-level
+    <vault>/<sem>/<cls>/Exam Prep/<title>.md — a comprehensive final spanning
+    3+ units isn't about any single unit. Same title -> same slug ->
     overwrites in place (an existing note anywhere under this class's
-    Practice folders is reused), so re-detecting an exam across lectures/a
-    revised syllabus is idempotent. A 'topics' entry that exactly matches an
-    existing unit folder links to that unit's hub note; anything else stays a
-    plain bullet. Returns the path (str)."""
+    Exam Prep folders is reused), so re-detecting an exam across lectures/a
+    revised syllabus is idempotent. A 'topics' entry that resolves to a unit
+    links to that unit's hub note; anything else stays a plain bullet.
+    Returns the path (str)."""
     s_sem, s_cls = _slug(sem), _slug(cls)
     # str()-wrap every model-supplied field — same defensiveness as
     # save_assignments' due_date parsing — so malformed JSON from Claude can't
@@ -2246,7 +2421,8 @@ def write_exam_note(sem, cls, exam):
     topics = topics if isinstance(topics, list) else []
 
     cls_dir = OBSIDIAN_VAULT / s_sem / s_cls
-    units = {p.name for p in cls_dir.iterdir() if p.is_dir()} if cls_dir.is_dir() else set()
+    labels = _class_labels(cls_dir)
+    topic_names = [t for t in (str(x).strip() for x in topics) if t]
 
     fm = {"class": cls, "kind": kind, "date": due or "TBA", "tags": "[exam]"}
     front = "\n".join(f"{k}: {v}" for k, v in fm.items())
@@ -2256,24 +2432,20 @@ def write_exam_note(sem, cls, exam):
             f"\nClass: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]\n")
     if fmt:
         body += f"\n**Format:** {fmt}\n"
-    if topics:
-        bullets = "\n".join(
-            f"- [[{s_sem}/{s_cls}/{t}/{t}|{t}]]" if t in units else f"- {t}"
-            for t in (str(x).strip() for x in topics) if t
-        )
-        if bullets:
-            body += f"\n## Covers\n\n{bullets}\n"
+    if topic_names:
+        body += f"\n## Covers\n\n{_covers_bullets(topic_names, s_sem, s_cls, labels)}\n"
 
     fname = f"{_slug(title)}.md"
     # reuse an existing note wherever it already lives so re-detection stays
     # an overwrite even as unit folders appear later
-    path = next(iter(cls_dir.glob(f"*/Practice/{fname}")), None) if cls_dir.is_dir() else None
-    if path is None and (cls_dir / "Practice" / fname).exists():
-        path = cls_dir / "Practice" / fname
+    path = next(iter(cls_dir.glob(f"*/{PREP_DIR}/{fname}")), None) if cls_dir.is_dir() else None
+    if path is None and (cls_dir / PREP_DIR / fname).exists():
+        path = cls_dir / PREP_DIR / fname
     if path is None:
-        matched = [t for t in (str(x).strip() for x in topics) if t in units]
-        # ponytail: exam spanning several units stays class-level; per-unit copies if that grates
-        dest = cls_dir / matched[0] / "Practice" if len(matched) == 1 else cls_dir / "Practice"
+        hit = _exam_units(topic_names, labels, cls_dir)
+        # 1-2 units -> file with the best-matching one; a comprehensive final
+        # spanning 3+ isn't about any single unit, so it stays class-level
+        dest = cls_dir / hit[0] / PREP_DIR if 1 <= len(hit) <= 2 else cls_dir / PREP_DIR
         path = dest / fname
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
@@ -2281,19 +2453,27 @@ def write_exam_note(sem, cls, exam):
 
 
 def write_quiz_note(quiz, questions, results, score):
-    """Files a graded practice quiz/test under
-    <vault>/<sem>/<cls>/<unit>/Practice/<kind> <date> <time> — <score>%.md
-    (class-level Practice when the quiz wasn't scoped to a unit). Mirrors
-    write_exam_note's structure/graph anchor. Returns the path (str)."""
+    """Files a practice quiz/test under
+    <vault>/<sem>/<cls>/<unit>/Exam Prep/<kind> <date> <time>.md
+    (class-level Exam Prep when the quiz wasn't scoped to a unit). Called at
+    generation (score=None -> blank, ungraded) and again at grade time; the
+    filename is derived from the quiz's created_at so both write the same path
+    and grading overwrites the blank. Mirrors write_exam_note's structure/graph
+    anchor. Returns the path (str)."""
     s_sem, s_cls = _slug(quiz.get("semester")), _slug(quiz.get("class"))
     unit = (quiz.get("unit") or "").strip()
     kind = str(quiz.get("kind") or "quiz")
-    now = datetime.datetime.now()
+    ca = quiz.get("created_at")
+    try:
+        now = datetime.datetime.fromisoformat(ca) if ca else datetime.datetime.now()
+    except ValueError:
+        now = datetime.datetime.now()
+    score_label = "ungraded" if score is None else f"{score}%"
 
-    fm = {"class": quiz.get("class") or "", "kind": kind, "score": score,
+    fm = {"class": quiz.get("class") or "", "kind": kind, "score": score_label,
           "date": now.strftime("%Y-%m-%d"), "tags": "[practice]"}
     front = "\n".join(f"{k}: {v}" for k, v in fm.items())
-    body = f"---\n{front}\n---\n\n# {kind.title()} — {score}%\n"
+    body = f"---\n{front}\n---\n\n# {kind.title()} — {score_label}\n"
 
     for i, q in enumerate(questions):
         r = results[i] if i < len(results) else {}
@@ -2314,11 +2494,19 @@ def write_quiz_note(quiz, questions, results, score):
             body += f"\n{'Correct' if r.get('correct') else 'Incorrect'}\n"
 
     body += f"\nClass: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]\n"
+    # questions carry the topic they came from — the scope this practice run covers
+    body += _exam_links(quiz.get("semester"), quiz.get("class"),
+                        [q.get("topic") for q in questions if q.get("topic")] + ([unit] if unit else []))
 
     base = OBSIDIAN_VAULT / s_sem / s_cls
     if unit:
         base = base / _slug(unit)
-    path = base / "Practice" / f"{kind} {now:%Y-%m-%d %H%M} — {score}%.md"
+    path = base / PREP_DIR / f"{kind} {now:%Y-%m-%d %H%M}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return str(path)
+
+
+_migrate_prep_dirs()   # import-time, idempotent — see the function docstring
+_refile_exam_notes()   # ditto — lifts class-level exams to the unit they cover
+_backfill_prep_links()  # ditto — links older study notes to the exams they prep for

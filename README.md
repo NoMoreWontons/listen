@@ -29,10 +29,6 @@ the local FastAPI server holds the service key and does all the work. See
    class/unit's filed notes — multiple choice graded instantly, short answers
    graded by Claude. Past quizzes are saved with scores.
 
-**Notion fallback (optional):** if `NOTION_TOKEN` is set, the server polls one Notion
-database for AI meeting-note pages, pulls the transcript, runs the same
-summarise + label + file pipeline, and tags those rows `source = notion`.
-
 Supabase is a write-only sync backend (share notes across devices); Obsidian is for
 everyday use. Editing a note never writes back to Supabase.
 
@@ -62,7 +58,7 @@ Agent-runnable install — assumes `.env` already holds real keys:
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt        # Windows path; use .venv/bin on POSIX
 # Apply schema.sql to Supabase (SQL editor, or the Supabase MCP apply_migration).
-python test_sweep.py && python test_note.py && python test_notion.py && python test_model_stall.py
+python test_sweep.py && python test_note.py && python test_model_stall.py
 .venv/Scripts/python -m uvicorn app:app              # serves http://127.0.0.1:8000
 ```
 
@@ -80,14 +76,6 @@ is a multi-GB download; set `WHISPER_MODEL=tiny` for a fast first run.
 | `RETENTION_DAYS` | no | default `7` — how long local audio is kept |
 | `OBSIDIAN_VAULT` | no | default `~/College Lectures`; folder notes are written to |
 | `SEMESTER_OVERRIDE` | no | blank = auto from date; set e.g. `Bridge` to force the semester label on new recordings |
-| `NOTION_TOKEN` | no | enables the Notion fallback; empty = feature off |
-| `NOTION_DB_ID` | no | the Notion database polled for AI meeting notes |
-| `NOTION_POLL_MIN` | no | default `10` — minutes between Notion polls |
-
-**Notion setup:** create an internal integration at
-https://www.notion.so/my-integrations, copy its secret into `NOTION_TOKEN`, then share
-the target database with that integration (page `···` → Connections). Put the database
-id in `NOTION_DB_ID`.
 
 ## Notes
 
@@ -96,7 +84,7 @@ id in `NOTION_DB_ID`.
 - **Audio** is local-only under `audio/`, auto-deleted after `RETENTION_DAYS` (swept
   on launch). Transcripts live in Supabase + Obsidian.
 - **Checks:** `python test_sweep.py` (retention), `python test_note.py` (Obsidian
-  filing), `python test_notion.py` (Notion block flatten), `python test_model_stall.py`
+  filing), `python test_model_stall.py`
   (model warm-up), `python test_hw.py` (upload block sniffing), `python test_quiz.py`
   (MCQ grading), `python test_yt.py` (YouTube URL gate).
 
