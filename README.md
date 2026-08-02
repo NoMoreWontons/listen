@@ -76,6 +76,7 @@ is a multi-GB download; set `WHISPER_MODEL=tiny` for a fast first run.
 | `RETENTION_DAYS` | no | default `7` — how long local audio is kept |
 | `OBSIDIAN_VAULT` | no | default `~/College Lectures`; folder notes are written to |
 | `SEMESTER_OVERRIDE` | no | blank = auto from date; set e.g. `Bridge` to force the semester label on new recordings |
+| `MODEL_LOAD_STALL_S` | no | default `300` — abort the Whisper model load if download progress stalls this long |
 
 ## Notes
 
