@@ -37,8 +37,31 @@ OBSIDIAN_VAULT = pathlib.Path(
 # the scope spans units). Was "Practice"; _migrate_prep_dirs renames old ones.
 PREP_DIR = "Exam Prep"
 
+# Shared by every prompt that may draw a diagram (lecture summaries, cheat
+# sheets). Obsidian renders mermaid fences natively and so does the in-app
+# view; a syntax error renders as an error box, which is worse than the prose
+# it replaced, so the syntax rules are deliberately narrow — one diagram type,
+# every label quoted. Widen only if the model proves it can stay valid.
+DIAGRAM_RULES = (
+    "Draw diagrams as ```mermaid fenced code blocks using `flowchart TD` or "
+    "`flowchart LR` — that one type covers concept maps, hierarchies, process "
+    "steps, and 'which method do I use' decision trees.\n"
+    "Mermaid syntax is strict. Every node label MUST be a double-quoted string: "
+    'A["kinetic friction"] --> B["opposes sliding"]. Never put LaTeX, backticks, '
+    "or a semicolon inside a label; keep labels under 40 characters and use plain "
+    "words rather than math notation. Use `-->` for arrows and `-- \"text\" -->` "
+    "for a labelled arrow. Do not use subgraphs, styling, or click handlers.\n"
+)
+
 sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 claude = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
+
+
+def _text(msg):
+    """The reply text. content[0] is not always it: Sonnet leads with a
+    ThinkingBlock (no .text at all) and a web-search call interleaves result
+    blocks — so join the text blocks and skip everything else."""
+    return "".join(b.text for b in msg.content if getattr(b, "type", "text") == "text").strip()
 
 
 def audio_path(rid):
@@ -547,7 +570,7 @@ async def ocr(request: Request, filename: str = ""):
                 "ONLY the transcription."
             )}]}],
         )
-        return {"text": msg.content[0].text.strip()}
+        return {"text": _text(msg)}
     except Exception as e:
         return {"error": f"transcription failed: {e}"}
 
@@ -1012,7 +1035,7 @@ def generate_quiz(rows, kind="quiz", fmt="mcq"):
         model="claude-haiku-4-5", max_tokens=6000,
         messages=[{"role": "user", "content": ask + "Notes:\n" + material}],
     )
-    raw = msg.content[0].text.strip()
+    raw = _text(msg)
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
 
@@ -1090,7 +1113,7 @@ def grade_short(questions, results):
             '"feedback": "one sentence"}. Full credit for capturing the idea in the '
             "student's own words; half for partially right.\n\n" + listing)}],
     )
-    raw = re.sub(r"^```(?:json)?|```$", "", msg.content[0].text.strip(), flags=re.MULTILINE).strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", _text(msg), flags=re.MULTILINE).strip()
     try:
         by_i = {g.get("i"): g for g in json.loads(raw)}
     except (json.JSONDecodeError, AttributeError, TypeError):
@@ -1125,7 +1148,7 @@ def grade_frq(questions, files):
             'in order: {"i": <question number>, "score": <0, 0.5 or 1>, "feedback": "1-2 '
             'sentences", "transcription": "student\'s answer, briefly"}.\n\n' + listing)}]}],
     )
-    raw = re.sub(r"^```(?:json)?|```$", "", msg.content[0].text.strip(), flags=re.MULTILINE).strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", _text(msg), flags=re.MULTILINE).strip()
     try:
         by_i = {g.get("i"): g for g in json.loads(raw)}
     except (json.JSONDecodeError, AttributeError, TypeError):
@@ -1208,7 +1231,7 @@ def ask_notes(payload: dict = Body(...)):
         )
     except Exception as e:  # match quiz_generate: surface as JSON, not a 500
         return {"error": f"ask failed: {e}"}
-    raw = msg.content[0].text.strip()
+    raw = _text(msg)
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
     try:
         parsed = json.loads(raw)
@@ -1323,8 +1346,6 @@ def study_generate(payload: dict = Body(...)):
 
     units = {s["unit"] for s in scopes}
     unit = next(iter(units)) if len(units) == 1 else None
-    # every unit/topic the material draws on — what exam matching is done against
-    labels = sorted(units | {r.get("topic") for r in rows if r.get("topic")})
 
     if kind in ("quiz", "test"):
         try:
@@ -1355,12 +1376,15 @@ def study_generate(payload: dict = Body(...)):
         if not valid:
             return {"error": "no usable cards generated"}
         sb.table("cards").insert(valid).execute()
-        return {"count": len(valid), "path": write_cards_note(sem, cls, unit or "", labels)}
+        return {"count": len(valid), "path": write_cards_note(sem, cls, unit or "")}
 
-    md = build_cheatsheet(rows, cls, unit or "")
+    try:
+        md = build_cheatsheet(rows, cls, unit or "")
+    except Exception as e:
+        return {"error": f"generation failed: {e}"}
     fname = _slug(f"{cls} {unit or ''}".strip()) + " cheatsheet.md"
     # filed in the vault (opens in Obsidian) as well as returned for the in-app view
-    path = write_prep_note(sem, cls, unit or "", fname, md, labels)
+    path = write_prep_note(sem, cls, unit or "", fname, md)
     return {"filename": fname, "markdown": md,
             "path": path, "obsidian": _obsidian_uri(path)}
 
@@ -1396,7 +1420,7 @@ def generate_cards(rows, n=15):
             "Cover the breadth of the material; keep each side concise.\n\n"
             "Notes:\n" + material)}],
     )
-    raw = re.sub(r"^```(?:json)?|```$", "", msg.content[0].text.strip(), flags=re.MULTILINE).strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", _text(msg), flags=re.MULTILINE).strip()
     return json.loads(raw)
 
 
@@ -1492,12 +1516,33 @@ def cards_due_ics():
 # --- cheat-sheet export (one-page markdown) ---
 
 def build_cheatsheet(rows, cls, unit):
-    """One markdown study sheet from filed-note summaries. Pure/testable."""
-    head = f"# {cls}" + (f" — {unit}" if unit else "")
-    body = "\n\n".join(
-        f"## {r.get('topic') or r.get('title') or 'Untitled'}\n\n{(r.get('summary') or '').strip()}"
+    """One Claude call: a scannable one-page study sheet — tables and diagrams
+    rather than the wall of bullets that concatenating every lecture summary
+    produced. Raises on API failure so the caller can surface it, matching
+    generate_quiz/generate_cards."""
+    material = "\n\n".join(
+        f"## {r.get('topic') or r.get('title') or 'Untitled'}\n{(r.get('summary') or '').strip()}"
         for r in rows if (r.get("summary") or "").strip())
-    return f"{head}\n\n{body}\n"
+    head = f"# {cls}" + (f" — {unit}" if unit else "")
+    msg = claude.messages.create(
+        model="claude-sonnet-5", max_tokens=4000,
+        messages=[{"role": "user", "content": (
+            "Condense these college lecture notes into ONE cheat sheet a student "
+            f"can scan the night before an exam. Start it with the title '{head}'.\n"
+            "A cheat sheet SELECTS — it is not a summary of everything. Keep only "
+            "what is most likely to be tested; cut recaps, logistics, and anything "
+            "that restates a neighbour. Target one printed page: 6 sections at most.\n"
+            "Make it visual. Almost every section should be a table or a diagram:\n"
+            "- formulas as a table: | Quantity | Formula | When to use |\n"
+            "- contrasts as a comparison table, one row per property\n"
+            "- relationships, procedures, and method-choice as flowcharts\n"
+            "Use bullets only where neither fits, never more than 4 in a row, one "
+            "line each. No worked examples and no question-and-answer transcripts.\n"
+            "Write math as LaTeX ($...$ inline, $$...$$ display).\n" + DIAGRAM_RULES +
+            "Return ONLY the cheat sheet markdown, starting with the title. Do not "
+            "wrap your reply in a code fence.\n\nNotes:\n" + material)}],
+    )
+    return _text(msg) + "\n"
 
 
 @app.get("/cheatsheet")
@@ -1515,7 +1560,10 @@ def cheatsheet(class_: str = Query("", alias="class"), unit: str = "", semester:
         q = q.eq("unit", unit)
     rows = q.execute().data
     sem = sem or _rows_semester(rows)
-    md = build_cheatsheet(rows, cls, unit)
+    try:
+        md = build_cheatsheet(rows, cls, unit)
+    except Exception as e:
+        return Response(f"generation failed: {e}", media_type="text/plain", status_code=502)
     fname = _slug(f"{cls} {unit}".strip()) + " cheatsheet.md"
     write_prep_note(sem, cls, unit, fname, md)  # file it, then serve the download
     return Response(md, media_type="text/markdown",
@@ -1675,7 +1723,7 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
             ],
         }],
     )
-    raw = msg.content[0].text.strip()
+    raw = _text(msg)
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
     def txt(v):
         # model sometimes returns a bullet list as a JSON array — flatten to markdown
@@ -1843,7 +1891,13 @@ def analyze(transcript, notes="", created_at=None):
                     "that class's own note); omit the section if there was no recap. "
                     "Then concise key points and any action items "
                     "as a bullet list — built from the LECTURER's material; ignore student "
-                    "chatter unless the lecturer engages it. Then, if the lecturer worked "
+                    "chatter unless the lecturer engages it. Where a picture carries an "
+                    "idea better than a paragraph — how concepts relate, the steps of a "
+                    "procedure, a classification, a cause-and-effect chain, or a diagram "
+                    "the lecturer drew on the board — draw it instead of describing it. "
+                    "At most two diagrams per summary, and none at all if the material "
+                    "genuinely isn't visual.\n" + DIAGRAM_RULES +
+                    "Then, if the lecturer worked "
                     "through any in-class problems or examples in this segment, append a "
                     "'## Worked examples' section: one '### <short problem name>' per "
                     "problem with the problem statement, the key solution steps, and the "
@@ -1872,7 +1926,7 @@ def analyze(transcript, notes="", created_at=None):
             }
         ],
     )
-    raw = msg.content[0].text.strip()
+    raw = _text(msg)
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
     segments = _parse_segments(raw)
     exams = _parse_exams(raw)
@@ -1964,7 +2018,7 @@ def _hub_desc(kind, name, context):
         msg = claude.messages.create(
             model="claude-haiku-4-5", max_tokens=300,
             messages=[{"role": "user", "content": prompt}])
-    return "".join(b.text for b in msg.content if b.type == "text").strip()
+    return _text(msg)
 
 
 def ensure_hubs(row):
@@ -1995,12 +2049,38 @@ def ensure_hubs(row):
             f"# {unit}\n\n{desc}\n\nClass: [[{sem}/{cls}/{cls}|{cls}]]\n", encoding="utf-8")
 
 
+def _prep_hub(sem, cls, unit=""):
+    """Hub note for a class's (or unit's) Exam Prep folder, so study material is
+    its own node in the graph: quiz/cheat sheet -> Exam Prep -> unit -> class.
+    Written once, like the other hubs. Returns the vault-relative link target."""
+    s_sem, s_cls, s_unit = _slug(sem), _slug(cls), _slug(unit)
+    base = OBSIDIAN_VAULT / s_sem / s_cls
+    rel = f"{s_sem}/{s_cls}"
+    if s_unit:
+        base, rel = base / s_unit, f"{rel}/{s_unit}"
+    rel = f"{rel}/{PREP_DIR}/{PREP_DIR}"
+    hub = base / PREP_DIR / f"{PREP_DIR}.md"
+    if not hub.exists():
+        up = (f"Unit: [[{s_sem}/{s_cls}/{s_unit}/{s_unit}|{s_unit}]]" if s_unit
+              else f"Class: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]")
+        hub.parent.mkdir(parents=True, exist_ok=True)
+        hub.write_text(f"# {PREP_DIR}\n\nPractice quizzes and tests, cheat sheets, "
+                       f"and flashcard decks.\n\n{up}\n", encoding="utf-8")
+    return rel
+
+
+def _prep_hub_link(sem, cls, unit=""):
+    """The `Exam Prep:` line study material carries, creating the hub if needed."""
+    return f"\nExam Prep: [[{_prep_hub(sem, cls, unit)}|{PREP_DIR}]]\n"
+
+
 def _rgb(h, s, v):
     import colorsys
     r, g, b = colorsys.hsv_to_rgb(h % 1.0, min(max(s, 0), 1), min(max(v, 0), 1))
     return (int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255)
 
 
+PREP_COLOR = 0xE0A33C   # amber: study material, distinct from every class hue
 GRAPH_SETTINGS_FILE = pathlib.Path(__file__).with_name("graph_settings.json")
 GRAPH_DEFAULTS = {                 # all fractions of 1; the app UI shows them as %
     "class_drop_min": 0.20, "class_drop_max": 0.30,  # class hubs: S/V faded this much off full
@@ -2031,7 +2111,12 @@ def write_graph_config():
     warmth = lambda h: (math.cos((h % 1.0 - 1 / 12) * 2 * math.pi) + 1) / 2  # 1 at red-orange, 0 at azure
     drop = lambda lo, hi, h: 1 - (lo + (hi - lo) * warmth(h))
     jitter = lambda name, rng: ((zlib.crc32(name.encode()) % 2001) / 1000 - 1) * rng  # stable ±rng
-    groups = []
+    # Study material reads as one family vault-wide, so Exam Prep gets a single
+    # fixed colour rather than a per-class hue. First in the list: Obsidian takes
+    # the first matching group (that's why the unit hub query precedes its
+    # folder query below), and the class/topic queries also match these paths.
+    # Trailing slash keeps a unit legitimately named "Exam Preparation" out.
+    groups = [{"query": f'path:"{PREP_DIR}/"', "color": {"a": 1, "rgb": PREP_COLOR}}]
     sems = sorted(d for d in OBSIDIAN_VAULT.iterdir()
                   if d.is_dir() and not d.name.startswith("."))
     classes = [(sem, c) for sem in sems
@@ -2170,14 +2255,13 @@ def _rows_semester(rows):
     return next((r.get("semester") for r in rows if r.get("semester")), "")
 
 
-def write_prep_note(sem, cls, unit, filename, body, labels=()):
+def write_prep_note(sem, cls, unit, filename, body):
     """Writes a study artifact into the unit's Exam Prep folder --
     <vault>/<sem>/<cls>/<unit>/Exam Prep/<filename>, class-level when unit is
     empty (a scope spanning units). Shared by the cheat-sheet and flashcard
     exports; quizzes/exams build their own paths since they reuse existing
-    notes. `labels` are the units/topics the material was built from — any exam
-    covering them gets an `Exam:` wikilink. Returns the path (str)."""
-    body += _exam_links(sem, cls, labels or ([unit] if unit else []))
+    notes. Returns the path (str)."""
+    body += _prep_hub_link(sem, cls, unit)
     base = OBSIDIAN_VAULT / _slug(sem) / _slug(cls)
     if unit:
         base = base / _slug(unit)
@@ -2187,7 +2271,7 @@ def write_prep_note(sem, cls, unit, filename, body, labels=()):
     return str(path)
 
 
-def write_cards_note(sem, cls, unit, labels=()):
+def write_cards_note(sem, cls, unit):
     """Readable snapshot of a scope's flashcard deck in its Exam Prep folder.
     The DB stays the source of truth for SM-2 scheduling — this is rewritten
     whole on each generation so a second batch doesn't split across notes."""
@@ -2201,7 +2285,7 @@ def write_cards_note(sem, cls, unit, labels=()):
             f"# Flashcards — {unit or cls}\n\n"
             + "".join(f"- **{c.get('front', '')}** — {c.get('back', '')}\n" for c in cards)
             + f"\nClass: [[{_slug(sem)}/{_slug(cls)}/{_slug(cls)}|{_slug(cls)}]]\n")
-    return write_prep_note(sem, cls, unit, "Flashcards.md", body, labels)
+    return write_prep_note(sem, cls, unit, "Flashcards.md", body)
 
 
 def _migrate_prep_dirs():
@@ -2245,21 +2329,24 @@ def _refile_exam_notes():
             if not covers:
                 continue  # nothing to resolve
             try:
-                # Relink Covers in place — bullets written before word-overlap
-                # matching are plain text, so the exam has no graph edges yet.
-                # Covers is the last section write_exam_note emits, so rebuilding
-                # from the heading down loses nothing.
+                # Move first, so the hub link below points at the folder the
+                # exam actually ends up in.
+                if note.parent == prep:
+                    hit = _exam_units(covers, labels, cls_dir)
+                    if 1 <= len(hit) <= 2:
+                        dest = cls_dir / hit[0] / PREP_DIR / note.name
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        note.replace(dest)
+                        note = dest
+                # Rebuild from '## Covers' down — bullets written before word-
+                # overlap matching are plain text, so the exam has no graph edges
+                # yet, and the Exam Prep hub link is the section that follows.
                 head, sep, _ = note.read_text(encoding="utf-8").partition("## Covers")
                 if sep:
-                    bullets = _covers_bullets(covers, s_sem, s_cls, labels)
-                    note.write_text(f"{head}## Covers\n\n{bullets}\n", encoding="utf-8")
-                if note.parent != prep:
-                    continue  # already filed under a unit — relink was the job
-                hit = _exam_units(covers, labels, cls_dir)
-                if 1 <= len(hit) <= 2:
-                    dest = cls_dir / hit[0] / PREP_DIR / note.name
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    note.replace(dest)
+                    unit = note.parent.parent.name if note.parent.parent != cls_dir else ""
+                    note.write_text(
+                        f"{head}## Covers\n\n{_covers_bullets(covers)}\n"
+                        + _prep_hub_link(s_sem, s_cls, unit), encoding="utf-8")
             except OSError as e:
                 print(f"[listen] exam refile skipped for {note}: {e}")
 
@@ -2321,14 +2408,12 @@ def _exam_units(topics, labels, cls_dir):
 _COVERS_BULLET = re.compile(r"^- (?:\[\[[^|\]]+\|)?([^\]]+?)\]{0,2}$", re.M)
 
 
-def _covers_bullets(topic_names, s_sem, s_cls, labels):
-    """Covers list for an exam note: each entry links the unit it resolves to
-    (keeping the exam's own wording as the label), so a wide exam shows a graph
-    edge to every unit it spans. Unresolvable entries stay plain bullets."""
-    return "\n".join(
-        f"- [[{s_sem}/{s_cls}/{u}/{u}|{t}]]" if (u := _match_unit(t, labels)) else f"- {t}"
-        for t in topic_names
-    )
+def _covers_bullets(topic_names):
+    """Covers list for an exam note: plain bullets. These used to wikilink the
+    unit each entry resolved to, but a wide exam then fanned an edge out to
+    every unit it spanned and the graph stopped reading as the folder tree.
+    Matching still happens — it decides which folder the exam is filed in."""
+    return "\n".join(f"- {t}" for t in topic_names)
 
 
 def _exam_notes(cls_dir):
@@ -2349,31 +2434,14 @@ def _exam_notes(cls_dir):
     return out
 
 
-def _exam_links(sem, cls, labels):
-    """An `Exam:` wikilink line for every exam whose Covers overlap `labels`
-    (the units/topics the study material was built from) — the graph edge that
-    hangs a practice quiz or cheat sheet off the midterm it's prep for.
-    Material spanning two exams links to both. "" when nothing matches."""
-    cls_dir = OBSIDIAN_VAULT / _slug(sem) / _slug(cls)
-    if not cls_dir.is_dir():
-        return ""
-    mine = set()
-    for l in labels:
-        mine |= _kw(l)
-    links = []
-    for note, title, covers in _exam_notes(cls_dir):
-        if not any(mine & _kw(c) for c in covers):
-            continue
-        rel = note.relative_to(OBSIDIAN_VAULT).with_suffix("").as_posix()
-        links.append(f"[[{rel}|{title}]]")
-    return f"\nExam: {', '.join(links)}\n" if links else ""
-
-
-def _backfill_prep_links():
-    """Adds the `Exam:` wikilink to study notes filed before exam matching
-    existed. Runs after _refile_exam_notes so links point at each exam's final
-    home. Scope is the note's own unit folder — the finer topic labels aren't
-    recoverable from a written note. ponytail: no-op once every note has a line."""
+def _prune_exam_links():
+    """Strips the cross-links that used to fan arrows across the graph: the
+    `Exam:` line study material carried (one link per exam covering its scope)
+    and the unit wikilinks inside an exam's `## Covers` bullets. What's left is
+    the containment chain — material -> Exam Prep -> unit -> class -> semester —
+    so the graph reads as the folder tree. Also creates any missing Exam Prep
+    hub note, the one link the material keeps. ponytail: rewrites in place on
+    import, a no-op once every note under a prep folder is already plain."""
     if not OBSIDIAN_VAULT.is_dir():
         return
     # both shapes: <sem>/<cls>/Exam Prep (material spanning units) and
@@ -2383,19 +2451,19 @@ def _backfill_prep_links():
         parts = prep.relative_to(OBSIDIAN_VAULT).parts
         sem, cls = parts[0], parts[1]
         unit = parts[2] if len(parts) == 4 else ""
-        # class-level notes have no one unit — match on every unit in the class
-        scope = [unit] if unit else [p.name for p in prep.parent.iterdir()
-                                     if p.is_dir() and p.name != PREP_DIR]
+        _prep_hub(sem, cls, unit)  # every prep folder gets its graph node
         for note in prep.glob("*.md"):
             try:
                 text = note.read_text(encoding="utf-8")
-                if "tags: [exam]" in text or "\nExam: " in text:
-                    continue  # an exam itself, or already linked
-                links = _exam_links(sem, cls, scope)
-                if links:
-                    note.write_text(text.rstrip("\n") + "\n" + links, encoding="utf-8")
+                # the hub link is "Exam Prep: ", which this pattern doesn't touch
+                out = re.sub(r"\nExam: [^\n]*\n", "", text)
+                head, sep, covers = out.partition("## Covers")
+                if sep:  # unlink the bullets, keeping the exam's own wording
+                    out = head + sep + _COVERS_BULLET.sub(r"- \1", covers)
+                if out != text:
+                    note.write_text(out, encoding="utf-8")
             except OSError as e:
-                print(f"[listen] prep link backfill skipped for {note}: {e}")
+                print(f"[listen] exam-link prune skipped for {note}: {e}")
 
 
 def write_exam_note(sem, cls, exam):
@@ -2433,8 +2501,7 @@ def write_exam_note(sem, cls, exam):
     if fmt:
         body += f"\n**Format:** {fmt}\n"
     if topic_names:
-        body += f"\n## Covers\n\n{_covers_bullets(topic_names, s_sem, s_cls, labels)}\n"
-
+        body += f"\n## Covers\n\n{_covers_bullets(topic_names)}\n"
     fname = f"{_slug(title)}.md"
     # reuse an existing note wherever it already lives so re-detection stays
     # an overwrite even as unit folders appear later
@@ -2447,6 +2514,9 @@ def write_exam_note(sem, cls, exam):
         # spanning 3+ isn't about any single unit, so it stays class-level
         dest = cls_dir / hit[0] / PREP_DIR if 1 <= len(hit) <= 2 else cls_dir / PREP_DIR
         path = dest / fname
+    # the hub the exam hangs off depends on where it landed (unit or class level)
+    landed_unit = path.parent.parent.name if path.parent.parent != cls_dir else ""
+    body += _prep_hub_link(sem, cls, landed_unit)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return str(path)
@@ -2494,9 +2564,7 @@ def write_quiz_note(quiz, questions, results, score):
             body += f"\n{'Correct' if r.get('correct') else 'Incorrect'}\n"
 
     body += f"\nClass: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]\n"
-    # questions carry the topic they came from — the scope this practice run covers
-    body += _exam_links(quiz.get("semester"), quiz.get("class"),
-                        [q.get("topic") for q in questions if q.get("topic")] + ([unit] if unit else []))
+    body += _prep_hub_link(quiz.get("semester"), quiz.get("class"), unit)
 
     base = OBSIDIAN_VAULT / s_sem / s_cls
     if unit:
@@ -2509,4 +2577,4 @@ def write_quiz_note(quiz, questions, results, score):
 
 _migrate_prep_dirs()   # import-time, idempotent — see the function docstring
 _refile_exam_notes()   # ditto — lifts class-level exams to the unit they cover
-_backfill_prep_links()  # ditto — links older study notes to the exams they prep for
+_prune_exam_links()    # ditto — strips old exam cross-links, keeps the hub chain

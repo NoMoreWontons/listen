@@ -85,6 +85,12 @@ def fake_cards_msg(**kw):
     return FakeMsg('[{"front":"f1","back":"b1"}]')
 
 
+def fake_sheet_msg(**kw):
+    """build_cheatsheet returns the model's markdown verbatim — mermaid fences
+    and all — so the stub carries one, to catch any future fence-stripping."""
+    return FakeMsg('# Biology\n\n```mermaid\nflowchart TD\n  A["cell"] --> B["mitosis"]\n```')
+
+
 # --- _scope_rows: pure, no DB ---
 
 def test_scope_rows():
@@ -193,13 +199,17 @@ def test_cheatsheet():
     with tempfile.TemporaryDirectory() as d:
         app.OBSIDIAN_VAULT = pathlib.Path(d)
         app.sb = FakeSB([mkrow("Cells", "Mitosis", summary="Mitosis is cell division.")])
+        app.claude.messages.create = fake_sheet_msg
         out = app.study_generate({"kind": "cheatsheet", "class": "Biology", "scopes": [{"unit": "Cells"}]})
         assert out["filename"] == "Biology Cells cheatsheet.md", out
-        assert "# Biology" in out["markdown"] and "Mitosis is cell division." in out["markdown"], out
+        assert "# Biology" in out["markdown"] and "```mermaid" in out["markdown"], out
         p = pathlib.Path(out["path"])
         assert p == (pathlib.Path(d) / "Untitled" / "Biology" / "Cells" / app.PREP_DIR
                      / "Biology Cells cheatsheet.md"), p
-        assert p.read_text(encoding="utf-8") == out["markdown"]
+        # the filed note is the sheet plus the vault links write_prep_note appends
+        text = p.read_text(encoding="utf-8")
+        assert text.startswith(out["markdown"].rstrip("\n")), text
+        assert f"{app.PREP_DIR}: [[" in text, text
         # in-app view opens the same note in Obsidian
         assert out["obsidian"].startswith("obsidian://open"), out
     print("ok: cheatsheet returns markdown and files a copy under Exam Prep")
@@ -230,6 +240,7 @@ def test_semester_falls_back_to_rows():
         rows = [dict(mkrow("Cells", "Mitosis", summary="Mitosis is cell division."),
                      semester="Fall 26")]
         app.sb = FakeSB(rows)
+        app.claude.messages.create = fake_sheet_msg
         out = app.study_generate({"kind": "cheatsheet", "class": "Biology",
                                   "scopes": [{"unit": "Cells"}]})
         assert pathlib.Path(out["path"]).parent == (

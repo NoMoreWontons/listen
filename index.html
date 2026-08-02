@@ -653,9 +653,56 @@
   .md ul, .md ol { margin: var(--s1) 0 var(--s2); padding-left: 1.3rem; }
   .md p { margin: var(--s1) 0; }
   .md .katex-display { overflow-x: auto; }
+  /* cheat sheets lean on tables — formulas, comparisons — so they need to read */
+  .md table { border-collapse: collapse; margin: var(--s2) 0; font-size: var(--t-sm); }
+  .md th, .md td { border: 1px solid var(--rail-dark); padding: var(--s1) var(--s2); text-align: left; }
+  .md th { background: var(--rail-soft); }
+  .md .mermaid { overflow-x: auto; margin: var(--s2) 0; }
+  /* max-width only ever shrinks — mermaid renders at natural size (useMaxWidth
+     off), so this caps an oversized diagram without stretching a small one */
+  .md .mermaid svg { max-width: 100%; height: auto; }
+
+  /* ---- cheat sheet: a document, not a sidebar card. Full page width so the
+     formula tables and diagrams have room, and printable — that's what a cheat
+     sheet is for. ---- */
+  #sheetArea:empty { display: none; }
+  #sheetArea { margin-top: var(--s5); }
+  .sheet { max-width: 1100px; margin: 0 auto var(--s3); }
+  .sheet .md { column-gap: var(--s5); }
+  @media (min-width: 1100px) { .sheet .md { columns: 2; } }
+  /* a table or diagram split down the middle of a column break is unreadable */
+  .sheet .md table, .sheet .md .mermaid, .sheet .md pre { break-inside: avoid; }
+  .sheet .md h2, .sheet .md h3 { break-after: avoid; }
+  .sheet .md > h1 { column-span: all; }
+  /* .wide is set in drawDiagrams — only diagrams that would shrink past
+     legibility break out of the column (see the comment there) */
+  .sheet .md .mermaid { text-align: center; }
+  .sheet .md .mermaid.wide { column-span: all; }
+  .cs-actions { display: flex; gap: var(--s3); align-items: baseline; font-size: var(--t-sm); }
+  .cs-actions button, .cs-actions a {
+    border: none; background: none; padding: 0; cursor: pointer;
+    font: inherit; color: var(--ink-soft); text-decoration: underline dotted;
+  }
+  @media print {
+    /* direct children only, so the sheet's own contents are untouched.
+       !important because .main/.brand set display at higher specificity. */
+    body > * { display: none !important; }
+    #sheetArea { display: block !important; margin: 0; }
+    .sheet { max-width: none; border: none; padding: 0; }
+    .sheet .quiz-head { display: none; }     /* Download/Print/close belong on screen, not on paper */
+  }
   details summary { cursor: pointer; font-size: var(--t-sm); color: var(--ink-soft); margin-top: var(--s2); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+// useMaxWidth:false — the default stretches every diagram to the container, which
+// blows up a tall/narrow decision tree and shrinks a wide one to unreadable.
+// Natural size + an overflow-x container keeps both legible.
+if (window.mermaid) mermaid.initialize({
+  startOnLoad: false, theme: 'neutral', flowchart: { useMaxWidth: false },
+});
+</script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.css">
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/contrib/auto-render.min.js"></script>
@@ -693,6 +740,8 @@
   </div>
   <canvas id="wave" aria-hidden="true"></canvas>
 </section>
+
+<div id="sheetArea"></div>
 
 <div class="main">
   <section class="sessions">
@@ -923,6 +972,33 @@ function typeset(el) {
     delimiters: [{ left: '$$', right: '$$', display: true }, { left: '$', right: '$', display: false }],
     throwOnError: false,
   });
+  drawDiagrams(el);  // after katex, which skips <code> — so the source is still there
+}
+let diagramN = 0;
+// marked leaves a ```mermaid fence as <code class="language-mermaid">; swap each
+// for its rendered svg. md() escapes before marked, and marked escapes code text
+// again, so the source comes back one entity layer deep — decode it before parsing.
+async function drawDiagrams(el) {
+  if (!window.mermaid) return;
+  for (const code of el.querySelectorAll('code.language-mermaid')) {
+    const src = new DOMParser().parseFromString(code.textContent, 'text/html')
+      .documentElement.textContent;
+    try {
+      const { svg } = await mermaid.render('mmd' + (++diagramN), src);
+      const box = document.createElement('div');
+      box.className = 'mermaid';
+      box.innerHTML = svg;
+      (code.closest('pre') || code).replaceWith(box);
+      // In the two-column cheat-sheet layout a diagram shrinks to fit its
+      // column. Past ~1.5x the column that's too small to read, so those break
+      // out across both columns instead; the rest stay inline and keep it dense.
+      const natural = box.querySelector('svg')?.getBBox().width || 0;
+      if (natural > box.clientWidth * 1.5) box.classList.add('wide');
+    } catch (e) {
+      // bad syntax from the model — leave the source visible, it still reads
+      document.getElementById('dmmd' + diagramN)?.remove();  // mermaid's error stub
+    }
+  }
 }
 function escAttr(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
@@ -1554,26 +1630,33 @@ async function genStudy(kind, itemEl, fmt = 'mcq') {
   } finally { genBusy = false; closeTreeMenu(); }
 }
 
-// Cheat sheets render in the quiz area (one card per class), each with a download
-// and an Obsidian-open link. The note is already filed under the class's Exam Prep.
+// Cheat sheets get the full page width (#sheetArea, above .main) rather than the
+// narrow sessions column — they're documents, with tables and diagrams that need
+// the room. One card per class; the note is already filed under its Exam Prep.
 function renderCheatsheets(list) {
-  const area = document.getElementById('quizArea');
-  area.innerHTML = `<div class="quiz-head"><b>Cheat sheet${list.length > 1 ? 's' : ''}</b>`
-    + `<button onclick="closeQuiz()" title="Close">&#10005;</button></div>`;
+  const area = document.getElementById('sheetArea');
+  area.innerHTML = '';
   for (const { cls, resp } of list) {
     const card = document.createElement('div');
-    card.className = 'quiz cheatsheet';
+    card.className = 'quiz cheatsheet sheet';
     card.innerHTML = `<div class="quiz-head"><b>${esc(cls)}</b><span class="cs-actions">`
       + (resp.obsidian ? `<a href="${escAttr(resp.obsidian)}">Open in Obsidian</a>` : '')
+      + `<button onclick="closeSheets()" title="Close">&#10005;</button>`
       + `</span></div>${md(resp.markdown)}`;
     const dl = document.createElement('button');
     dl.textContent = 'Download .md';
     dl.onclick = () => downloadMd(resp.markdown, resp.filename);
-    card.querySelector('.cs-actions').prepend(dl);
+    const pr = document.createElement('button');
+    pr.textContent = 'Print';       // a cheat sheet's whole point is being on paper
+    pr.onclick = () => window.print();
+    card.querySelector('.cs-actions').prepend(dl, pr);
     area.appendChild(card);
+    typeset(card);  // formula LaTeX + the mermaid diagrams the sheet is built from
   }
   area.scrollIntoView({ behavior: 'smooth' });
 }
+
+function closeSheets() { document.getElementById('sheetArea').innerHTML = ''; }
 
 function downloadMd(markdown, filename) {
   const a = document.createElement('a');

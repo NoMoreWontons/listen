@@ -43,8 +43,23 @@ def test_prep_dir_is_not_a_unit():
 
         assert before == after, "Exam Prep folders changed the palette"
         queries = [g["query"] for g in after]
-        assert not any(app.PREP_DIR in q for q in queries), queries
-    print("ok: Exam Prep folders are not units — no query, no hue shift")
+        # one fixed group for study material vault-wide, and nothing unit-shaped
+        assert queries[0] == f'path:"{app.PREP_DIR}/"', queries
+        assert not any(app.PREP_DIR in q for q in queries[1:]), queries
+    print("ok: Exam Prep folders are not units — one fixed hue, no hue shift")
+
+
+def test_prep_group_wins_over_class_queries():
+    """Obsidian takes the first matching group, and a prep note's path also
+    matches its class/unit queries — so the prep group has to come first, and
+    its trailing slash keeps a unit legitimately named 'Exam Preparation' out."""
+    with tempfile.TemporaryDirectory() as d:
+        build(d, {"Bridge": {"Physics": ["Kinematics", "Exam Preparation"]}})
+        groups = groups_of(d)
+        assert groups[0]["query"] == f'path:"{app.PREP_DIR}/"', groups[0]
+        assert groups[0]["color"]["rgb"] == app.PREP_COLOR, groups[0]
+        assert 'path:"Bridge/Physics/Exam Preparation"' in [g["query"] for g in groups[1:]]
+    print("ok: prep group is first and doesn't swallow an 'Exam Preparation' unit")
 
 
 def test_groups_cover_units_topics_classes_semesters():
@@ -79,6 +94,7 @@ def test_other_graph_settings_preserved():
 
 if __name__ == "__main__":
     test_prep_dir_is_not_a_unit()
+    test_prep_group_wins_over_class_queries()
     test_groups_cover_units_topics_classes_semesters()
     test_other_graph_settings_preserved()
     print("test_graph: OK")

@@ -276,7 +276,32 @@ def test_analyze_integrates_notes():
     app.analyze("lecture body")  # no notes, no created_at -> no notes/date preamble
     assert "their own notes" not in captured["messages"][0]["content"]
     assert "recorded on" not in captured["messages"][0]["content"]
+    assert app.DIAGRAM_RULES in prompt, prompt  # summaries may draw mermaid now
     print("ok: analyze feeds user notes + lecture date into the prompt, parses exams")
+
+
+def test_analyze_keeps_mermaid_in_summary():
+    """analyze strips the ```json wrapper Claude sometimes adds. A summary now
+    carries its own ``` fences, and the stripper is MULTILINE — so a diagram
+    must survive the round trip intact, wrapper or not."""
+    diagram = '```mermaid\\nflowchart TD\\n  A[\\"force\\"] --> B[\\"motion\\"]\\n```'
+    body = ('{"segments":[{"class":"C","unit":"U","topic":"T","summary":'
+            f'"## Key points\\n\\n- a point\\n\\n{diagram}\\n"}}],"exams":[]}}')
+
+    def reply(text):
+        def fake_create(**kw):
+            return type("M", (), {
+                "content": [type("T", (), {"text": text})()],
+                "usage": type("U", (), {"input_tokens": 1, "output_tokens": 2})()})()
+        return fake_create
+
+    for raw in (body, f"```json\n{body}\n```"):
+        app.claude.messages.create = reply(raw)
+        segments, *_ = app.analyze("lecture body")
+        summary = segments[0]["summary"]
+        assert "```mermaid" in summary and summary.count("```") == 2, summary
+        assert 'A["force"] --> B["motion"]' in summary, summary
+    print("ok: a mermaid diagram survives analyze's json-fence stripping")
 
 
 def test_analyze_pdf_homework_prompt():
@@ -314,10 +339,10 @@ def test_parse_exams_defensive():
     print("ok: _parse_exams parses missing/malformed exams defensively")
 
 
-def test_write_exam_note_links_matching_units():
+def test_write_exam_note_files_under_matching_unit():
     with tempfile.TemporaryDirectory() as d:
         app.OBSIDIAN_VAULT = pathlib.Path(d)
-        # a unit folder that already exists under this class -> Covers should link it
+        # a unit folder that already exists under this class -> the exam files there
         (pathlib.Path(d) / "Fall 26" / "Biology" / "Cells").mkdir(parents=True)
         exam = {
             "title": "Midterm 1", "kind": "exam", "due_date": "2026-10-01",
@@ -334,9 +359,8 @@ def test_write_exam_note_links_matching_units():
         assert "**Date:** 2026-10-01" in text, text
         assert "Class: [[Fall 26/Biology/Biology|Biology]]" in text, text  # graph anchor
         assert "**Format:** 50 multiple choice, no calculator" in text, text
-        assert "- [[Fall 26/Biology/Cells/Cells|Cells]]" in text, text  # matches existing unit
-        assert "- Genetics" in text, text  # no matching folder -> plain bullet
-    print("ok: write_exam_note links Covers entries that match existing unit folders")
+        assert "- Cells" in text and "- Genetics" in text, text  # Covers stay plain bullets
+    print("ok: write_exam_note files under the unit its Covers match")
 
 
 def test_write_exam_note_undated_no_format_overwrites():
@@ -379,9 +403,9 @@ def test_exam_covers_match_by_word_overlap():
         path = pathlib.Path(app.write_exam_note("Bridge", "Physics", exam))
         assert path.parent == phys / "Kinematics and Motion" / app.PREP_DIR, path
         text = path.read_text(encoding="utf-8")
-        # label keeps the exam's wording, target is the resolved unit hub
-        assert "- [[Bridge/Physics/Kinematics and Motion/Kinematics and Motion|Relative velocity]]" in text, text
-        assert "- [[Bridge/Physics/Rotational Motion/Rotational Motion|Angular momentum]]" in text, text
+        # matching decides the folder only — the bullets keep the exam's wording, unlinked
+        assert "- Relative velocity" in text and "- Angular momentum" in text, text
+        assert "[[Bridge/Physics/Rotational Motion" not in text, text
     print("ok: exam Covers resolve to units by word overlap, file under the best match")
 
 
@@ -399,31 +423,35 @@ def test_wide_exam_stays_class_level():
     print("ok: exam spanning 3+ units stays class-level")
 
 
-def test_prep_note_links_every_matching_exam():
-    """Study material carries an `Exam:` wikilink per exam covering its scope —
-    the graph edge that hangs a cheat sheet off the midterm AND the final."""
+def test_exams_and_prep_notes_carry_one_link_each():
+    """No fan-out: an exam's Covers bullets are plain and study material carries
+    no `Exam:` line, so the only edges are up the containment chain. Filing is
+    unaffected — the wide exam still lands class-level, the narrow one in Cells."""
     with tempfile.TemporaryDirectory() as d:
         app.OBSIDIAN_VAULT = pathlib.Path(d)
         bio = pathlib.Path(d) / "Fall 26" / "Biology"
-        (bio / "Cells").mkdir(parents=True)
+        for u in ("Cells", "Genetics", "Ecology"):
+            (bio / u).mkdir(parents=True)
+        paths = {}
         for title, topics in (("Midterm 1", ["Cells"]), ("Final", ["Cells", "Genetics", "Ecology"])):
-            app.write_exam_note("Fall 26", "Biology", {
-                "title": title, "kind": "exam", "due_date": "", "format": "", "topics": topics})
+            paths[title] = pathlib.Path(app.write_exam_note("Fall 26", "Biology", {
+                "title": title, "kind": "exam", "due_date": "", "format": "", "topics": topics}))
+        wide = paths["Final"].read_text(encoding="utf-8")
+        assert "- Cells\n- Genetics\n- Ecology" in wide, wide  # plain, no unit wikilinks
+        assert wide.count("[[") == 2, wide                     # Class: + Exam Prep: only
+        assert paths["Midterm 1"].parent.parent.name == "Cells", paths  # filing still matches
 
-        path = app.write_prep_note("Fall 26", "Biology", "Cells", "sheet.md", "# body\n", ["Cells"])
+        path = app.write_prep_note("Fall 26", "Biology", "Cells", "sheet.md", "# body\n")
         text = pathlib.Path(path).read_text(encoding="utf-8")
-        assert "Exam: " in text, text
-        assert "|Midterm 1]]" in text and "|Final]]" in text, text  # both, not the more recent one
-
-        # material outside every exam's Covers gets no link
-        plain = app.write_prep_note("Fall 26", "Biology", "Cells", "other.md", "# body\n", ["Photosynthesis"])
-        assert "Exam:" not in pathlib.Path(plain).read_text(encoding="utf-8")
-    print("ok: prep notes link every exam covering their scope, none when nothing matches")
+        assert "Exam: " not in text, text
+        assert text.count("[[") == 1, text  # the Exam Prep hub link
+    print("ok: exams and prep notes link only up the chain — no exam fan-out")
 
 
 def test_legacy_exams_folder_migrates_and_refiles():
     """Old 'Exams' folders fold into Exam Prep, then class-level exam notes lift
-    to the unit they cover — with their Covers bullets relinked."""
+    to the unit they cover. Covers bullets stay plain, and the prune pass strips
+    the exam cross-links left in notes written before this."""
     with tempfile.TemporaryDirectory() as d:
         app.OBSIDIAN_VAULT = pathlib.Path(d)
         phys = pathlib.Path(d) / "Bridge" / "Physics"
@@ -442,30 +470,36 @@ def test_legacy_exams_folder_migrates_and_refiles():
         moved = phys / "Kinematics and Motion" / app.PREP_DIR / "Midterm 1.md"
         assert moved.exists(), list(phys.rglob("*.md"))
         text = moved.read_text(encoding="utf-8")
-        assert "- [[Bridge/Physics/Kinematics and Motion/Kinematics and Motion|Projectile Motion]]" in text, text
-        assert "- Vectors" in text, text  # unresolvable entry stays a plain bullet
-        # a study note filed before exam matching existed gets linked to the exam
-        old = phys / "Kinematics and Motion" / app.PREP_DIR / "quiz 2026-07-01 0900.md"
-        old.write_text("---\nclass: Physics\ntags: [practice]\n---\n\n# Quiz\n", encoding="utf-8")
-        app._backfill_prep_links()
-        assert "Exam: [[Bridge/Physics/Kinematics and Motion/Exam Prep/Midterm 1|Midterm 1]]" \
-            in old.read_text(encoding="utf-8"), old.read_text(encoding="utf-8")
+        assert "- Projectile Motion" in text and "- Vectors" in text, text  # both plain
+        assert "|Projectile Motion]]" not in text, text  # no edge out to the unit
 
-        # class-level prep note (material spanning units) is backfilled too —
-        # its folder is <sem>/<cls>/Exam Prep, one level shallower
-        wide = phys / app.PREP_DIR / "Physics cheatsheet.md"
-        wide.parent.mkdir(parents=True, exist_ok=True)
-        wide.write_text("---\nclass: Physics\n---\n\n# Sheet\n", encoding="utf-8")
-        app._backfill_prep_links()
-        assert "Exam: [[Bridge/Physics/Kinematics and Motion/Exam Prep/Midterm 1|Midterm 1]]" \
-            in wide.read_text(encoding="utf-8"), wide.read_text(encoding="utf-8")
+        # a note written before the prune existed keeps its Exam: line until the
+        # pass runs; the hub link on the line below must survive
+        old = phys / "Kinematics and Motion" / app.PREP_DIR / "quiz 2026-07-01 0900.md"
+        old.write_text("---\nclass: Physics\ntags: [practice]\n---\n\n# Quiz\n"
+                       "\nExam: [[Bridge/Physics/Kinematics and Motion/Exam Prep/Midterm 1|Midterm 1]]\n"
+                       "\nExam Prep: [[Bridge/Physics/Kinematics and Motion/Exam Prep/Exam Prep|Exam Prep]]\n",
+                       encoding="utf-8")
+        # an exam whose bullets were linked before the change gets them unlinked
+        linked = phys / app.PREP_DIR / "Final.md"
+        linked.parent.mkdir(parents=True, exist_ok=True)
+        linked.write_text("---\nclass: Physics\ntags: [exam]\n---\n\n# Final\n\n## Covers\n\n"
+                          "- [[Bridge/Physics/Kinematics and Motion/Kinematics and Motion|Projectile Motion]]\n"
+                          "- Vectors\n", encoding="utf-8")
+        app._prune_exam_links()
+
+        text = old.read_text(encoding="utf-8")
+        assert "Exam: [[" not in text, text
+        assert "Exam Prep: [[" in text, text
+        text = linked.read_text(encoding="utf-8")
+        assert "- Projectile Motion\n- Vectors\n" in text and "[[" not in text, text
 
         before = old.read_text(encoding="utf-8")
         app._migrate_prep_dirs()
         app._refile_exam_notes()
-        app._backfill_prep_links()  # all idempotent
-        assert old.read_text(encoding="utf-8") == before  # no second Exam: line
-    print("ok: legacy Exams folders migrate, exams refile to their unit, old prep notes link")
+        app._prune_exam_links()  # all idempotent
+        assert old.read_text(encoding="utf-8") == before  # nothing left to strip
+    print("ok: legacy Exams folders migrate, exams refile, exam cross-links pruned")
 
 
 def test_addendum_renders_without_resummary():
@@ -496,12 +530,13 @@ if __name__ == "__main__":
     test_legacy_rid_suffixed_files_cleaned_up()
     test_delete_recording_rewrites_shared_note()
     test_analyze_integrates_notes()
+    test_analyze_keeps_mermaid_in_summary()
     test_analyze_pdf_homework_prompt()
     test_parse_exams_defensive()
-    test_write_exam_note_links_matching_units()
+    test_write_exam_note_files_under_matching_unit()
     test_write_exam_note_undated_no_format_overwrites()
     test_exam_covers_match_by_word_overlap()
     test_wide_exam_stays_class_level()
-    test_prep_note_links_every_matching_exam()
+    test_exams_and_prep_notes_carry_one_link_each()
     test_legacy_exams_folder_migrates_and_refiles()
     test_addendum_renders_without_resummary()
