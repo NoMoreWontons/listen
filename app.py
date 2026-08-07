@@ -454,13 +454,14 @@ def addendum(rid: str, payload: dict = Body(...)):
 
 
 def _cleanup_unit_dir(sem, cls, unit):
-    """Removes a unit's hub note + folder if relabeling/deleting emptied it —
-    shared tail for merge_units, merge_topics (cross-unit), delete_unit."""
+    """Removes a unit's hub note, Timeline base and folder if relabeling/deleting
+    emptied it — shared tail for merge_units, merge_topics (cross-unit),
+    delete_unit."""
     old_dir = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(unit)
     try:
-        hub = old_dir / f"{_slug(unit)}.md"
-        if hub.exists():
-            hub.unlink()
+        for f in (old_dir / f"{_slug(unit)}.md", old_dir / TIMELINE):
+            if f.exists():
+                f.unlink()  # both, or the rmdir below never sees an empty folder
         old_dir.rmdir()  # only succeeds if empty
         write_graph_config()
     except OSError:
@@ -1955,6 +1956,28 @@ def _slug(s):
     return (s or "Untitled")[:80]
 
 
+def _one_line(s, cap=200):
+    """One-line gist of a summary for note frontmatter — the Timeline bases show
+    this, and Bases can only read frontmatter, never note bodies. Summaries are
+    markdown (## headings, bullets, **bold** labels), so take the first line that
+    isn't a heading and strip its markup.
+    ponytail: first real line, no model call — this is a card subtitle."""
+    skip = False
+    for raw in (s or "").splitlines():
+        if raw.lstrip().startswith("#"):
+            # "## Review of last class" recaps the PREVIOUS lecture — never the gist
+            skip = "review" in raw.lower()
+            continue
+        if skip:
+            continue
+        # only * and ` — underscores here are LaTeX subscripts ($\mu_k$), not emphasis
+        line = re.sub(r"[*`]", "", raw).strip().lstrip("-").strip()
+        if not line or (len(line) < 40 and line.endswith(":")):
+            continue  # bare section label, e.g. **Key Points:**
+        return line[:cap].rsplit(" ", 1)[0] + "…" if len(line) > cap else line
+    return ""
+
+
 def _note_md(rows):
     """Combined note for every recording sharing one topic (rows: non-empty
     transcripts, oldest first — see _group_rows). Frontmatter/H1/date come
@@ -1971,9 +1994,14 @@ def _note_md(rows):
         "topic": first.get("topic") or "",
         "date": (first.get("created_at") or "")[:10],
         "source": source,
-        "tags": f"[lecture, {source}]",  # Obsidian reads this inline-list as tags
+        "summary": _one_line(first.get("summary")),
     }
-    front = "\n".join(f"{k}: {v}" for k, v in fm.items())
+    # json.dumps is a valid YAML double-quoted scalar. Labels and summaries carry
+    # colons, quotes and unicode math; unquoted, one of those breaks the WHOLE
+    # frontmatter block and the note drops out of every Timeline base.
+    front = "\n".join(f"{k}: {json.dumps(v)}" for k, v in fm.items())
+    front += (f"\nlectures: {len(rows)}"
+              f"\ntags: [lecture, {source}]")  # Obsidian reads this inline-list as tags
     sem, cls, unit = _slug(first.get("semester")), _slug(first.get("class")), _slug(first.get("unit"))
     head = (
         f"---\n{front}\n---\n\n"
@@ -2000,53 +2028,74 @@ def _note_md(rows):
     return head + notes + "\n\n## Transcripts\n\n" + transcripts + "\n"
 
 
-def _hub_desc(kind, name, context):
-    """2-4 sentence description for a class/unit hub note. Claude with web
-    search for background; plain Claude if the search tool isn't available."""
-    prompt = (
-        f"Write a 2-4 sentence encyclopedic description of the college {kind} "
-        f"'{name}'. Context from the student's lecture notes:\n{(context or '')[:1500]}\n\n"
-        "Search the web if helpful for accurate background. "
-        "Return ONLY the description text, no preamble."
+TIMELINE = "Timeline.base"
+
+
+def _timeline_base(rel):
+    """An Obsidian Bases timeline over every lecture note at or under the
+    vault-relative folder `rel` — inFolder() matches subfolders, so a class
+    timeline picks up all of its units. Bases reads frontmatter only, which is
+    why _note_md carries date/summary/lectures."""
+    return (
+        "filters:\n"
+        "  and:\n"
+        f'    - file.inFolder("{rel}")\n'
+        '    - file.hasTag("lecture")\n'
+        "properties:\n"
+        "  note.date:\n    displayName: Date\n"
+        "  note.summary:\n    displayName: Summary\n"
+        "  note.unit:\n    displayName: Unit\n"
+        "  note.lectures:\n    displayName: Lectures\n"
+        "views:\n"
+        "  - type: cards\n"
+        "    name: Timeline\n"
+        "    order:\n      - file.name\n      - date\n      - summary\n"
+        "    sort:\n      - property: date\n        direction: ASC\n"
+        "  - type: table\n"
+        "    name: Log\n"
+        "    order:\n      - file.name\n      - date\n      - unit\n      - lectures\n"
+        "    sort:\n      - property: date\n        direction: ASC\n"
     )
-    try:
-        msg = claude.messages.create(
-            model="claude-haiku-4-5", max_tokens=300,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
-            messages=[{"role": "user", "content": prompt}])
-    except Exception:
-        msg = claude.messages.create(
-            model="claude-haiku-4-5", max_tokens=300,
-            messages=[{"role": "user", "content": prompt}])
-    return _text(msg)
+
+
+def _ensure_base(rel):
+    """Writes the Timeline base for vault-relative folder `rel` if missing.
+    Idempotent and independent of the hub note beside it, so a folder can never
+    end up with a hub embedding a base that was never written. Returns the
+    embed target."""
+    p = OBSIDIAN_VAULT / rel / TIMELINE
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_timeline_base(rel), encoding="utf-8")
+    return f"{rel}/{TIMELINE}"
 
 
 def ensure_hubs(row):
     """Folder hub notes so the Obsidian graph chains
-    lecture -> unit -> class -> semester. Semester hub is title-only; class
-    and unit hubs get a Claude-written description (web search when available)
-    plus a wikilink up the chain.
+    lecture -> unit -> class -> semester. Semester hub is title-only; class and
+    unit hubs embed that folder's Timeline base and link up the chain — the
+    lecture list IS the description, so nothing here goes stale.
     ponytail: hubs are written once and never refreshed — delete a hub file to
-    regenerate it with newer context."""
+    regenerate it."""
     sem, cls, unit = _slug(row.get("semester")), _slug(row.get("class")), _slug(row.get("unit"))
-    summary = row.get("summary") or ""
     sem_p = OBSIDIAN_VAULT / sem / f"{sem}.md"
     cls_p = OBSIDIAN_VAULT / sem / cls / f"{cls}.md"
     unit_p = OBSIDIAN_VAULT / sem / cls / unit / f"{unit}.md"
     if not sem_p.exists():
         sem_p.parent.mkdir(parents=True, exist_ok=True)
         sem_p.write_text(f"# {sem}\n", encoding="utf-8")
+    cls_base = _ensure_base(f"{sem}/{cls}")
+    unit_base = _ensure_base(f"{sem}/{cls}/{unit}")
+    # full paths in the embeds: every folder has a file named Timeline.base, and
+    # a shortest-path wikilink would resolve to whichever one Obsidian picks
     if not cls_p.exists():
-        cls_p.parent.mkdir(parents=True, exist_ok=True)
-        desc = _hub_desc("course", row.get("class") or cls, summary)
         cls_p.write_text(
-            f"# {cls}\n\n{desc}\n\nSemester: [[{sem}/{sem}|{sem}]]\n", encoding="utf-8")
+            f"# {cls}\n\n![[{cls_base}#Timeline]]\n\nSemester: [[{sem}/{sem}|{sem}]]\n",
+            encoding="utf-8")
     if not unit_p.exists():
-        unit_p.parent.mkdir(parents=True, exist_ok=True)
-        desc = _hub_desc(f"unit of the course '{row.get('class') or cls}'",
-                         row.get("unit") or unit, summary)
         unit_p.write_text(
-            f"# {unit}\n\n{desc}\n\nClass: [[{sem}/{cls}/{cls}|{cls}]]\n", encoding="utf-8")
+            f"# {unit}\n\n![[{unit_base}#Timeline]]\n\nClass: [[{sem}/{cls}/{cls}|{cls}]]\n",
+            encoding="utf-8")
 
 
 def _prep_hub(sem, cls, unit=""):

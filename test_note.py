@@ -221,8 +221,8 @@ def test_legacy_rid_suffixed_files_cleaned_up():
         ]
         app.sb = FakeSB(rows)
         path = app.write_note(rows[0])
-        files = sorted(p.name for p in folder.glob("*.md"))
-        assert files == ["Mitosis.md"], files
+        files = sorted(p.name for p in folder.glob("*.md") if p.stem != folder.name)
+        assert files == ["Mitosis.md"], files  # hub note aside, the rid-suffixed pair collapsed
         text = pathlib.Path(path).read_text(encoding="utf-8")
         assert "alpha" in text and "beta" in text, text
         assert rows[0]["obsidian_path"] == path and rows[1]["obsidian_path"] == path
@@ -521,7 +521,50 @@ def test_addendum_renders_without_resummary():
     print("ok: addendum renders verbatim between Summary and Transcript, summary untouched")
 
 
+def test_frontmatter_parses_and_hubs_embed_timeline():
+    """Frontmatter is the ONLY thing an Obsidian Bases timeline can read, and a
+    single unquoted colon or quote breaks the WHOLE block — the note then drops
+    out of every timeline silently. Summaries are markdown full of both."""
+    import yaml
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        nasty = ('## Key points\n\n**Summary:**\n\n'
+                 '- Inverse: $(F^{-1})\'(x) = 1/F\'(F^{-1}(x))$ — he said "watch the sign"\n'
+                 '- second bullet\n')
+        rows = [mkrow("r1", "Mitosis", "2026-07-01T10:00:00", summary=nasty)]
+        app.sb = FakeSB(rows)
+        note = pathlib.Path(app.write_note(rows[0]))
+        fm = yaml.safe_load(note.read_text(encoding="utf-8").split("---", 2)[1])
+        assert fm["topic"] == "Mitosis" and fm["date"] == "2026-07-01", fm
+        assert fm["lectures"] == 1 and fm["tags"] == ["lecture", "local"], fm
+        assert fm["summary"].startswith("Inverse:"), fm   # heading + bare label skipped
+        assert '"watch the sign"' in fm["summary"], fm    # quotes survive
+        assert "$(F^{-1})" in fm["summary"], fm           # latex subscripts survive
+
+        unit_d = pathlib.Path(d) / "Fall 26" / "Biology" / "Cells"
+        base = unit_d / app.TIMELINE
+        assert 'file.inFolder("Fall 26/Biology/Cells")' in base.read_text(encoding="utf-8")
+        hub = (unit_d / "Cells.md").read_text(encoding="utf-8")
+        assert "![[Fall 26/Biology/Cells/Timeline.base#Timeline]]" in hub, hub
+
+        # emptied unit: the base must go too, or the folder never rmdir's
+        note.unlink()
+        app._cleanup_unit_dir("Fall 26", "Biology", "Cells")
+        assert not unit_d.exists(), sorted(p.name for p in unit_d.iterdir())
+    print("ok: frontmatter parses as YAML, hubs embed their base, cleanup removes it")
+
+
+def test_one_line_skips_recaps():
+    assert app._one_line("## Review of last class\n- old stuff\n\n## Key points\n- the real gist") \
+        == "the real gist"
+    assert app._one_line("") == ""
+    assert app._one_line("x" * 300).endswith("…")
+    print("ok: _one_line skips recap sections, empty and overlong summaries")
+
+
 if __name__ == "__main__":
+    test_frontmatter_parses_and_hubs_embed_timeline()
+    test_one_line_skips_recaps()
     test_single_recording()
     test_second_recording_joins_topic()
     test_relabel_away_and_last_one_out()
