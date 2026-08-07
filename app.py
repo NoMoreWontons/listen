@@ -1992,7 +1992,6 @@ def _note_md(rows):
         "class": first.get("class") or "",
         "unit": first.get("unit") or "",
         "topic": first.get("topic") or "",
-        "date": (first.get("created_at") or "")[:10],
         "source": source,
         "summary": _one_line(first.get("summary")),
     }
@@ -2000,7 +1999,10 @@ def _note_md(rows):
     # colons, quotes and unicode math; unquoted, one of those breaks the WHOLE
     # frontmatter block and the note drops out of every Timeline base.
     front = "\n".join(f"{k}: {json.dumps(v)}" for k, v in fm.items())
-    front += (f"\nlectures: {len(rows)}"
+    # date stays UNQUOTED so Obsidian types it as a date, not a string — plain
+    # YYYY-MM-DD never needs escaping, and Bases sorts/filters it as a date
+    front += (f"\ndate: {(first.get('created_at') or '')[:10]}"
+              f"\nlectures: {len(rows)}"
               f"\ntags: [lecture, {source}]")  # Obsidian reads this inline-list as tags
     sem, cls, unit = _slug(first.get("semester")), _slug(first.get("class")), _slug(first.get("unit"))
     head = (

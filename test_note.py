@@ -2,6 +2,7 @@
 note, refiles cleanly on relabel/delete, and merge_topics moves labels across
 units. Stubs app.sb with a tiny in-memory fake — no real Supabase/network."""
 import os
+import datetime
 import tempfile
 import pathlib
 
@@ -535,7 +536,9 @@ def test_frontmatter_parses_and_hubs_embed_timeline():
         app.sb = FakeSB(rows)
         note = pathlib.Path(app.write_note(rows[0]))
         fm = yaml.safe_load(note.read_text(encoding="utf-8").split("---", 2)[1])
-        assert fm["topic"] == "Mitosis" and fm["date"] == "2026-07-01", fm
+        assert fm["topic"] == "Mitosis", fm
+        # a real YAML date, not a quoted string — Bases sorts/filters it as one
+        assert fm["date"] == datetime.date(2026, 7, 1), repr(fm["date"])
         assert fm["lectures"] == 1 and fm["tags"] == ["lecture", "local"], fm
         assert fm["summary"].startswith("Inverse:"), fm   # heading + bare label skipped
         assert '"watch the sign"' in fm["summary"], fm    # quotes survive
