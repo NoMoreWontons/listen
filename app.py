@@ -259,7 +259,11 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def index():
-    return FileResponse(HERE / "index.html")
+    # no-cache, not no-store: keeps the etag round-trip (304 when unchanged) but
+    # forbids serving a stale copy without asking. Matters most for the iPad
+    # home-screen web app, which has no address bar and so no way to force a
+    # reload -- without this it can sit on old JS with no visible fix.
+    return FileResponse(HERE / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.post("/start")
