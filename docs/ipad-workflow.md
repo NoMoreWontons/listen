@@ -64,7 +64,46 @@ its long-term future is a shrug — Tailscale is the fallback if it rots.
    .venv\Scripts\python.exe -m uvicorn app:app --host 100.69.173.35 --port 8000
    ```
 
-4. On the iPad, open `http://100.69.173.35:8000`. The full listen UI loads in Safari.
+4. **Open the port in Windows Firewall.** This step is easy to miss and looks
+   exactly like a broken mesh when you skip it. Loopback traffic bypasses the
+   firewall entirely, so binding `127.0.0.1` never needed a rule; binding a real
+   interface does, and Windows blocks inbound by default. In an **Administrator**
+   PowerShell:
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "listen server (NordLynx only)" `
+     -Direction Inbound -Protocol TCP -LocalPort 8000 `
+     -InterfaceAlias NordLynx -Action Allow -Profile Any
+   ```
+
+   `-InterfaceAlias NordLynx` scopes it to the mesh adapter. The Wi-Fi subnet
+   stays blocked, and the socket doesn't exist there anyway because the bind is
+   mesh-only. Two independent layers.
+
+5. On the iPad: NordVPN app open, Meshnet on, laptop listed as a linked peer.
+6. Browse to `http://100.69.173.35:8000`. **Type `http://` explicitly** —
+   Safari and Chrome auto-upgrade a bare `IP:port` to `https://`, nothing is
+   listening on HTTPS, and the failure reads as "not a secure connection"
+   rather than as a wrong scheme.
+
+Note that binding the mesh IP means **`localhost:8000` no longer works**. Use
+`http://100.69.173.35:8000` on the laptop as well. The tradeoff is that NordVPN
+has to be up to use the app at all, even locally. If that chafes, the
+alternative is binding `0.0.0.0` and relying on the firewall rule above as the
+only thing keeping the port off Wi-Fi — one layer instead of two. Not
+recommended for an app with no auth and live API keys in the process.
+
+### Checking it works
+
+From the laptop, before touching the iPad:
+
+```powershell
+Get-NetTCPConnection -State Listen -LocalPort 8000 | Select LocalAddress,OwningProcess
+Invoke-WebRequest http://100.69.173.35:8000/recordings -UseBasicParsing | % StatusCode
+```
+
+A listener on `100.69.173.35` plus a `200` means the server is healthy and any
+remaining failure is firewall or mesh, not the app.
 
 Binding to the mesh IP rather than `0.0.0.0` means the port is never bound on
 the wifi interface at all. Machines on the local subnet cannot see it, scan it,
