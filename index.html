@@ -409,6 +409,19 @@
   /* one amber call-to-action per surface; everything alongside it stays quiet */
   .split-actions button:last-child,
   .labels button.ocr-btn { background: var(--paper-deep); color: var(--ink); }
+  .pending-page {
+    border: 1px solid var(--rail-soft); border-radius: 4px;
+    padding: .45rem .55rem; margin: .4rem 0;
+  }
+  .pending-page b { font-size: .85rem; }
+  .pending-page textarea {
+    width: 100%; margin: .35rem 0; font: inherit; font-size: .82rem;
+    background: var(--paper-deep); color: var(--ink);
+    border: 1px solid var(--rail-soft); border-radius: 3px; padding: .3rem;
+    resize: vertical; box-sizing: border-box;
+  }
+  .pending-row { display: flex; gap: .35rem; align-items: center; }
+  .pending-row select { flex: 1; min-width: 0; font-size: .8rem; }
   .split-actions button:disabled { opacity: .55; cursor: default; }
 
   /* ---- graph color settings ---- */
@@ -736,6 +749,8 @@ if (window.mermaid) mermaid.initialize({
       <button id="hwBtn" class="upload-btn" title="Upload homework (PDF or photo) — auto-filed, then link it to a due date">&#8686; Homework</button>
       <input type="file" id="hwInput" accept=".pdf,image/*" hidden>
       <button id="ytBtn" class="upload-btn" title="Add a YouTube video — save the link as a reference note, or transcribe it like a lecture">&#9654; YouTube</button>
+      <button id="pendingBtn" class="upload-btn" title="Handwritten page with no lecture yet — typed up now, attached to a recording later">&#9998; iPad Page</button>
+      <input type="file" id="pendingInput" accept="image/*,.pdf" hidden>
     </div>
   </div>
   <canvas id="wave" aria-hidden="true"></canvas>
@@ -756,6 +771,7 @@ if (window.mermaid) mermaid.initialize({
       <div id="pickBar" hidden></div>
       <div id="tree"></div>
     </section>
+    <section class="folders" id="pending" hidden></section>
     <section class="folders" id="merge" hidden></section>
     <section class="folders" id="practice">
       <span class="deck-label">Practice</span>
@@ -1078,6 +1094,95 @@ async function doSplit(rid, approve, btn) {
   refresh();
 }
 
+// --- pages staged before their lecture exists -------------------------------
+// Notes taken on the iPad reach the laptop long before the audio does, so a page
+// can be typed up and proofread now and attached to a recording that doesn't
+// exist yet. Nothing here touches #list, so the 5s refresh leaves it alone.
+let pendingPages = [];
+
+async function stagePage(f) {
+  if (!f) return;
+  const btn = document.getElementById('pendingBtn');
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = 'reading…';
+  try {
+    const resp = await (await fetch(`/pending?filename=${encodeURIComponent(f.name)}`,
+      { method: 'POST', body: f })).json();
+    if (resp.error) { alert(resp.error); return; }
+    await refresh();
+  } finally { btn.disabled = false; btn.textContent = old; }
+}
+
+async function savePendingText(name, text) {
+  await fetch(`/pending/${encodeURIComponent(name)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }) });
+}
+
+async function attachPending(name) {
+  const box = document.querySelector(`#pending [data-page="${CSS.escape(name)}"]`);
+  const rid = box.querySelector('select').value;
+  if (!rid) { alert('Pick a lecture first.'); return; }
+  await savePendingText(name, box.querySelector('textarea').value);  // corrections first
+  const btn = box.querySelector('.attach-btn');
+  btn.disabled = true; btn.textContent = 'filing…';
+  const resp = await (await fetch(`/pending/${encodeURIComponent(name)}/attach`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rid }) })).json();
+  if (resp.error) alert(resp.error);
+  document.activeElement.blur();   // or refresh() skips the rebuild
+  refresh();
+}
+
+async function dropPending(name) {
+  if (!confirm('Discard this page? The image and its text are deleted.')) return;
+  await fetch(`/pending/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  document.activeElement.blur();
+  refresh();
+}
+
+function renderPending(rows) {
+  const panel = document.getElementById('pending');
+  // same trap as renderMerge: never rebuild while the user is mid-proofread
+  if (document.activeElement && panel.contains(document.activeElement)) return;
+  fetch('/pending').then(r => r.json()).then(pages => {
+    if (document.activeElement && panel.contains(document.activeElement)) return;
+    pendingPages = Array.isArray(pages) ? pages : [];
+    panel.hidden = pendingPages.length === 0;
+    if (panel.hidden) return;
+    const filed = rows.filter(r => r.status === 'done');
+    const nearest = up => {   // default to the lecture closest in time to the upload
+      const t = Date.parse(up) || Date.now();
+      let best = '', gap = Infinity;
+      for (const r of filed) {
+        const d = Math.abs(Date.parse(r.created_at) - t);
+        if (d < gap) { gap = d; best = r.id; }
+      }
+      return best;
+    };
+    panel.innerHTML = `<span class="deck-label">Pages waiting (${pendingPages.length})</span>`
+      + pendingPages.map(p => {
+        const sel = nearest(p.uploaded_at);
+        const opts = filed.length
+          ? filed.map(r => `<option value="${escAttr(r.id)}"${r.id === sel ? ' selected' : ''}>`
+              + `${esc((r.created_at || '').slice(0, 10))} — ${esc(r.topic || r.title || 'Lecture')}</option>`).join('')
+          : '<option value="">no lectures yet — upload the audio first</option>';
+        return `<div class="pending-page" data-page="${escAttr(p.name)}">
+          <b>${esc(p.filename)}</b>
+          <span class="src">${esc((p.uploaded_at || '').slice(0, 16).replace('T', ' '))}</span>
+          <button class="del" title="Discard this page" onclick="dropPending('${escAttr(p.name)}')">&#10005;</button>
+          <textarea rows="5" spellcheck="true"
+            onblur="savePendingText('${escAttr(p.name)}', this.value)">${esc(p.text || '')}</textarea>
+          <div class="pending-row">
+            <select ${filed.length ? '' : 'disabled'}>${opts}</select>
+            <button class="attach-btn pill-btn" ${filed.length ? '' : 'disabled'}
+              onclick="attachPending('${escAttr(p.name)}')">Attach</button>
+          </div>
+        </div>`;
+      }).join('');
+  }).catch(() => {});
+}
+
 const fileInput = document.getElementById('fileInput');
 // battery saver: per-recording whisper pause; state lives server-side so a
 // reloaded tab paints the real state on the next refresh tick.
@@ -1109,6 +1214,9 @@ fileInput.onchange = () => { uploadFile(fileInput.files[0]); fileInput.value = '
 const hwInput = document.getElementById('hwInput');
 document.getElementById('hwBtn').onclick = () => hwInput.click();
 hwInput.onchange = () => { uploadFile(hwInput.files[0], 'homework'); hwInput.value = ''; };
+const pendingInput = document.getElementById('pendingInput');
+document.getElementById('pendingBtn').onclick = () => pendingInput.click();
+pendingInput.onchange = () => { stagePage(pendingInput.files[0]); pendingInput.value = ''; };
 document.getElementById('ytBtn').onclick = async () => {
   const url = prompt('YouTube URL:');
   if (!url) return;
@@ -1279,6 +1387,7 @@ async function refresh() {
   // above, so re-opened boxes (openK) need an explicit kick to (re)fill their now-empty slot.
   document.querySelectorAll('#list details.audio-box[open]').forEach(d => loadAudioBox(d, d.dataset.k.replace('-audio', '')));
   renderTree(rows);
+  renderPending(rows);
   renderMerge(rows);
   renderPractice(rows);
   renderReview(rows);

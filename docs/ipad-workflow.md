@@ -196,6 +196,44 @@ through them; see "Attaching companion ink" below.
 | Apple Notes | `...` → **Send a Copy** → *Send Notes to Listen*. If the shortcut doesn't appear, `...` → **Print**, pinch outward on the preview to open it as a PDF, then share. |
 | Voice Memos | select the recording → `...` → **Share** → *Send Audio to Listen* |
 
+### Pages that arrive before their lecture
+
+Ink reaches the laptop long before the audio does — often the audio isn't
+uploaded until that evening, and sometimes there is no recording at all yet. So
+a page can be staged with no lecture chosen and filed later.
+
+1. Tap **✎ iPad Page** in the Upload row. Pick a photo or a PDF.
+2. It's typed up immediately and appears under **Pages waiting** in the side
+   column, with the transcription in an editable box. Proofread it now, while
+   the lecture is still fresh — the text saves when you tap out of the box.
+3. Whenever the recording exists — minutes or days later — pick it from the
+   dropdown and tap **Attach**. The lecture closest in date is preselected.
+
+Attaching does three things in one pass: stores the page in `Attachments/`,
+appends your proofread text to that recording's notes, and re-runs `analyze` so
+the summary absorbs it. If no lecture exists yet the dropdown says so and the
+page simply waits.
+
+Staged pages live in `listen/pending/` as the original file plus a `.json`
+sidecar holding the filename and text. No database column, so no migration.
+`_pending_path` refuses any name that escapes that directory — the name comes
+from the browser.
+
+### How ink improves the audio summary
+
+`analyze`'s prompt now knows what these notes are for:
+
+> These are sparse on purpose: they cover what the audio could NOT carry —
+> material the lecturer wrote on the board without saying aloud, diagrams, and
+> the correct spelling of technical terms a single-microphone transcript often
+> garbles. Where the notes and the transcript disagree, TRUST THE NOTES,
+> especially for names, symbols, numbers and spellings.
+
+That last clause is the useful part. Whisper mangles jargon it has never heard;
+your handwriting has it spelled correctly, so the notes win. The prompt also
+tells the model that a `[diagram: ...]` line is a placeholder for a drawing
+filed beside the note, and not to describe detail it wasn't given.
+
 ### Attaching companion ink to a lecture
 
 1. On the iPad, open `http://<your-mesh-ip>:8000` in Safari.

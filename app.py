@@ -21,6 +21,8 @@ load_dotenv()
 HERE = pathlib.Path(__file__).parent
 AUDIO_DIR = HERE / "audio"
 AUDIO_DIR.mkdir(exist_ok=True)
+PENDING_DIR = HERE / "pending"   # pages uploaded before their lecture exists
+PENDING_DIR.mkdir(exist_ok=True)
 FRQ_UPLOAD_DIR = HERE / "frq_uploads"  # photographed/scanned FRQ answer pages, kept for the record
 FRQ_UPLOAD_DIR.mkdir(exist_ok=True)
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
@@ -550,19 +552,12 @@ def office_text(data, ext=None):
     return html.unescape("\n\n".join(parts))
 
 
-@app.post("/ocr")
-async def ocr(request: Request, filename: str = "", rid: str = ""):
-    """Photo/PDF of handwritten or printed notes -> markdown text for the notes
-    box. Raw body like /upload. Returns the text; the browser appends it to the
-    notes textarea so the user reviews before saving."""
+def read_page(data, filename):
+    """Turn one uploaded page into markdown. Shared by /ocr (attach now) and
+    /pending (attach later). Returns {"text": ...} or {"error": ...} -- never
+    raises, since both callers hand the result straight back to the browser."""
     import base64
-    data = await request.body()
-    # Store the page before transcribing it. Claude can misread a diagram, and
-    # without the original there is nothing to check the transcription against.
-    # Silent when rid is absent (the caller isn't attaching to a recording) or
-    # the type isn't embeddable.
-    attached = save_attachment(rid, filename, data) if rid else None
-    ext = pathlib.Path(filename).suffix.lower().lstrip(".")
+    ext = pathlib.Path(filename or "").suffix.lower().lstrip(".")
     media = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
              "gif": "image/gif", "webp": "image/webp"}.get(ext)
     if media:
@@ -597,9 +592,151 @@ async def ocr(request: Request, filename: str = "", rid: str = ""):
                 "Return ONLY the transcription."
             )}]}],
         )
-        return {"text": _text(msg), "attached": attached}
+        return {"text": _text(msg)}
     except Exception as e:
         return {"error": f"transcription failed: {e}"}
+
+
+def _pending_path(name):
+    """Resolve a staged page by name, refusing anything that escapes the
+    staging dir. `name` arrives from the browser, so treat it as hostile."""
+    p = (PENDING_DIR / name).resolve()
+    if p.parent != PENDING_DIR.resolve() or not p.name:
+        raise ValueError("bad pending name")
+    return p
+
+
+def _pending_row(page):
+    """One staged page as the browser sees it: the file plus its .json sidecar
+    (original filename + the typed-up text the user may have corrected)."""
+    meta = {}
+    side = page.with_name(page.name + ".json")
+    if side.exists():
+        try:
+            meta = json.loads(side.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"name": page.name,
+            "filename": meta.get("filename") or page.name,
+            "uploaded_at": meta.get("uploaded_at")
+            or datetime.datetime.fromtimestamp(page.stat().st_mtime).isoformat(),
+            "text": meta.get("text") or ""}
+
+
+@app.post("/pending")
+async def pending_add(request: Request, filename: str = ""):
+    """Stage a page that has no lecture to attach to yet — notes taken on the
+    iPad reach the laptop long before (or without) the audio. Transcribed now
+    so it can be proofread while the lecture is fresh; filed later from the
+    Pages waiting list once the recording exists."""
+    data = await request.body()
+    if not data:
+        return {"error": "empty upload"}
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    ext = pathlib.Path(filename or "").suffix.lower()
+    stem = _slug(pathlib.Path(filename or "page").stem)
+    i = 1
+    while (PENDING_DIR / f"{stamp}-{i}-{stem}{ext}").exists():
+        i += 1
+    page = PENDING_DIR / f"{stamp}-{i}-{stem}{ext}"
+    page.write_bytes(data)
+    got = read_page(data, filename)
+    if got.get("error"):
+        page.unlink(missing_ok=True)  # nothing readable to attach later
+        return got
+    page.with_name(page.name + ".json").write_text(json.dumps(
+        {"filename": filename or page.name, "text": got.get("text") or "",
+         "uploaded_at": datetime.datetime.now().isoformat()}), encoding="utf-8")
+    return {"name": page.name, "text": got.get("text") or ""}
+
+
+@app.get("/pending")
+def pending_list():
+    """Staged pages, newest first. The .json sidecars are metadata, not pages."""
+    if not PENDING_DIR.is_dir():
+        return []
+    pages = [p for p in PENDING_DIR.iterdir() if p.is_file() and p.suffix != ".json"]
+    return sorted((_pending_row(p) for p in pages),
+                  key=lambda r: r["uploaded_at"], reverse=True)
+
+
+@app.post("/pending/{name}")
+def pending_edit(name: str, payload: dict = Body(...)):
+    """Save the proofread text. Corrections happen here, before the page is
+    ever folded into a lecture summary."""
+    try:
+        page = _pending_path(name)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not page.exists():
+        return {"ok": False, "error": "that page is no longer waiting"}
+    row = _pending_row(page)
+    row["text"] = payload.get("text", "")
+    page.with_name(page.name + ".json").write_text(json.dumps(row), encoding="utf-8")
+    return {"ok": True}
+
+
+@app.post("/pending/{name}/attach")
+def pending_attach(name: str, payload: dict = Body(...)):
+    """File a staged page onto a recording: store the page in the vault, append
+    its text to that recording's notes, and let label() re-integrate the summary
+    and rewrite the note. The attachment is saved FIRST so the note write picks
+    up its embed in the same pass."""
+    rid = (payload.get("rid") or "").strip()
+    if not rid:
+        return {"ok": False, "error": "no recording chosen"}
+    try:
+        page = _pending_path(name)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not page.exists():
+        return {"ok": False, "error": "that page is no longer waiting"}
+    rows = sb.table("recordings").select("*").eq("id", rid).execute().data
+    if not rows:
+        return {"ok": False, "error": "that recording no longer exists"}
+    row = rows[0]
+    meta = _pending_row(page)
+    save_attachment(rid, meta["filename"], page.read_bytes())
+    text = (meta.get("text") or "").strip()
+    notes = "\n\n".join(x for x in [(row.get("notes") or "").strip(), text] if x)
+    # label() owns the re-summarize + refile path; reuse it rather than repeat it.
+    # Existing labels are passed back unchanged so only the notes actually move.
+    out = label(rid, {"semester": row.get("semester") or "", "klass": row.get("class") or "",
+                      "unit": row.get("unit") or "", "topic": row.get("topic") or "",
+                      "notes": notes})
+    page.unlink(missing_ok=True)
+    page.with_name(page.name + ".json").unlink(missing_ok=True)
+    return {"ok": out.get("ok", True), "error": out.get("error"),
+            "obsidian_path": out.get("obsidian_path")}
+
+
+@app.delete("/pending/{name}")
+def pending_drop(name: str):
+    try:
+        page = _pending_path(name)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    page.unlink(missing_ok=True)
+    page.with_name(page.name + ".json").unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.post("/ocr")
+async def ocr(request: Request, filename: str = "", rid: str = ""):
+    """Photo/PDF of handwritten or printed notes -> markdown text for the notes
+    box. Raw body like /upload. Returns the text; the browser appends it to the
+    notes textarea so the user reviews before saving. rid attaches the page
+    itself to that recording; without one, use /pending instead."""
+    data = await request.body()
+    # Store the page before transcribing it. Claude can misread a diagram, and
+    # without the original there is nothing to check the transcription against.
+    # Silent when rid is absent (the caller isn't attaching to a recording) or
+    # the type isn't embeddable.
+    attached = save_attachment(rid, filename, data) if rid else None
+    got = read_page(data, filename)
+    if got.get("error"):
+        return got
+    return {"text": got.get("text") or "", "attached": attached}
 
 
 @app.delete("/recordings/{rid}")
@@ -1866,8 +2003,16 @@ def analyze(transcript, notes="", created_at=None):
     if not transcript:
         return [{"class": "", "unit": "", "topic": "", "summary": ""}], [], 0, 0
     notes_part = (
-        "\nThe student took their own notes during this lecture. Integrate them "
-        "into the summary, giving weight to anything they flagged:\n"
+        "\nThe student took their own notes during this lecture. These are sparse "
+        "on purpose: they cover what the audio could NOT carry — material the "
+        "lecturer wrote on the board without saying aloud, diagrams, and the "
+        "correct spelling of technical terms a single-microphone transcript "
+        "often garbles. Where the notes and the transcript disagree, TRUST THE "
+        "NOTES, especially for names, symbols, numbers and spellings. Integrate "
+        "them into the summary, giving weight to anything they flagged. A line "
+        "like '[diagram: ...]' is a placeholder for a drawing filed beside this "
+        "note — mention what it depicts, never describe detail you were not "
+        "given:\n"
         + notes.strip() + "\n"
     ) if (notes or "").strip() else ""
     lecture_date = (created_at or "")[:10]
