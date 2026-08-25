@@ -3,9 +3,27 @@
 How handwritten notes and off-laptop audio reach the vault at
 `C:\Users\savag\College Lectures`. Written 2026-08-25.
 
-The short version: nothing needs building in `app.py`. The intake endpoints
-already exist. What's missing is a way for the iPad to reach the server and a
-share-sheet Shortcut to hit it in one tap.
+The short version: the intake endpoints mostly already exist. What's missing is
+a way for the iPad to reach the server, a share-sheet Shortcut to hit it, and
+one real gap — diagrams.
+
+## What these notes actually are
+
+The ink is **not** a second copy of the lecture. It's deliberately sparse: the
+things audio can't carry. Diagrams and board work. Anything the professor wrote
+down and never said out loud. The handful of points worth flagging as important.
+
+That shapes everything below, and it splits the ink into two paths that are not
+interchangeable:
+
+| Kind of ink | Path | Why |
+|---|---|---|
+| **Companion to a lecture you recorded** — diagrams, board work, unspoken material | Attach to that recording via the listen UI's "Add notes from file". Never creates a new row. | `/label/{rid}` re-runs `analyze(transcript, notes, created_at)`, whose prompt says "giving weight to anything they flagged" (app.py:1841). Your board notes get fused into the lecture's own summary, weighted. One note, not two. |
+| **Standalone material** — a handout, a worksheet, a page with no recording behind it | Share-sheet Shortcut → `/upload?kind=pdf` | Nothing to attach to. It becomes its own row and files itself. |
+
+Sending companion ink through `/upload?kind=pdf` is the wrong move: it creates a
+second `recordings` row that has to be auto-labeled from sparse handwriting, and
+it pollutes the counts that flashcard and quiz generation read from.
 
 ## What already exists
 
@@ -14,6 +32,7 @@ share-sheet Shortcut to hit it in one tap.
 | `POST /upload?kind=pdf` | 309 → 892 | PDF straight to Claude as a native document block (scanned and handwritten pages included, no OCR dependency). Auto-labels semester/class/unit/topic, summarizes, calls `write_note`. Files itself with zero interaction. |
 | `POST /upload?kind=audio` | 309 | Raw audio body into the whisper pipeline, same as a live recording. |
 | `POST /ocr` | 539 | Photo/PDF/pptx/docx → markdown, returned as text for the notes box. Human reviews before saving. Wired to the "Add notes from file" button in `index.html`. |
+| `POST /label/{rid}` | 405 | User labels + notes as JSON. On a `done` recording whose notes changed, re-runs `analyze` so the summary absorbs them. This is the companion-ink path. |
 | `POST /addendum/{rid}` | 436 | Dated append to a finished recording. Stored in the DB `addendum` column, so it survives note rewrites. |
 
 All of these take a raw request body, not multipart — which is what makes them
@@ -115,13 +134,30 @@ Identical, with three changes:
 
 ### Using them
 
-- **GoodNotes**: open the notebook, **Share** → **Export** → **PDF** → pick the
-  pages for this lecture → **Share** → tap *Send Notes to Listen*.
-- **Apple Notes**: `...` menu → **Send a Copy** → tap *Send Notes to Listen*.
-  If the shortcut doesn't appear, use `...` → **Print**, pinch outward on the
-  page preview to open it as a PDF, then share from there.
-- **Voice Memos**: select the recording → `...` → **Share** → tap
-  *Send Audio to Listen*.
+These Shortcuts are for **standalone material only** — a handout, a worksheet, a
+recording made away from the laptop. Companion ink for a lecture does not go
+through them; see "Attaching companion ink" below.
+
+| App | Path |
+|---|---|
+| GoodNotes | Share → Export → PDF → pick the pages → Share → *Send Notes to Listen* |
+| Apple Notes | `...` → **Send a Copy** → *Send Notes to Listen*. If the shortcut doesn't appear, `...` → **Print**, pinch outward on the preview to open it as a PDF, then share. |
+| Voice Memos | select the recording → `...` → **Share** → *Send Audio to Listen* |
+
+### Attaching companion ink to a lecture
+
+1. On the iPad, open `http://100.69.173.35:8000` in Safari.
+2. Find the lecture's card in the list.
+3. Tap **Add notes from file** (`ocrNotes`, index.html:1042) and pick the
+   exported PDF or a photo of the page.
+4. `/ocr` returns markdown into the notes box. **Read it before saving** — this
+   is the review step, and handwriting transcription is where it earns its keep.
+5. Save. `/label/{rid}` re-runs `analyze` and the summary absorbs the notes,
+   weighted toward whatever you flagged.
+
+For a lecture already finished and filed, the same button appears next to the
+correction box and routes to `/addendum` instead — a dated append that survives
+note rewrites.
 
 ### What to expect
 
@@ -149,20 +185,35 @@ titles actually annoy you.
 
 ## Step 3: which notes app
 
-The integration point is the share sheet, not the app's storage format —
-`/upload?kind=pdf` takes whatever exports a PDF. So pick on Pencil feel alone.
+The integration point is the share sheet and the file picker, not the app's
+storage format. Anything that exports PDF works. So pick on two things: Pencil
+feel, and how cleanly it exports **a few selected pages**.
 
-- **Apple Notes** — free, installed, share sheet is right there, handwriting
-  search works. Start here.
-- **GoodNotes / Notability** — better ink, paid. Move to one of these only if
-  Notes chafes.
-- **Notion, Joplin** — no real Pencil inking, and both would be a second silo
-  that still needs exporting. Skip.
-- **Obsidian + Excalidraw plugin** — ink lands inside the vault directly, which
-  sounds ideal, but Excalidraw is a drawing canvas rather than a notebook. Poor
-  fit for fifty minutes of fast lecture writing.
+That second criterion is what decides it. Companion ink for one lecture is two
+or three pages out of a running notebook, and you need exactly those pages —
+not the whole notebook, not one endless scroll.
+
+- **GoodNotes** — start here. Selected-page PDF export is the deciding feature,
+  ink latency is the best of the bunch, and folders per class mirror the vault.
+  Paid.
+- **Apple Notes** — free and installed, and fine if you keep one note per
+  lecture. But it exports the whole note, so the discipline has to come from
+  you. Reasonable way to try the pipeline before paying for anything.
+- **Notability** — records audio synced to ink, which is tempting, but that
+  means recording on the iPad. See Step 4.
+- **Notion, Joplin** — no serious Pencil inking, and both become a second silo
+  you still have to export from. Skip.
+- **Obsidian + Excalidraw** — ink lands in the vault directly, which sounds
+  ideal for diagrams specifically. But Excalidraw is an infinite drawing canvas
+  rather than a notebook, and it's slow to drive mid-lecture. Possible later for
+  redrawing a diagram cleanly after the fact; wrong tool for live capture.
 
 ## Step 4: audio, and the Pencil noise problem
+
+This matters more here than in a normal setup. Because the ink is sparse and
+diagram-heavy by design, the audio is carrying most of the content. A degraded
+transcript isn't a partial loss — it's the loss of everything the notes
+deliberately didn't duplicate.
 
 Recording on the same iPad you're writing on is a real risk, not a theoretical
 one. Pencil taps are structure-borne: they travel through the chassis into
@@ -173,6 +224,8 @@ A matte or Paperlike screen protector makes it worse, not better.
 Options, best first:
 
 1. **Record on the iPhone, write on the iPad.** Separate device, problem gone.
+   Given how much the audio is carrying, treat this as the default rather than
+   one option among three.
 2. **Record on the iPad but prop it in a stand** instead of flat under your
    writing hand. Partial mitigation.
 3. **Record on the iPad and accept it.** Test one lecture first: ten minutes of
@@ -255,3 +308,26 @@ Start read-only. Upgrade if it chafes.
   from source, not exercised from an iPad.
 - The Pencil-noise test (option 3 in Step 4) hasn't been done.
 - The mesh bind is set but has never been hit from the iPad.
+
+### The diagram gap — unsolved
+
+`/ocr` (app.py:539) reads the request body, sends it to Claude, and returns
+markdown. It never writes the image to disk. Grep the vault: the only `![[...]]`
+embeds `app.py` produces are the Timeline bases at 2095 and 2099. **No image has
+ever been written into the vault.**
+
+For prose notes that's fine. For a free-body diagram it is not: Claude's
+description replaces the drawing, the drawing is discarded, and there is no
+artifact to go back to. Given that diagrams are a main reason these notes exist
+at all, this is the real gap in the workflow.
+
+Minimum fix, if it's worth building: write the uploaded image into the vault
+beside the note and emit an `![[...]]` line so Obsidian renders it — keeping
+both the picture and Claude's reading of it.
+
+The design constraint that makes this non-trivial: `_refile_group` rebuilds the
+note with a wholesale `dest.write_text(_note_md(group))`, so the embed line must
+be **DB-derived** like everything else in that note. A new column, or reuse of
+`addendum`. A hand-added line in the file gets eaten on the next refile.
+
+Not built. Not scoped beyond this paragraph.
