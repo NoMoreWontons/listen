@@ -41,7 +41,7 @@ easy to hit from Shortcuts.
 ## Step 1: make the server reachable from the iPad
 
 `start_server.bat` used to bind `127.0.0.1`, which nothing outside the laptop
-can see. It now binds the mesh IP `100.69.173.35`.
+can see. It now binds the mesh IP `<your-mesh-ip>`.
 
 Do **not** switch that to `0.0.0.0`. There is no auth on any endpoint, the
 process holds live Supabase and Anthropic keys, and `/delete_unit` is a POST
@@ -57,12 +57,25 @@ its long-term future is a shrug — Tailscale is the fallback if it rots.
 1. Enable Meshnet in the NordVPN app on the laptop and on the iPad. Link the
    two devices.
 2. Find the laptop's mesh IP — the Nord app's device list, or `tailscale ip -4`.
-   Here it is **100.69.173.35** (CGNAT range, 100.64.0.0/10).
-3. `start_server.bat` (already done):
+   It's in the CGNAT range, `100.64.0.0/10`.
+3. Put it in `.env`, which is gitignored. This repo is public, so the address
+   stays out of git:
+
+   ```
+   LISTEN_HOST=100.64.x.x
+   ```
+
+   `start_server.bat` reads it and falls back to `127.0.0.1` when the key is
+   absent, so a missing `.env` can never bind wide by accident:
 
    ```bat
-   .venv\Scripts\python.exe -m uvicorn app:app --host 100.69.173.35 --port 8000
+   for /f "usebackq tokens=1,* delims==" %%a in (".env") do if "%%a"=="LISTEN_HOST" set "LISTEN_HOST=%%b"
+   if not defined LISTEN_HOST set "LISTEN_HOST=127.0.0.1"
+   .venv\Scripts\python.exe -m uvicorn app:app --host %LISTEN_HOST% --port 8000
    ```
+
+   The bat echoes what it bound on startup. Substitute your own address for
+   `<your-mesh-ip>` everywhere below.
 
 4. **Open the port in Windows Firewall.** This step is easy to miss and looks
    exactly like a broken mesh when you skip it. Loopback traffic bypasses the
@@ -81,13 +94,13 @@ its long-term future is a shrug — Tailscale is the fallback if it rots.
    mesh-only. Two independent layers.
 
 5. On the iPad: NordVPN app open, Meshnet on, laptop listed as a linked peer.
-6. Browse to `http://100.69.173.35:8000`. **Type `http://` explicitly** —
+6. Browse to `http://<your-mesh-ip>:8000`. **Type `http://` explicitly** —
    Safari and Chrome auto-upgrade a bare `IP:port` to `https://`, nothing is
    listening on HTTPS, and the failure reads as "not a secure connection"
    rather than as a wrong scheme.
 
 Note that binding the mesh IP means **`localhost:8000` no longer works**. Use
-`http://100.69.173.35:8000` on the laptop as well. The tradeoff is that NordVPN
+`http://<your-mesh-ip>:8000` on the laptop as well. The tradeoff is that NordVPN
 has to be up to use the app at all, even locally. If that chafes, the
 alternative is binding `0.0.0.0` and relying on the firewall rule above as the
 only thing keeping the port off Wi-Fi — one layer instead of two. Not
@@ -99,10 +112,10 @@ From the laptop, before touching the iPad:
 
 ```powershell
 Get-NetTCPConnection -State Listen -LocalPort 8000 | Select LocalAddress,OwningProcess
-Invoke-WebRequest http://100.69.173.35:8000/recordings -UseBasicParsing | % StatusCode
+Invoke-WebRequest http://<your-mesh-ip>:8000/recordings -UseBasicParsing | % StatusCode
 ```
 
-A listener on `100.69.173.35` plus a `200` means the server is healthy and any
+A listener on `<your-mesh-ip>` plus a `200` means the server is healthy and any
 remaining failure is firewall or mesh, not the app.
 
 Binding to the mesh IP rather than `0.0.0.0` means the port is never bound on
@@ -118,7 +131,7 @@ Two gotchas:
 ## Step 2: the share-sheet Shortcuts
 
 Before building anything, confirm reachability: on the iPad, open
-`http://100.69.173.35:8000` in Safari with the server running. If the listen UI
+`http://<your-mesh-ip>:8000` in Safari with the server running. If the listen UI
 doesn't load, the Shortcuts won't work either and the problem is the mesh, not
 the Shortcut.
 
@@ -147,7 +160,7 @@ entries in the share sheet are faster to hit than one with a menu.
 2. In the URL field, type exactly:
 
    ```
-   http://100.69.173.35:8000/upload?kind=pdf&filename=notes.pdf
+   http://<your-mesh-ip>:8000/upload?kind=pdf&filename=notes.pdf
    ```
 
 3. Tap the **chevron** (`>`) on the action to expand it, then set:
@@ -168,7 +181,7 @@ Identical, with three changes:
 - URL:
 
   ```
-  http://100.69.173.35:8000/upload?kind=audio&filename=lecture.m4a
+  http://<your-mesh-ip>:8000/upload?kind=audio&filename=lecture.m4a
   ```
 
 ### Using them
@@ -185,7 +198,7 @@ through them; see "Attaching companion ink" below.
 
 ### Attaching companion ink to a lecture
 
-1. On the iPad, open `http://100.69.173.35:8000` in Safari.
+1. On the iPad, open `http://<your-mesh-ip>:8000` in Safari.
 2. Find the lecture's card in the list.
 3. Tap **Add notes from file** (`ocrNotes`, index.html:1042) and pick the
    exported PDF or a photo of the page.
@@ -218,7 +231,7 @@ the ponytail comment at app.py:322). Claude renames the note during
 To pass the real name instead: insert a **Get Details of Files** action
 (property **Name**) before the request, then build the URL with a **Text**
 action containing
-`http://100.69.173.35:8000/upload?kind=pdf&filename=` followed by that Name
+`http://<your-mesh-ip>:8000/upload?kind=pdf&filename=` followed by that Name
 variable, and feed that Text into the URL field. Skip it until the placeholder
 titles actually annoy you.
 
