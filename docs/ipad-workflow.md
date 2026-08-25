@@ -361,25 +361,63 @@ Start read-only. Upgrade if it chafes.
 - The Pencil-noise test (option 3 in Step 4) hasn't been done.
 - The mesh bind is set but has never been hit from the iPad.
 
-### The diagram gap — unsolved
+### The diagram gap — solved
 
-`/ocr` (app.py:539) reads the request body, sends it to Claude, and returns
-markdown. It never writes the image to disk. Grep the vault: the only `![[...]]`
-embeds `app.py` produces are the Timeline bases at 2095 and 2099. **No image has
-ever been written into the vault.**
+`/ocr` used to read the request body, send it to Claude, and return markdown
+without ever writing the image to disk. A free-body diagram became Claude's
+prose about a free-body diagram, and the drawing was gone.
 
-For prose notes that's fine. For a free-body diagram it is not: Claude's
-description replaces the drawing, the drawing is discarded, and there is no
-artifact to go back to. Given that diagrams are a main reason these notes exist
-at all, this is the real gap in the workflow.
+Now the uploaded page is stored in `<vault>/Attachments/` and embedded in the
+note, so the original renders directly beneath the summary Claude wrote from it.
 
-Minimum fix, if it's worth building: write the uploaded image into the vault
-beside the note and emit an `![[...]]` line so Obsidian renders it — keeping
-both the picture and Claude's reading of it.
+- `save_attachment` writes `<original stem>-<rid8>-<n>.<ext>`, readable enough
+  to browse by hand. Gated to `.pdf/.png/.jpg/.jpeg/.webp/.gif` — the types
+  Obsidian actually embeds. A `.docx` would produce a broken link, so those stay
+  text-only.
+- `_note_md` emits a **Source pages** section per recording (`##` on a
+  single-recording note, `###` inside each dated section of a combined one).
+- PDFs are embedded as PDFs. Obsidian renders them inline, which avoids a
+  pdf2image/poppler dependency and keeps multi-page ink lossless.
+- The embed list is **read off disk**, not stored in a DB column, so no
+  migration. `_refile_group` rewrites notes wholesale from the DB on every
+  merge, split, delete and relabel; regenerating the list on each write is
+  required anyway, and derived-from-disk can't drift from what the vault holds.
+- `Attachments/` sits at the vault root because notes **move** when units and
+  topics merge — a per-unit folder would orphan them. Wikilinks resolve by
+  filename anywhere in the vault, so the location doesn't matter to the link.
+- `write_graph_config` scans vault-root folders as semesters, so `ATTACH_DIR` is
+  excluded there or it shows up as a phantom semester. There's a test for that.
+- `delete_recording` calls `drop_attachments`, since nothing else references
+  them.
 
-The design constraint that makes this non-trivial: `_refile_group` rebuilds the
-note with a wholesale `dest.write_text(_note_md(group))`, so the embed line must
-be **DB-derived** like everything else in that note. A new column, or reuse of
-`addendum`. A hand-added line in the file gets eaten on the next refile.
+The `/ocr` prompt was also tightened: Claude is told not to reproduce or infer
+diagrams, and to write a placeholder naming the diagram with only the labels it
+can actually read — `[diagram: free-body diagram — labels: mg, N, f]` — rather
+than guessing at values, angles or directions. The original renders beside it,
+so an honest placeholder beats a confident wrong description.
 
-Not built. Not scoped beyond this paragraph.
+### What the embed does not fix
+
+It makes a misreading **detectable and correctable**. It does not make it
+harmless.
+
+The OCR text lands in the `notes` column, and `/label` re-runs `analyze`, which
+folds those notes into the summary. The summary is in turn the input to
+`/quiz/generate`, `/cards/generate` and `/cheatsheet`. So a misread diagram can
+propagate into study material you later drill from, and the correct image
+sitting next to it doesn't stop that.
+
+The real defense is the review step: `ocrNotes` drops the transcription into a
+textarea and focuses it, unsaved, so you read it before it becomes the summary.
+That is an argument for keeping companion ink on the listen-UI path rather than
+a fire-and-forget Shortcut. Read the text, fix what's wrong, then save.
+
+### Open
+
+- The mesh bind, both Shortcuts, and the Pencil-noise question are still
+  untested against a real iPad and a real lecture.
+- The attachment pipeline has unit tests (`test_attach.py`, 7 checks) but has
+  not been driven end to end through the browser with a real diagram.
+- The server must be restarted to pick this up. Existing notes gain a Source
+  pages section the next time their topic group refiles; there is nothing to
+  backfill, since no attachments existed before now.

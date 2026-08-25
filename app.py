@@ -37,6 +37,16 @@ OBSIDIAN_VAULT = pathlib.Path(
 # the scope spans units). Was "Practice"; _migrate_prep_dirs renames old ones.
 PREP_DIR = "Exam Prep"
 
+# Original uploaded pages (ink notes, diagrams, scanned handouts) live here so
+# the drawing survives Claude's transcription of it. Vault root, not beside the
+# note: wikilinks resolve by filename anywhere in the vault, and notes MOVE when
+# units/topics merge -- a per-unit folder would orphan its attachments. Excluded
+# from the semester scan in write_graph_config, or it reads as a semester.
+ATTACH_DIR = "Attachments"
+# Only what Obsidian actually embeds. A .docx would write an ![[x.docx]] that
+# renders as a broken link, so those stay text-only through /ocr.
+ATTACH_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif")
+
 # Shared by every prompt that may draw a diagram (lecture summaries, cheat
 # sheets). Obsidian renders mermaid fences natively and so does the in-app
 # view; a syntax error renders as an error box, which is worse than the prose
@@ -326,6 +336,10 @@ async def upload(request: Request, kind: str = "audio", filename: str = ""):
         threading.Thread(target=process, args=(rid,), daemon=True).start()
     else:
         pdf_path(rid).write_bytes(data)  # survives a crash; recovery = re-upload
+        # A syllabus is administrative -- nothing to look at later. Course
+        # material and homework can carry diagrams worth keeping verbatim.
+        if kind != "syllabus":
+            save_attachment(rid, filename, data)
         _set(rid, stage="summarizing")
         threading.Thread(target=process_pdf, args=(rid,), daemon=True).start()
     return {"id": rid}
@@ -537,12 +551,17 @@ def office_text(data, ext=None):
 
 
 @app.post("/ocr")
-async def ocr(request: Request, filename: str = ""):
+async def ocr(request: Request, filename: str = "", rid: str = ""):
     """Photo/PDF of handwritten or printed notes -> markdown text for the notes
     box. Raw body like /upload. Returns the text; the browser appends it to the
     notes textarea so the user reviews before saving."""
     import base64
     data = await request.body()
+    # Store the page before transcribing it. Claude can misread a diagram, and
+    # without the original there is nothing to check the transcription against.
+    # Silent when rid is absent (the caller isn't attaching to a recording) or
+    # the type isn't embeddable.
+    attached = save_attachment(rid, filename, data) if rid else None
     ext = pathlib.Path(filename).suffix.lower().lstrip(".")
     media = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
              "gif": "image/gif", "webp": "image/webp"}.get(ext)
@@ -567,11 +586,18 @@ async def ocr(request: Request, filename: str = ""):
             messages=[{"role": "user", "content": [block, {"type": "text", "text": (
                 "These are a student's notes (may be handwritten). Transcribe them "
                 "to markdown, faithful to the original wording and structure. Keep "
-                "lists as lists; mark anything illegible as [illegible]. Return "
-                "ONLY the transcription."
+                "lists as lists; mark anything illegible as [illegible].\n\n"
+                "Do NOT reproduce or infer diagrams. Where the page has one, write a "
+                "single placeholder line naming it and listing only labels you can "
+                "actually read, e.g. '[diagram: free-body diagram — labels: mg, N, f]'. "
+                "The original page is stored beside these notes and renders next to "
+                "them, so an honest placeholder is more useful than a guessed "
+                "description. Never state a value, direction, angle or relationship "
+                "the drawing does not clearly show.\n\n"
+                "Return ONLY the transcription."
             )}]}],
         )
-        return {"text": _text(msg)}
+        return {"text": _text(msg), "attached": attached}
     except Exception as e:
         return {"error": f"transcription failed: {e}"}
 
@@ -587,6 +613,7 @@ def delete_recording(rid: str):
     sb.table("recordings").delete().eq("id", rid).execute()
     audio_path(rid).unlink(missing_ok=True)
     pdf_path(rid).unlink(missing_ok=True)
+    drop_attachments(rid)  # nothing else references them; they'd sit in the vault forever
     if row.get("obsidian_path"):
         # _refile_group rebuilds from whatever remains under these labels (row
         # is already gone from the DB), or removes the file — vault check included
@@ -2015,16 +2042,27 @@ def _note_md(rows):
         a = (r.get("addendum") or "").strip()
         return f"\n\n{h} Corrections & additions\n\n{a}" if a else ""
 
+    def pages(r, h):
+        """Embeds of the uploaded pages. Claude's transcription can misread a
+        diagram; the original renders right beside it, so the error is visible
+        and fixable instead of silently standing in for the drawing."""
+        names = _attachments(r.get("id"))
+        if not names:
+            return ""
+        return f"\n\n{h} Source pages\n\n" + "\n".join(f"![[{x}]]" for x in names)
+
     if len(rows) == 1:
         return (
             head
             + f"## Summary\n\n{first.get('summary') or ''}"
             + extra(first, "##")
+            + pages(first, "##")
             + f"\n\n## Transcript\n\n{first.get('transcript') or ''}\n"
         )
     heading = lambda r: f"{(r.get('created_at') or '')[:10]} — {r.get('title') or r.get('topic') or 'Lecture'}"
     notes = "\n\n".join(
-        f"## {heading(r)}\n\n{r.get('summary') or ''}{extra(r, '###')}" for r in rows)
+        f"## {heading(r)}\n\n{r.get('summary') or ''}{extra(r, '###')}{pages(r, '###')}"
+        for r in rows)
     transcripts = "\n\n".join(
         f"### {heading(r)}\n\n{r.get('transcript') or ''}" for r in rows)
     return head + notes + "\n\n## Transcripts\n\n" + transcripts + "\n"
@@ -2169,7 +2207,8 @@ def write_graph_config():
     # Trailing slash keeps a unit legitimately named "Exam Preparation" out.
     groups = [{"query": f'path:"{PREP_DIR}/"', "color": {"a": 1, "rgb": PREP_COLOR}}]
     sems = sorted(d for d in OBSIDIAN_VAULT.iterdir()
-                  if d.is_dir() and not d.name.startswith("."))
+                  if d.is_dir() and not d.name.startswith(".")
+                  and d.name != ATTACH_DIR)
     classes = [(sem, c) for sem in sems
                for c in sorted(p for p in sem.iterdir() if p.is_dir())]
     n = max(len(classes), 1)
@@ -2304,6 +2343,49 @@ def _rows_semester(rows):
     selector defaults to 'All semesters', and an empty semester would slug to
     'Untitled' and strand the note at the vault root, off the graph."""
     return next((r.get("semester") for r in rows if r.get("semester")), "")
+
+
+def save_attachment(rid, filename, data):
+    """Keep the uploaded page itself in the vault, not just Claude's reading of
+    it. A misread diagram is then correctable against the original instead of
+    being the only surviving record. Returns the stored filename, or None when
+    the type is one Obsidian won't embed.
+
+    Named "<original stem>-<rid8>-<n>.<ext>" so the folder stays skimmable by
+    hand while _attachments can still find one recording's pages."""
+    ext = pathlib.Path(filename or "").suffix.lower()
+    if ext not in ATTACH_EXTS:
+        return None
+    d = OBSIDIAN_VAULT / ATTACH_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    stem = _slug(pathlib.Path(filename).stem)  # returns "Untitled" if empty
+    i = 1
+    while (d / f"{stem}-{rid[:8]}-{i}{ext}").exists():
+        i += 1
+    dest = d / f"{stem}-{rid[:8]}-{i}{ext}"
+    dest.write_bytes(data)
+    return dest.name
+
+
+def _attachments(rid):
+    """Stored page filenames for one recording, oldest first. Read off disk
+    rather than a DB column: _refile_group rewrites notes wholesale, so the
+    embed list is regenerated on every write anyway, and derived-from-disk
+    cannot drift from what the vault actually holds."""
+    d = OBSIDIAN_VAULT / ATTACH_DIR
+    if not rid or not d.is_dir():
+        return []
+    # sort by length first: a plain sort puts "-10" before "-2"
+    return sorted((f.name for f in d.glob(f"*-{rid[:8]}-*") if f.is_file()),
+                  key=lambda s: (len(s), s))
+
+
+def drop_attachments(rid):
+    """Unlink one recording's stored pages. Called from delete_recording --
+    nothing else references them, so they would sit in the vault forever."""
+    d = OBSIDIAN_VAULT / ATTACH_DIR
+    for name in _attachments(rid):
+        (d / name).unlink(missing_ok=True)
 
 
 def write_prep_note(sem, cls, unit, filename, body):

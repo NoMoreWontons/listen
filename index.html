@@ -1166,7 +1166,7 @@ async function ocrNotes(rid, btn, sel = '.lbl-notes') {
     const old = btn.textContent;
     btn.disabled = true; btn.textContent = 'transcribing…';
     try {
-      const resp = await (await fetch(`/ocr?filename=${encodeURIComponent(f.name)}`,
+      const resp = await (await fetch(`/ocr?filename=${encodeURIComponent(f.name)}&rid=${encodeURIComponent(rid)}`,
         { method: 'POST', body: f })).json();
       if (resp.error) { alert(resp.error); return; }
       const ta = document.querySelector(`.labels[data-rid="${rid}"] ${sel}`);
