@@ -1,11 +1,12 @@
 # iPad + Apple Pencil into the listen vault
 
 How handwritten notes and off-laptop audio reach the vault at
-`C:\Users\savag\College Lectures`. Written 2026-08-25.
+`C:\Users\savag\College Lectures`. Written 2026-08-25; transport rewritten
+2026-08-30 (NordVPN Meshnet → Tailscale Serve).
 
-The short version: the intake endpoints mostly already exist. What's missing is
-a way for the iPad to reach the server, a share-sheet Shortcut to hit it, and
-one real gap — diagrams.
+The short version: the intake endpoints already exist, and the iPad now reaches
+them over https via Tailscale Serve (Step 1). What's left is building the
+share-sheet Shortcuts (Step 2).
 
 ## What these notes actually are
 
@@ -34,35 +35,41 @@ it pollutes the counts that flashcard and quiz generation read from.
 | `POST /ocr` | 539 | Photo/PDF/pptx/docx → markdown, returned as text for the notes box. Human reviews before saving. Wired to the "Add notes from file" button in `index.html`. |
 | `POST /label/{rid}` | 405 | User labels + notes as JSON. On a `done` recording whose notes changed, re-runs `analyze` so the summary absorbs them. This is the companion-ink path. |
 | `POST /addendum/{rid}` | 436 | Dated append to a finished recording. Stored in the DB `addendum` column, so it survives note rewrites. |
+| `POST /pending` | 630 | Stages a page with no lecture chosen yet. Transcribes on arrival, holds it in `listen/pending/` until you attach it. Raw body plus `?filename=`, same shape as `/upload`, so the share sheet can hit it. |
 
 All of these take a raw request body, not multipart — which is what makes them
 easy to hit from Shortcuts.
 
 ## Step 1: make the server reachable from the iPad
 
-`start_server.bat` used to bind `127.0.0.1`, which nothing outside the laptop
-can see. It now binds the mesh IP `<your-mesh-ip>`.
+Two constraints pull in opposite directions. The server has **no auth on any
+endpoint**, holds live Supabase and Anthropic keys in-process, and `/delete_unit`
+is one POST away — so it must not be reachable from campus or dorm wifi. But
+`getUserMedia` only exists in a **secure context**: https, or http on localhost.
+Plain http to an IP means the browser hides the microphone and the Record button
+dies with the `INSECURE_MSG` alert (`index.html:865`).
 
-Do **not** switch that to `0.0.0.0`. There is no auth on any endpoint, the
-process holds live Supabase and Anthropic keys, and `/delete_unit` is a POST
-away. On campus or dorm wifi that's the whole app handed to the subnet.
+Tailscale Serve satisfies both. uvicorn binds loopback only; `tailscale serve`
+terminates https in front of it with a real Let's Encrypt cert and exposes it to
+your tailnet alone.
 
-Instead, put both devices on a private mesh and bind to the mesh interface
-only.
+```
+iPad ──https──> tailscale serve ──http──> 127.0.0.1:8000
+      (tailnet only)            (loopback)
+```
 
-**NordVPN Meshnet** (already paid for). Nord announced a Dec 1 2025 shutdown,
-then reversed it in September 2025 and open-sourced the feature. It works, but
-its long-term future is a shrug — Tailscale is the fallback if it rots.
+1. Install Tailscale on the laptop and the iPad, log in to the same account on
+   both.
 
-1. Enable Meshnet in the NordVPN app on the laptop and on the iPad. Link the
-   two devices.
-2. Find the laptop's mesh IP — the Nord app's device list, or `tailscale ip -4`.
-   It's in the CGNAT range, `100.64.0.0/10`.
-3. Put it in `.env`, which is gitignored. This repo is public, so the address
-   stays out of git:
+2. In the admin console under **DNS**, enable **MagicDNS**, then enable **HTTPS
+   Certificates**. Both are required. Enabling certs publishes your machine name
+   and tailnet DNS name to a public certificate ledger — that's the cost, and
+   it's the only thing that becomes public. Free on the Personal plan.
+
+3. Bind loopback. In `.env` (gitignored):
 
    ```
-   LISTEN_HOST=100.64.x.x
+   LISTEN_HOST=127.0.0.1
    ```
 
    `start_server.bat` reads it and falls back to `127.0.0.1` when the key is
@@ -74,68 +81,80 @@ its long-term future is a shrug — Tailscale is the fallback if it rots.
    .venv\Scripts\python.exe -m uvicorn app:app --host %LISTEN_HOST% --port 8000
    ```
 
-   The bat echoes what it bound on startup. Substitute your own address for
-   `<your-mesh-ip>` everywhere below.
+   The bat echoes what it bound on startup.
 
-4. **Open the port in Windows Firewall.** This step is easy to miss and looks
-   exactly like a broken mesh when you skip it. Loopback traffic bypasses the
-   firewall entirely, so binding `127.0.0.1` never needed a rule; binding a real
-   interface does, and Windows blocks inbound by default. In an **Administrator**
-   PowerShell:
+4. On the laptop:
 
-   ```powershell
-   New-NetFirewallRule -DisplayName "listen server (NordLynx only)" `
-     -Direction Inbound -Protocol TCP -LocalPort 8000 `
-     -InterfaceAlias NordLynx -Action Allow -Profile Any
+   ```
+   tailscale serve --bg 8000
    ```
 
-   `-InterfaceAlias NordLynx` scopes it to the mesh adapter. The Wi-Fi subnet
-   stays blocked, and the socket doesn't exist there anyway because the bind is
-   mesh-only. Two independent layers.
+   It prints the URL. Substitute your own for `<your-ts-url>` everywhere below.
+   To undo: `tailscale serve --https=443 off`.
 
-5. On the iPad: NordVPN app open, Meshnet on, laptop listed as a linked peer.
-6. Browse to `http://<your-mesh-ip>:8000`. **Type `http://` explicitly** —
-   Safari and Chrome auto-upgrade a bare `IP:port` to `https://`, nothing is
-   listening on HTTPS, and the failure reads as "not a secure connection"
-   rather than as a wrong scheme.
+No firewall rule is needed. The old setup bound a mesh interface directly and
+needed an inbound TCP allow scoped to that adapter; the socket now exists only
+on loopback, which the firewall doesn't govern. One fewer moving part.
 
-Note that binding the mesh IP means **`localhost:8000` no longer works**. Use
-`http://<your-mesh-ip>:8000` on the laptop as well. The tradeoff is that NordVPN
-has to be up to use the app at all, even locally. If that chafes, the
-alternative is binding `0.0.0.0` and relying on the firewall rule above as the
-only thing keeping the port off Wi-Fi — one layer instead of two. Not
-recommended for an app with no auth and live API keys in the process.
+`serve` is tailnet-only. Do **not** use `tailscale funnel` — that publishes to
+the open internet, and this app has no auth.
+
+### NordVPN Meshnet cannot coexist with this
+
+The previous version of this doc used NordVPN Meshnet. **Both Meshnet and
+Tailscale allocate out of the same CGNAT range, `100.64.0.0/10`**, and NordLynx
+claims the whole block on-link:
+
+```
+0.0.0.0      0.0.0.0       100.64.0.1   100.69.x.y      6   <- NordLynx default route
+100.64.0.0   255.192.0.0   On-link      100.69.x.y      6   <- swallows all of 100.64/10
+```
+
+Every Tailscale address falls inside that and gets routed into Nord's tunnel.
+Symptoms: you cannot ping your own Tailscale IP, peers give "General failure",
+and the ts.net URL fails with `ERR_CONNECTION_CLOSED` while the cert issues
+fine and loopback returns `200`. Nord also overrides the system resolver
+(`103.86.96.100`), so MagicDNS at `100.100.100.100` never gets consulted and
+ts.net names don't resolve at all.
+
+Quit NordVPN. Closing the window is not enough — the NordLynx adapter stays up
+holding the route and the DNS override. Exit from the system tray, or uninstall.
+On iOS it's moot: Meshnet and Tailscale contend for the single
+`NEPacketTunnelProvider` slot, so only one runs at a time.
 
 ### Checking it works
 
-From the laptop, before touching the iPad:
+From the laptop:
 
 ```powershell
 Get-NetTCPConnection -State Listen -LocalPort 8000 | Select LocalAddress,OwningProcess
-Invoke-WebRequest http://<your-mesh-ip>:8000/recordings -UseBasicParsing | % StatusCode
+curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:8000/recordings
+tailscale serve status
 ```
 
-A listener on `<your-mesh-ip>` plus a `200` means the server is healthy and any
-remaining failure is firewall or mesh, not the app.
+A listener on `127.0.0.1`, a `200`, and a serve entry proxying to
+`http://127.0.0.1:8000` means the laptop side is healthy.
 
-Binding to the mesh IP rather than `0.0.0.0` means the port is never bound on
-the wifi interface at all. Machines on the local subnet cannot see it, scan it,
-or reach it. That is the entire security story for this setup.
+**The laptop cannot reach its own ts.net URL.** The Windows Tailscale tun
+adapter won't loop traffic back to its own address, so `curl` to `<your-ts-url>`
+hangs from the same machine even when everything is correct. This is not a
+fault. Use `http://127.0.0.1:8000` on the laptop — that's a secure origin, so
+recording works there — and test the ts.net URL from the iPad.
 
 Two gotchas:
 
-- The mesh has to be up **before** uvicorn starts, or the bind fails because
-  the IP doesn't exist yet. Start Nord first.
-- Meshnet needs the NordVPN app running on the iPad too, not just the laptop.
+- Tailscale has to be up **before** uvicorn starts is no longer true: the bind
+  is loopback, so uvicorn starts regardless. Only `serve` needs Tailscale.
+- The Tailscale app must be toggled on on the iPad, not just installed.
 
 ## Step 2: the share-sheet Shortcuts
 
 Before building anything, confirm reachability: on the iPad, open
-`http://<your-mesh-ip>:8000` in Safari with the server running. If the listen UI
-doesn't load, the Shortcuts won't work either and the problem is the mesh, not
+`<your-ts-url>` in Safari with the server running. If the listen UI
+doesn't load, the Shortcuts won't work either and the problem is Tailscale, not
 the Shortcut.
 
-Two Shortcuts, one per kind. Four actions each. No branching — two separate
+Three Shortcuts, one per kind. Four actions each. No branching — separate
 entries in the share sheet are faster to hit than one with a menu.
 
 ### Shortcut A — "Send Notes to Listen"
@@ -160,7 +179,7 @@ entries in the share sheet are faster to hit than one with a menu.
 2. In the URL field, type exactly:
 
    ```
-   http://<your-mesh-ip>:8000/upload?kind=pdf&filename=notes.pdf
+   <your-ts-url>/upload?kind=pdf&filename=notes.pdf
    ```
 
 3. Tap the **chevron** (`>`) on the action to expand it, then set:
@@ -181,20 +200,80 @@ Identical, with three changes:
 - URL:
 
   ```
-  http://<your-mesh-ip>:8000/upload?kind=audio&filename=lecture.m4a
+  <your-ts-url>/upload?kind=audio&filename=lecture.m4a
   ```
+
+### Shortcut C — "Stage Page in Listen"
+
+Companion ink for a lecture. Same four actions as A, hitting `/pending`
+(app.py:630) instead of `/upload` — it takes a raw body and `?filename=`, the
+same shape, so nothing had to be built for this.
+
+- Name: `Stage Page in Listen`
+- **Share Sheet Types**: **Files**, **PDFs**, **Images**
+- URL:
+
+  ```
+  <your-ts-url>/pending?filename=page.pdf
+  ```
+
+The page is transcribed on arrival and lands under **Pages waiting** in the
+listen UI. You proofread it there and tap **Attach** to bind it to a lecture —
+see "Pages that arrive before their lecture" below. This is the share-sheet
+route to the staging flow; the **✎ iPad Page** button is the same endpoint from
+inside the UI.
+
+Use this, not Shortcut A, for anything belonging to a lecture. A goes to
+`/upload?kind=pdf`, which creates its own `recordings` row.
 
 ### Using them
 
-These Shortcuts are for **standalone material only** — a handout, a worksheet, a
-recording made away from the laptop. Companion ink for a lecture does not go
-through them; see "Attaching companion ink" below.
+| What you have | Shortcut | Where it lands |
+|---|---|---|
+| Voice memo | **Send Audio to Listen** (`/upload?kind=audio`) | New recording, transcribes |
+| Handout, worksheet, anything with no lecture behind it | **Send Notes to Listen** (`/upload?kind=pdf`) | New row, auto-labeled and filed |
+| Ink for a lecture you recorded | **Stage Page in Listen** (`/pending`) | Pages waiting → proofread → Attach |
 
 | App | Path |
 |---|---|
-| GoodNotes | Share → Export → PDF → pick the pages → Share → *Send Notes to Listen* |
-| Apple Notes | `...` → **Send a Copy** → *Send Notes to Listen*. If the shortcut doesn't appear, `...` → **Print**, pinch outward on the preview to open it as a PDF, then share. |
+| GoodNotes | Share → Export → PDF → pick the pages → Share → *Stage Page in Listen* (or *Send Notes to Listen* if standalone) |
+| Apple Notes | `...` → **Send a Copy** → the shortcut. If it doesn't appear, `...` → **Print**, pinch outward on the preview to open it as a PDF, then share. |
 | Voice Memos | select the recording → `...` → **Share** → *Send Audio to Listen* |
+
+When adding **Get Contents of URL**, Shortcuts auto-fills the URL field with the
+`Shortcut Input` variable, because the shortcut starts with a share-sheet input.
+Delete it and type the URL literally. `Shortcut Input` belongs in the **File**
+field under Request Body. URL is where it's sent; File is what's sent.
+
+### Saving to Files instead
+
+The pickers in the UI are plain `<input type="file">` with
+`accept=".pdf,image/*"` (index.html:756, 759), so on iOS **Choose File** opens
+the Files app and reads anything you've saved there. GoodNotes appears as a
+location, but it exposes `.goodnotes` notebook bundles rather than PDFs — those
+grey out against `accept`, and nothing here could parse them. Exporting is
+unavoidable.
+
+Which means Files costs more taps, not fewer:
+
+- **Shortcut** — export → PDF → pick pages → Share → tap the shortcut. Done,
+  already transcribed and waiting.
+- **Save to Files** — export → PDF → pick pages → Save to Files → pick folder →
+  Save → open listen → find the card → Add notes from file → Choose File →
+  navigate → pick.
+
+The export half is identical. Files adds a round trip and leaves a file behind.
+It earns its keep only for **batching**: export a week of pages into one folder
+in a sitting, then attach them one at a time later.
+
+**GoodNotes Auto-Backup is not the shortcut it looks like.** Settings →
+Auto-Backup exports to iCloud Drive or Dropbox continuously with no per-page
+action, but it exports **whole notebooks**. Attaching a full-semester notebook
+PDF to one lecture dumps every page's OCR into that recording's notes, and that
+text feeds `analyze` → `/quiz/generate` → `/cards/generate`. Wrong granularity.
+
+Page selection is the thing that actually matters, and only the manual export
+offers it. There is no way around that step in either direction.
 
 ### Pages that arrive before their lecture
 
@@ -236,7 +315,7 @@ filed beside the note, and not to describe detail it wasn't given.
 
 ### Attaching companion ink to a lecture
 
-1. On the iPad, open `http://<your-mesh-ip>:8000` in Safari.
+1. On the iPad, open `<your-ts-url>` in Safari.
 2. Find the lecture's card in the list.
 3. Tap **Add notes from file** (`ocrNotes`, index.html:1042) and pick the
    exported PDF or a photo of the page.
@@ -256,7 +335,7 @@ a background thread. The notification fires in about a second regardless of how
 long the lecture is — it confirms the upload landed, not that transcription
 finished. Watch the listen UI for that.
 
-If the mesh is down or the server isn't running, Shortcuts throws its own
+If Tailscale is down or the server isn't running, Shortcuts throws its own
 connection error dialog. There is no silent-failure case.
 
 ### On the hardcoded filename
@@ -269,7 +348,7 @@ the ponytail comment at app.py:322). Claude renames the note during
 To pass the real name instead: insert a **Get Details of Files** action
 (property **Name**) before the request, then build the URL with a **Text**
 action containing
-`http://<your-mesh-ip>:8000/upload?kind=pdf&filename=` followed by that Name
+`<your-ts-url>/upload?kind=pdf&filename=` followed by that Name
 variable, and feed that Text into the URL field. Skip it until the placeholder
 titles actually annoy you.
 
@@ -311,6 +390,18 @@ mics sitting inches away, while the lecturer is meters off. Whisper handles
 broadband transients badly — they produce hallucinated text, not just dropouts.
 A matte or Paperlike screen protector makes it worse, not better.
 
+There is a second reason not to record in the listen web app on the iPad:
+**iOS suspends `MediaRecorder` when the tab is backgrounded or the screen
+locks.** A 50-minute lecture only survives if the iPad stays awake with listen
+in the foreground. Voice Memos keeps recording with the screen locked, so for
+anything long it is the more robust capture even on the same device — upload it
+after with Shortcut B.
+
+Either way transcription is unaffected. The iPad never runs whisper: recording
+in the web app POSTs audio to the laptop every 10s (`/chunk/{rid}`, app.py:294)
+and `/stop/{rid}` fires the decode there. Capture device and transcribe device
+are independent.
+
 Options, best first:
 
 1. **Record on the iPhone, write on the iPad.** Separate device, problem gone.
@@ -344,9 +435,8 @@ fallback), not a hosted API. So:
 
 Nothing expires while it waits. Batch the uploads when you get home.
 
-If the mesh is down, AirDrop the files to the laptop and use the existing
-upload buttons in the listen UI. Meshnet's own file transfer works as a
-backup too.
+If Tailscale is down, AirDrop the files to the laptop and use the existing
+upload buttons in the listen UI.
 
 ## Do not hand-edit topic notes on the iPad
 
@@ -388,16 +478,18 @@ Start read-only. Upgrade if it chafes.
 | Input | Path | Taps |
 |---|---|---|
 | Handwritten notes, standalone | Export PDF → share → "Send Notes to Listen" → auto-labeled and filed | 2 |
-| Handwritten notes, for an existing lecture | listen UI in Safari → the recording's "Add notes from file" → review → save | 4, with review |
+| Handwritten notes, for a lecture | Export PDF → share → "Stage Page in Listen" → proofread in Pages waiting → Attach | 2, plus review when you get to it |
+| Handwritten notes, lecture already open in front of you | listen UI in Safari → the recording's "Add notes from file" → review → save | 4, with review |
 | iPhone/iPad audio | Voice Memos → share → "Send Audio to Listen" | 2 |
 | Correction to a filed note | listen UI → correction box → `/addendum` | 3 |
 
 ## Open
 
-- Neither Shortcut has been built or run. The endpoint contracts above are read
-  from source, not exercised from an iPad.
+- Shortcut B (audio) is built and verified end to end from the iPad: a Voice
+  Memo uploaded over https, transcribed on the laptop, and landed as
+  `done | upload_audio`.
+- Shortcuts A and C have not been built or run.
 - The Pencil-noise test (option 3 in Step 4) hasn't been done.
-- The mesh bind is set but has never been hit from the iPad.
 
 ### The diagram gap — solved
 
@@ -452,8 +544,9 @@ a fire-and-forget Shortcut. Read the text, fix what's wrong, then save.
 
 ### Open
 
-- The mesh bind, both Shortcuts, and the Pencil-noise question are still
-  untested against a real iPad and a real lecture.
+- The Pencil-noise question is still untested against a real lecture, as are
+  Shortcuts A and C. The transport is verified: the iPad loads `<your-ts-url>`
+  over https, records, and Shortcut B round-trips a Voice Memo.
 - The attachment pipeline has unit tests (`test_attach.py`, 7 checks) but has
   not been driven end to end through the browser with a real diagram.
 - The server must be restarted to pick this up. Existing notes gain a Source

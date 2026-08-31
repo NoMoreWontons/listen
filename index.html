@@ -855,7 +855,21 @@ const micSelect = document.getElementById('micSelect');
 const canvas = document.getElementById('wave');
 const ctx = canvas.getContext('2d');
 
+// navigator.mediaDevices only exists in a secure context — https, or http on
+// localhost. Over plain http to an IP it's undefined, and touching it here used
+// to throw at the top of the script: every handler below went unbound, so
+// Record, Upload and the whole page went dead rather than just recording.
+// The iPad now reaches this over https (tailscale serve, docs/ipad-workflow.md),
+// but the guard stays: a plain-http bind is one .env edit away.
+const canRecord = !!navigator.mediaDevices?.getUserMedia;
+const INSECURE_MSG = 'Recording needs a secure origin (https, or http on localhost). '
+  + 'This page is plain http, so the browser hides the microphone. '
+  + 'Record on the machine running the server (set LISTEN_HOST=127.0.0.1 in .env, open '
+  + 'http://127.0.0.1:8000), or serve it over https with a cert the iPad trusts — see '
+  + 'docs/ipad-workflow.md. Upload and everything else still work here.';
+
 async function loadMics() {
+  if (!canRecord) return;
   const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
   const saved = localStorage.getItem('micId');
   micSelect.innerHTML = devices.map((d, i) =>
@@ -863,8 +877,13 @@ async function loadMics() {
   if (saved && devices.some(d => d.deviceId === saved)) micSelect.value = saved;
 }
 micSelect.onchange = () => localStorage.setItem('micId', micSelect.value);
-navigator.mediaDevices.addEventListener('devicechange', loadMics);
-loadMics();
+if (canRecord) {
+  navigator.mediaDevices.addEventListener('devicechange', loadMics);
+  loadMics();
+} else {
+  btn.title = micSelect.title = INSECURE_MSG;
+  micSelect.hidden = true;
+}
 
 function fmt(s) { return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
 
@@ -935,6 +954,7 @@ function stopMeters() {
 
 btn.onclick = async () => {
   if (!recording) {
+    if (!canRecord) { alert(INSECURE_MSG); return; }
     let stream;
     try {
       const audio = micSelect.value
