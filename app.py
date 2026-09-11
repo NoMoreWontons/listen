@@ -178,6 +178,13 @@ def _download_progress_tqdm():
 
 
 def _load_model():
+    # ctranslate2 loads cublas/cudnn with plain LoadLibrary, which searches PATH
+    # and ignores os.add_dll_directory — so the pip nvidia-*-cu12 wheels are
+    # invisible unless their bin dirs are on PATH before the first CUDA call.
+    import sys, glob
+    dlls = glob.glob(os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", "*", "bin"))
+    os.environ["PATH"] = os.pathsep.join(dlls + [os.environ["PATH"]])
+
     from faster_whisper import WhisperModel
     from faster_whisper.utils import _MODELS
     from huggingface_hub import snapshot_download
@@ -200,8 +207,9 @@ def _load_model():
         import numpy as np
         next(model.transcribe(np.zeros(16000, dtype=np.float32))[0], None)
         return model
-    except Exception:
+    except Exception as e:
         # ponytail: CPU fallback when CUDA libs aren't present; slower but works
+        print(f"[whisper] CUDA unavailable ({e}); falling back to CPU", flush=True)
         return WhisperModel(model_path, device="cpu", compute_type="int8")
 
 
