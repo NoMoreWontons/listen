@@ -2508,6 +2508,11 @@ def _folded(text, title="Transcript"):
     return f"> [!quote]- {title}\n{body}"
 
 
+# "2026-09-04 08:36", the title /start gives a recording nobody named — and
+# " (recovered)" is appended when a dropped upload is recovered.
+_STAMP_TITLE = re.compile(r"^\d{4}-\d{2}-\d{2} (?P<time>\d{2}:\d{2})( \(recovered\))?$")
+
+
 def _note_md(rows):
     """Combined note for every recording sharing one topic (rows: non-empty
     transcripts, oldest first — see _group_rows). Frontmatter/H1/date come
@@ -2565,7 +2570,17 @@ def _note_md(rows):
             + pages(first, "##")
             + "\n\n" + _folded(first.get("transcript") or "") + "\n"
         )
-    heading = lambda r: f"{(r.get('created_at') or '')[:10]} — {r.get('title') or r.get('topic') or 'Lecture'}"
+    def heading(r):
+        """Dated section header for one recording inside a combined note. A
+        recording nobody named gets a "%Y-%m-%d %H:%M" stamp for a title, which
+        rendered as "2026-09-04 — 2026-09-04 08:36" and said nothing about the
+        section. Fall back to the topic, keeping the stamp's time so two
+        unnamed recordings on one day still get distinct headers."""
+        day = (r.get("created_at") or "")[:10]
+        stamp = _STAMP_TITLE.match((r.get("title") or "").strip())
+        if stamp:
+            return f"{day} {stamp.group('time')} — {r.get('topic') or 'Lecture'}"
+        return f"{day} — {r.get('title') or r.get('topic') or 'Lecture'}"
     notes = "\n\n".join(
         f"## {heading(r)}\n\n{r.get('summary') or ''}{extra(r, '###')}{pages(r, '###')}"
         for r in rows)

@@ -554,6 +554,30 @@ def test_frontmatter_parses_and_hubs_embed_timeline():
     print("ok: frontmatter parses as YAML, hubs carry their base inline, cleanup removes them")
 
 
+def test_stamp_titles_fall_back_to_topic():
+    """A recording nobody named is titled with a timestamp; the combined note's
+    section header must show the topic instead, and stay unique per recording."""
+    import re as _re
+    other = {"created_at": "2026-09-05T10:00:00", "title": "Other", "topic": "Boxplots"}
+    cases = [
+        ({"created_at": "2026-09-04T08:36:00", "title": "2026-09-04 08:36"},
+         "2026-09-04 08:36 — Boxplots"),
+        ({"created_at": "2026-09-04T14:15:00", "title": "2026-09-04 14:15 (recovered)"},
+         "2026-09-04 14:15 — Boxplots"),
+        ({"created_at": "2026-09-04T09:00:00", "title": "Histogram Shapes"},
+         "2026-09-04 — Histogram Shapes"),
+    ]
+    seen = []
+    for row, expected in cases:
+        row = dict(row, topic="Boxplots")
+        md = app._note_md([row, other])
+        head = _re.findall(r"^## (.+)$", md, _re.M)[0]
+        assert head == expected, f"{head!r} != {expected!r}"
+        seen.append(head)
+    assert seen[0] != seen[1], "two unnamed recordings on one day collided"
+    print("ok: stamp titles fall back to the topic, keeping the time to stay unique")
+
+
 def test_one_line_skips_recaps():
     assert app._one_line("## Review of last class\n- old stuff\n\n## Key points\n- the real gist") \
         == "the real gist"
@@ -565,6 +589,7 @@ def test_one_line_skips_recaps():
 if __name__ == "__main__":
     test_frontmatter_parses_and_hubs_embed_timeline()
     test_one_line_skips_recaps()
+    test_stamp_titles_fall_back_to_topic()
     test_single_recording()
     test_second_recording_joins_topic()
     test_relabel_away_and_last_one_out()
