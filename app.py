@@ -1599,17 +1599,22 @@ def ask_notes(payload: dict = Body(...)):
         return {"error": "question required"}
     sem = (payload.get("semester") or "").strip()
     cls = (payload.get("class") or "").strip()
-    q = sb.table("recordings").select("semester,class,unit,topic,summary,obsidian_path").eq("status", "done")
+    # class required, like quiz/cards/cheatsheet: without it every filed summary in
+    # the library went into one Sonnet prompt. The picker always has a class
+    # selected, so this only closes the direct-API path -- the cap below is what
+    # keeps a long-running class from turning one question into a 100 kB prompt.
+    if not cls:
+        return {"error": "class required"}
+    q = (sb.table("recordings").select("semester,class,unit,topic,summary,obsidian_path")
+         .eq("status", "done").eq("class", cls))
     if sem:
         q = q.eq("semester", sem)
-    if cls:
-        q = q.eq("class", cls)
-    rows = q.execute().data
-    if not any((r.get("summary") or "").strip() for r in rows):
+    rows = [r for r in q.execute().data if (r.get("summary") or "").strip()]
+    if not rows:
         return {"error": "no filed notes in that scope yet"}
+    rows = _ask_scope(question, rows)
     material = "\n\n".join(
-        f"## {r.get('topic') or ''}\n{r.get('summary') or ''}"
-        for r in rows if (r.get("summary") or "").strip())
+        f"## {r.get('topic') or ''}\n{r.get('summary') or ''}" for r in rows)
     ask = (
         "Answer the student's question using ONLY the lecture-note summaries below. "
         "Be concise. If the notes don't cover it, say so. Return ONLY a JSON object "
@@ -2237,6 +2242,32 @@ def _overlap(a, b):
     """Jaccard similarity of two labels' word sets, 0.0 to 1.0."""
     aw, bw = _norm_words(a), _norm_words(b)
     return len(aw & bw) / len(aw | bw) if (aw or bw) else 0.0
+
+
+ASK_NOTES_CAP = 40   # ~110 kB of summaries; past that a question is a shotgun anyway
+
+
+def _ask_scope(question, rows):
+    """The notes a question actually gets asked against, capped at ASK_NOTES_CAP.
+
+    Ranked by how much of the QUESTION each note covers, not by _overlap: that's
+    Jaccard, and a long summary shares few words with a short question, so the
+    most detailed lecture in the class would rank last. Rows that survive keep
+    their original newest-first order, and a question with no usable words falls
+    back to the most recent notes rather than an arbitrary slice.
+    """
+    if len(rows) <= ASK_NOTES_CAP:
+        return rows
+    qw = _norm_words(question)
+    if not qw:
+        return rows[:ASK_NOTES_CAP]
+
+    def covered(r):
+        text = " ".join(filter(None, (r.get("topic"), r.get("unit"), r.get("summary"))))
+        return len(qw & _norm_words(text)) / len(qw)
+
+    keep = sorted(range(len(rows)), key=lambda i: (-covered(rows[i]), i))[:ASK_NOTES_CAP]
+    return [rows[i] for i in sorted(keep)]
 
 
 def _closest(name, existing):
