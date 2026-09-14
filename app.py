@@ -321,8 +321,11 @@ async def lifespan(app):
     # ponytail: warm the model in the background so the first recording
     # doesn't cold-start the download; server still starts immediately.
     threading.Thread(target=_warm_model, daemon=True).start()
-    resume_stuck()
-    adopt_orphan_audio()  # after the sweep, so nothing retention just dropped comes back
+    try:  # a dead DB must not kill startup
+        resume_stuck()
+        adopt_orphan_audio()  # after the sweep, so nothing retention just dropped comes back
+    except Exception as e:
+        print(f"[listen] startup housekeeping skipped -- database unreachable: {e}")
     yield
 
 
@@ -439,7 +442,12 @@ def _obsidian_uri(path):
 def recordings():
     rows = (
         sb.table("recordings")
-        .select("id,title,created_at,status,transcript,summary,stage,progress,"
+        # transcript (2 MB table-wide) and summary (267 kB) are deliberately NOT
+        # selected: pulling them on every 5s tick burned the whole Supabase egress
+        # quota in an afternoon (402 exceed_egress_quota, 2026-09-14) and the project
+        # got restricted. Both are lazy-loaded per row -- /transcript/{rid} when the
+        # <details> opens, /summary/{rid} once per page load -- like /segments/{rid}.
+        .select("id,title,created_at,status,stage,progress,"
                 "tokens_in,tokens_out,semester,class,unit,topic,obsidian_path,source,notes,"
                 "pending_segments,live_transcript")
         .order("created_at", desc=True)
@@ -491,9 +499,25 @@ def get_audio(rid: str):
 def get_segments(rid: str):
     """Timestamped transcript segments -- split out of /recordings since it's
     a big payload the 5s poll doesn't need."""
-    row = sb.table("recordings").select("segments").eq("id", rid).single().execute().data or {}
-    return row.get("segments") or []
+    rows = sb.table("recordings").select("segments").eq("id", rid).limit(1).execute().data
+    return (rows[0] if rows else {}).get("segments") or []
 
+
+@app.get("/transcript/{rid}")
+def get_transcript(rid: str):
+    """Plain transcript text -- split out of /recordings for the same reason as
+    /segments: it's the biggest column in the table and the 5s poll never shows it."""
+    rows = sb.table("recordings").select("transcript").eq("id", rid).limit(1).execute().data
+    return {"transcript": (rows[0] if rows else {}).get("transcript") or ""}
+
+
+@app.post("/summaries")
+def get_summaries(ids: list[str] = Body(...)):
+    """Summaries (and error messages) for the rows the client hasn't cached yet.
+    Batched, not per-row: the page needs every finished row's summary at once, and
+    97 separate round-trips would just trade egress for latency."""
+    rows = sb.table("recordings").select("id,summary").in_("id", ids).execute().data or []
+    return {r["id"]: r.get("summary") or "" for r in rows}
 
 
 @app.post("/label/{rid}")
@@ -914,7 +938,11 @@ def _set(rid, **fields):
     # the caller should hear about it.
     for attempt in range(2):
         try:
-            return sb.table("recordings").update(fields).eq("id", rid).execute()
+            # returning="minimal": PostgREST echoes the whole updated row by default,
+            # so every progress checkpoint used to drag this row's transcript and
+            # segments back over the wire. No caller reads the result.
+            return (sb.table("recordings").update(fields, returning="minimal")
+                    .eq("id", rid).execute())
         except Exception:
             if attempt:
                 raise
@@ -1026,12 +1054,19 @@ def live_preview(rid):
     'recording', the audio file disappears, or ffmpeg isn't on PATH."""
     model = None
     offset = 0.0
+    carried = ""   # our own running copy of live_transcript -- see the read below
     while True:
         time.sleep(45)
         try:
-            row = (sb.table("recordings").select("status,live_transcript").eq("id", rid)
-                   .single().execute().data)  # one round-trip: status check + current text
-            if not row or row["status"] != "recording":
+            # No .single(): PostgREST answers a missing row with 406/PGRST116, which
+            # raises into the except below instead of returning None -- a row deleted
+            # mid-recording used to leave this thread polling a dead id every 45s for
+            # the life of the process. Status only: we are the sole writer of
+            # live_transcript, so re-reading our own growing text every tick was
+            # egress spent to learn what `carried` already holds.
+            rows = (sb.table("recordings").select("status").eq("id", rid)
+                    .limit(1).execute().data)
+            if not rows or rows[0]["status"] != "recording":
                 return
             path = audio_path(rid)
             if not path.exists():
@@ -1065,7 +1100,8 @@ def live_preview(rid):
                 # file from scratch when the recording actually stops.
                 offset += max(info.duration, 0.0)
                 if text:
-                    _set(rid, live_transcript=_append_live(row.get("live_transcript"), text))
+                    carried = _append_live(carried, text)
+                    _set(rid, live_transcript=carried)
             finally:
                 if tmp_path:
                     try:
@@ -1335,7 +1371,8 @@ def assignments_ics(rid: str):
 def assignments_open():
     """Open (not yet submitted) assignments, soonest due first — the homework
     card's link dropdown."""
-    return (sb.table("assignments").select("*").eq("status", "open")
+    # on the poll: only the columns hwLinker's <option> actually reads
+    return (sb.table("assignments").select("id,title,due_on,klass").eq("status", "open")
             .order("due_on").execute().data)
 
 
@@ -1429,7 +1466,9 @@ def weak_spots(cls: str = Query(..., alias="class"), semester: str = ""):
     q = sb.table("quizzes").select("questions,answers,semester,class,score").eq("class", cls)
     if semester:
         q = q.eq("semester", semester)
-    return weak_topics(q.execute().data)
+    # bounded: this reads whole question+answer blobs on a 30s timer, and weak spots
+    # from your last 20 quizzes is the useful answer anyway -- a lifetime scan isn't.
+    return weak_topics(q.order("created_at", desc=True).limit(20).execute().data)
 
 
 def grade_mcq(questions, answers):
@@ -1653,8 +1692,9 @@ def quiz_submit_frq(qid: str, payload: dict = Body(...)):
 
 @app.get("/quizzes")
 def quizzes():
+    # .limit() below: same 30s timer, and nobody reads past the first screen of history
     return (sb.table("quizzes").select("id,created_at,kind,semester,class,unit,score")
-            .order("created_at", desc=True).execute().data)
+            .order("created_at", desc=True).limit(50).execute().data)
 
 
 @app.get("/quiz/{qid}")
@@ -1816,6 +1856,16 @@ def cards_due():
     return (sb.table("cards").select("*").lte("due_at", now)
             .order("due_at").execute().data)
 
+
+@app.get("/cards/due_count")
+def cards_due_count():
+    """How many cards are due — all the 5s poll needs to paint the badge.
+    The rows themselves cost front+back for every due card and are only read
+    when the user actually starts a review, the same split /recordings had to
+    make after its poll pulled whole transcripts and cost us the egress quota."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    r = sb.table("cards").select("id", count="exact").lte("due_at", now).limit(1).execute()
+    return {"due": r.count or 0}
 
 
 @app.post("/cards/{cid}/review")

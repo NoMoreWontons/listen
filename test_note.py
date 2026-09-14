@@ -36,8 +36,12 @@ class FakeQuery:
     def select(self, *a, **k):
         return self
 
-    def update(self, payload):
+    def update(self, payload, **kw):   # real .update() takes returning="minimal"
         self.mode, self.payload = "update", payload
+        return self
+
+    def limit(self, n):
+        self.cap = n
         return self
 
     def delete(self):

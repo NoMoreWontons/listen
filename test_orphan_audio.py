@@ -168,7 +168,7 @@ def test_adopt_survives_a_junk_filename():
 
 
 def test_startup_calls_adopt():
-    assert "adopt_orphan_audio()" in SRC.split("async def lifespan")[1][:400], (
+    assert "adopt_orphan_audio()" in SRC.split("async def lifespan")[1][:600], (  # window, not an exact position — lifespan grew a try/except
         "adopt_orphan_audio() is not wired into lifespan startup"
     )
 

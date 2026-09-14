@@ -23,6 +23,7 @@ const slotFor = id => ({ dataset: { sum: id }, replaceWith(n) { this.got = n; } 
 // `const` inside eval() stays local to it, so hoist the caches onto global to assert on them
 eval(grab(/const summaryCache = new Map\(\);[^\n]*/).replace('const ', 'global.') + '\n'
    + grab(/const audioBoxCache = new Map\(\);[^\n]*/).replace('const ', 'global.') + '\n'
+   + grab(/const transcriptCache = new Map\(\);[^\n]*/).replace('const ', 'global.') + '\n'
    + grab(/function fillSummaries\(rows\) \{[\s\S]*?\n\}/));
 
 // --- first render: the summary is parsed and typeset once ---------------------------
@@ -75,7 +76,7 @@ assert(!tmpl.includes('md(r.summary)'), 'row template still calls md() every tic
 // --- an open audio box must not refetch /segments on every 5s tick --------------------
 {
   let fetches = 0;
-  global.fetch = () => { fetches++; return Promise.resolve({ json: () => Promise.resolve([]) }); };
+  global.fetch = () => { fetches++; return Promise.resolve({ ok: true, json: () => Promise.resolve([]) }); };
   global.esc = s => s; global.fmt = s => String(s);
   eval(grab(/async function loadAudioBox\(details, rid\) \{[\s\S]*?\n\}/));
 

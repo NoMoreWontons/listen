@@ -1218,7 +1218,16 @@ async function loadAudioBox(details, rid) {
   if (cached) { slot.replaceWith(cached); return; }
   slot.dataset.loaded = '1';
   audioBoxCache.set(rid, slot);
-  const segs = await (await fetch(`/segments/${rid}`)).json();
+  let segs;
+  try {
+    const res = await fetch(`/segments/${rid}`);
+    if (!res.ok) throw new Error(res.status);
+    segs = await res.json();
+  } catch {   // un-mark, or this row's audio box stays blank until a page reload
+    slot.dataset.loaded = '';
+    audioBoxCache.delete(rid);
+    return;
+  }
   const segHtml = segs.map(s => `<span class="seg" data-s="${s.s}">[${fmt(Math.floor(s.s))}] ${esc(s.t)}</span> `).join('');
   slot.innerHTML = `<audio controls preload="none" src="/audio/${rid}"></audio><div class="live-tx">${segHtml}</div>`;
   const audio = slot.querySelector('audio');
@@ -1227,6 +1236,27 @@ async function loadAudioBox(details, rid) {
     const a = slot.querySelector('audio');
     if (a) { a.currentTime = +el.dataset.s; a.play(); }
   });
+}
+
+// Same lazy-load + re-adopt dance as loadAudioBox, for the plain transcript:
+// it used to ride along on /recordings, which meant the 5s poll pulled 2 MB of
+// lecture text out of Supabase forever to fill a <details> nobody had opened.
+const transcriptCache = new Map();  // rid -> the filled .tx-slot node
+async function loadTranscript(details, rid) {
+  const slot = details.querySelector('.tx-slot');
+  if (!details.open || !slot || slot.dataset.loaded) return;
+  const cached = transcriptCache.get(rid);
+  if (cached) { slot.replaceWith(cached); return; }
+  slot.dataset.loaded = '1';
+  transcriptCache.set(rid, slot);
+  let text = '';
+  try {
+    const res = await fetch(`/transcript/${rid}`);
+    if (!res.ok) throw new Error(res.status);
+    text = (await res.json()).transcript || '';
+  } catch { slot.dataset.loaded = ''; transcriptCache.delete(rid); slot.innerHTML = '<em>transcript unavailable</em>'; return; }
+  slot.innerHTML = text ? `<pre></pre>` : '<p><em>No speech detected.</em></p>';
+  if (text) slot.querySelector('pre').textContent = text;
 }
 
 function labelEditor(r) {
@@ -1573,6 +1603,7 @@ async function saveLabels(rid) {
   })).json();
   if (resp.error) alert(resp.error);
   else localStorage.removeItem('notes-draft-' + rid); // server has it now
+  summaryText.delete(rid);  // edited notes re-summarize the row: refetch it once
   refresh();
 }
 
@@ -1650,6 +1681,28 @@ function fillSummaries(rows) {
   const live = new Set(rows.map(r => r.id));
   for (const id of summaryCache.keys()) if (!live.has(id)) summaryCache.delete(id);
   for (const id of audioBoxCache.keys()) if (!live.has(id)) audioBoxCache.delete(id);
+  for (const id of transcriptCache.keys()) if (!live.has(id)) transcriptCache.delete(id);
+}
+
+// /recordings stopped carrying `summary` (267 kB across the table, re-sent on every
+// 5s tick until Supabase cut the project off for exceeding its egress quota). Fetch
+// each row's once and paste it back onto the row, so everything downstream --
+// the card markup, fillSummaries, mergeSuggestions, renderTree -- is unchanged.
+const summaryText = new Map();  // rid -> summary/error text, fetched once per row, in one batch
+async function hydrateSummaries(rows) {
+  const want = rows.filter(r => !summaryText.has(r.id)
+                                && (r.status === 'done' || r.status === 'error')).map(r => r.id);
+  if (want.length) try {
+    const res = await fetch('/summaries', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(want),
+    });
+    if (!res.ok) throw new Error(res.status);  // don't cache a 500 body as "no summary"
+    const got = await res.json();
+    for (const id of want) summaryText.set(id, got[id] || '');
+  } catch { /* leave them unfetched -- the next tick retries */ }
+  for (const r of rows) r.summary = summaryText.get(r.id) || '';
+  const live = new Set(rows.map(r => r.id));
+  for (const id of summaryText.keys()) if (!live.has(id)) summaryText.delete(id);
 }
 
 async function refresh() {
@@ -1660,6 +1713,8 @@ async function refresh() {
   // ponytail: progress bars inside #list freeze during playback; acceptable.
   const audioPlaying = [...document.querySelectorAll('#list audio')].some(a => !a.paused);
   const rows = await (await fetch('/recordings')).json();
+  pollBusy = rows.some(r => r.status === 'recording' || r.status === 'transcribing');
+  await hydrateSummaries(rows);
   // folders in the vault, so a semester scaffolded but not yet recorded into still shows up.
   // guarded like openAssignments below: a failed fetch (old server, no endpoint) must not blank the tree.
   try { vaultTree = await (await fetch('/vault_tree')).json() || {}; } catch { vaultTree = {}; }
@@ -1679,14 +1734,13 @@ async function refresh() {
       ${r.status === 'recording' && r.live_transcript ? `<div class="live-tx">${esc(r.live_transcript)}</div>` : ''}
       ${r.status === 'recording' && r.id !== rid ? `<p><button class="pill-btn" title="This tab isn't recording it — transcribe the audio saved so far" onclick="finishStuck('${r.id}')">Finish &amp; transcribe</button></p>` : ''}
       ${r.status === 'error' ? `<p class="error-msg">${esc(r.summary || 'Unknown error')}</p>` : ''}
-      ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
       ${r.status === 'split_pending' ? splitCard(r) : r.status !== 'error' ? labelEditor(r) : ''}
       ${r.source === 'homework' && r.status === 'done' ? hwLinker(r) : ''}
       ${r.status === 'done' && r.summary ? `<h4>Summary</h4><div class="sum-slot" data-sum="${r.id}"></div>` : ''}
       ${r.source === 'syllabus' && r.status === 'done' ? `<p><a href="/assignments/${r.id}.ics">&#128197; Download due dates (.ics) — import into Google Calendar</a></p>` : ''}
       ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
       ${r.status === 'done' ? `<details class="audio-box" data-k="${r.id}-audio" ontoggle="loadAudioBox(this,'${r.id}')"><summary>&#9654; audio + timestamps</summary><div class="audio-slot"></div></details>` : ''}
-      ${r.transcript ? `<details><summary>Transcript</summary><pre>${esc(r.transcript)}</pre></details>` : ''}
+      ${r.status === 'done' || r.status === 'error' || r.status === 'split_pending' ? `<details class="tx-box" data-k="${r.id}-tx" ontoggle="loadTranscript(this,'${r.id}')"><summary>Transcript</summary><div class="tx-slot"></div></details>` : ''}
     </div>`).join('');
   for (const d of document.querySelectorAll('#list details[data-k]'))
     if (openK.has(d.dataset.k)) d.open = true;
@@ -1695,6 +1749,7 @@ async function refresh() {
   // details start closed by default -- ontoggle only fires on the open<->closed transitions
   // above, so re-opened boxes (openK) need an explicit kick to (re)fill their now-empty slot.
   document.querySelectorAll('#list details.audio-box[open]').forEach(d => loadAudioBox(d, d.dataset.k.replace('-audio', '')));
+  document.querySelectorAll('#list details.tx-box[open]').forEach(d => loadTranscript(d, d.dataset.k.replace('-tx', '')));
   renderTree(rows);
   renderPending(rows);
   renderMerge(rows);
@@ -2614,18 +2669,19 @@ async function askNotes(btn) {
 
 // ---- flashcard review: due count re-renders on refresh (focus-guarded);
 // ---- the review session lives in #reviewArea, which refresh() never touches.
-let cardRows = [], cardsDue = [];
+let cardRows = [];
 async function renderReview(rows) {
   const card = document.getElementById('review');
   if (document.activeElement && card.contains(document.activeElement)) return;
   cardRows = rows;
   fillScope(rows, document.getElementById('rSem'), document.getElementById('rClass'), document.getElementById('rUnit'));
-  let due = [];
-  try { const d = await (await fetch('/cards/due')).json(); if (Array.isArray(d)) due = d; } catch {}
-  cardsDue = due;  // snapshot for startReview() — avoids serialising cards into an onclick attribute
+  // the badge needs a number, not the deck: /cards/due is select("*") over every
+  // due card and this runs on the 5s tick, which is how the egress quota died once.
+  let due = 0;
+  try { const d = await (await fetch('/cards/due_count')).json(); due = d.due || 0; } catch {}
   const el = document.getElementById('dueCount');
-  el.innerHTML = due.length
-    ? `<button class="submit" onclick="startReview()">Review ${due.length} due</button>`
+  el.innerHTML = due
+    ? `<button class="submit" onclick="startReview()">Review ${due} due</button>`
     : '<p class="gs-note">No cards due.</p>';
 }
 function rScope() {
@@ -2657,7 +2713,12 @@ function dlCheat() {
   window.location = '/cheatsheet?' + qs;
 }
 let reviewQueue = [];
-function startReview() { reviewQueue = cardsDue.slice(); showCard(); }
+async function startReview() {   // the cards themselves load on the click, not on the poll
+  try { reviewQueue = await (await fetch('/cards/due')).json(); }
+  catch { reviewQueue = []; }
+  if (!Array.isArray(reviewQueue)) reviewQueue = [];
+  showCard();
+}
 function showCard() {
   const area = document.getElementById('reviewArea');
   if (!reviewQueue.length) { area.innerHTML = '<div class="quiz"><b>Done reviewing.</b> <button onclick="closeReview()">✕</button></div>'; return; }
@@ -2695,14 +2756,23 @@ function closeReview() { document.getElementById('reviewArea').innerHTML = ''; r
 // nodes the first was still writing into. Skip while hidden too -- rebuilding a list
 // nobody is looking at only buys a stall at the moment the window comes back.
 let refreshing = false;
+// set by refresh() from the rows: fast polling only while something is actually
+// moving. An idle tab left open all day is what turned the 5s tick into an egress bill.
+let pollBusy = false;
+let lastPoll = 0;
 setInterval(async () => {
   if (refreshing || document.hidden) return;
+  // 5s while work is in flight (progress bars, live transcript), 30s when idle —
+  // nothing on an idle list changes except by a click, which refreshes on its own.
+  if (Date.now() - lastPoll < (pollBusy ? 5000 : 30000)) return;
   refreshing = true;
+  lastPoll = Date.now();
   try { await refresh(); } finally { refreshing = false; }
 }, 5000);
 // ...but don't leave up-to-5s-stale rows on screen the moment the window comes back,
 // which is exactly the app-switching this guard exists for.
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { lastPoll = Date.now(); refresh(); } });
+lastPoll = Date.now();
 refresh();
 </script>
 </body>
