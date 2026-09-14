@@ -78,6 +78,16 @@ for (const fn of ['def get_transcript(', 'def get_segments(']) {
 assert(!/select\("status,live_transcript"\)/.test(py),
   'live_preview must not re-read the text it is itself writing');
 
+// --- server: the card list is paged, the library's labels ride their own read --
+assert(body(py, 'def recordings(limit').includes('.limit('),
+  '/recordings must page: unpaged, the poll payload grows with the library forever');
+assert(py.includes('@app.get("/labels")'), 'panels need a label-only read off the poll');
+assert(py.includes('@app.get("/pending_split/{rid}")'), 'split proposals must stay off the poll');
+assert(!body(py, 'def labels():').includes('summary'),
+  '/labels is the whole library every time -- it must stay labels-only');
+assert(/fetch\(`\/recordings\?limit=/.test(html), 'the client must ask for a page, not everything');
+assert(/labelsStale = true/.test(html), 'the kept label set needs an invalidation path');
+
 // --- server: a dead DB must not kill startup --------------------------------
 const lifespan = py.match(/async def lifespan\(app\)[\s\S]*?yield/);
 assert(/try:[\s\S]*resume_stuck\(\)[\s\S]*except Exception/.test(lifespan[0]),

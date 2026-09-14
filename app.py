@@ -438,8 +438,27 @@ def _obsidian_uri(path):
             + "&file=" + urllib.parse.quote(rel.with_suffix("").as_posix()))
 
 
+LIST_PAGE = 200   # cards per poll; "show older" asks for more
+
+
+@app.get("/labels")
+def labels():
+    """Every recording, labels only -- what the vault tree, the merge panel, the
+    scope pickers and the datalists read. Split out of /recordings because those
+    panels need the whole library while the card list only needs a page of it:
+    on the poll, the full set is the one payload that still grew forever.
+    Clients fetch this once and refetch only when a label or status actually moves.
+    """
+    rows = (sb.table("recordings")
+            .select("id,created_at,status,semester,class,unit,topic,obsidian_path,source,title")
+            .order("created_at", desc=True).execute().data)
+    for r in rows:
+        r["obsidian_uri"] = _obsidian_uri(r.get("obsidian_path"))
+    return rows
+
+
 @app.get("/recordings")
-def recordings():
+def recordings(limit: int = LIST_PAGE):
     rows = (
         sb.table("recordings")
         # transcript (2 MB table-wide) and summary (267 kB) are deliberately NOT
@@ -447,10 +466,14 @@ def recordings():
         # quota in an afternoon (402 exceed_egress_quota, 2026-09-14) and the project
         # got restricted. Both are lazy-loaded per row -- /transcript/{rid} when the
         # <details> opens, /summary/{rid} once per page load -- like /segments/{rid}.
+        # pending_segments is out for the same reason and stays on disk in the DB:
+        # it's 8.6 kB of proposed splits sitting on rows that resolved theirs long
+        # ago, and only a split_pending card ever reads it (/pending_split/{rid}).
         .select("id,title,created_at,status,stage,progress,"
                 "tokens_in,tokens_out,semester,class,unit,topic,obsidian_path,source,notes,"
-                "pending_segments,live_transcript")
+                "live_transcript")
         .order("created_at", desc=True)
+        .limit(max(1, limit))   # a page of cards; /labels carries the rest of the library
         .execute()
         .data
     )
@@ -509,6 +532,15 @@ def get_transcript(rid: str):
     /segments: it's the biggest column in the table and the 5s poll never shows it."""
     rows = sb.table("recordings").select("transcript").eq("id", rid).limit(1).execute().data
     return {"transcript": (rows[0] if rows else {}).get("transcript") or ""}
+
+
+@app.get("/pending_split/{rid}")
+def get_pending_split(rid: str):
+    """The proposed split for one split_pending row. Off the poll for the same
+    reason as transcript and summary: resolved rows keep their old proposals, so
+    the column is mostly dead weight the card list never renders."""
+    rows = sb.table("recordings").select("pending_segments").eq("id", rid).limit(1).execute().data
+    return {"pending_segments": (rows[0] if rows else {}).get("pending_segments") or []}
 
 
 @app.post("/summaries")

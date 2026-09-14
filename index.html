@@ -1490,6 +1490,7 @@ async function finishStuck(id) {
 async function deleteRec(rid) {
   if (!confirm('Delete this recording, its audio, and its Obsidian note? This cannot be undone.')) return;
   await fetch(`/recordings/${rid}`, { method: 'DELETE' });
+  labelsStale = true;   // a vanished row looks like a paged-out one to hydrateLabels
   // the clicked ✕ still holds focus inside #list, which makes refresh() skip
   document.activeElement.blur();
   refresh();
@@ -1705,6 +1706,56 @@ async function hydrateSummaries(rows) {
   for (const id of summaryText.keys()) if (!live.has(id)) summaryText.delete(id);
 }
 
+// The poll carries a page of cards; the vault tree, merge panel, scope pickers and
+// datalists need every recording's labels, which is the one payload that still grew
+// with the library forever. So fetch those once and keep them, refetching only when
+// a label or status actually moves -- which the page notices on its own below, so
+// nothing has to remember to invalidate this by hand.
+let labelRows = [];
+let labelsStale = true;
+const LABEL_KEYS = ['status', 'semester', 'class', 'unit', 'topic', 'obsidian_uri', 'title'];
+async function hydrateLabels(rows) {
+  if (labelsStale) {
+    try {
+      const l = await (await fetch('/labels')).json();
+      if (Array.isArray(l)) { labelRows = l; labelsStale = false; }
+    } catch { /* keep the stale copy and retry next tick -- better than a blank tree */ }
+  }
+  const byId = new Map(labelRows.map(r => [r.id, r]));
+  // any drift between the page of live rows and what /labels last said means the
+  // library moved (a recording filed, a relabel, a delete) -- refetch next tick.
+  for (const r of rows) {
+    const known = byId.get(r.id);
+    if (!known || LABEL_KEYS.some(k => (known[k] || '') !== (r[k] || ''))) labelsStale = true;
+    byId.set(r.id, r);   // the live row wins: it's this tick's truth
+  }
+  return [...byId.values()].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+}
+
+// split proposals left the poll too (8.6 kB of stale proposals on rows that resolved
+// theirs long ago). Only a split_pending card renders one, and there is rarely one at all.
+const splitSegs = new Map();   // rid -> proposed segments
+async function hydrateSplits(rows) {
+  for (const r of rows) {
+    if (r.status !== 'split_pending') { splitSegs.delete(r.id); continue; }
+    if (!splitSegs.has(r.id)) {
+      try {
+        const res = await fetch(`/pending_split/${r.id}`);
+        if (!res.ok) throw new Error(res.status);
+        splitSegs.set(r.id, (await res.json()).pending_segments || []);
+      } catch { continue; }   // no entry cached, so the next tick tries again
+    }
+    r.pending_segments = splitSegs.get(r.id);
+  }
+}
+
+let listLimit = 200;   // cards fetched per poll; "show older" raises it
+function showOlder(btn) {
+  listLimit += 400;
+  btn.disabled = true;
+  refresh();
+}
+
 async function refresh() {
   // ponytail: don't blow away a label field the user is mid-edit on the 5s tick
   if (document.activeElement && document.getElementById('list').contains(document.activeElement)) return;
@@ -1712,9 +1763,12 @@ async function refresh() {
   // rebuild while ANY of them plays — side panels below keep updating.
   // ponytail: progress bars inside #list freeze during playback; acceptable.
   const audioPlaying = [...document.querySelectorAll('#list audio')].some(a => !a.paused);
-  const rows = await (await fetch('/recordings')).json();
+  const rows = await (await fetch(`/recordings?limit=${listLimit}`)).json();
   pollBusy = rows.some(r => r.status === 'recording' || r.status === 'transcribing');
   await hydrateSummaries(rows);
+  await hydrateSplits(rows);
+  // rows = the page of cards; allRows = the whole library, labels only, for the panels
+  const allRows = await hydrateLabels(rows);
   // folders in the vault, so a semester scaffolded but not yet recorded into still shows up.
   // guarded like openAssignments below: a failed fetch (old server, no endpoint) must not blank the tree.
   try { vaultTree = await (await fetch('/vault_tree')).json() || {}; } catch { vaultTree = {}; }
@@ -1722,7 +1776,7 @@ async function refresh() {
   if (rows.some(r => r.source === 'homework' && r.status === 'done')) {
     try { const a = await (await fetch('/assignments_open')).json(); if (Array.isArray(a)) openAssignments = a; } catch {}
   }
-  updateDatalists(rows);
+  updateDatalists(allRows);
   const openK = new Set([...document.querySelectorAll('#list details[open]')].map(d => d.dataset.k).filter(Boolean));
   // uploading: iOS Safari never focuses a tapped <button>, so the activeElement
   // guard above does not hold on the iPad -- the rewrite detached the button
@@ -1742,6 +1796,11 @@ async function refresh() {
       ${r.status === 'done' ? `<details class="audio-box" data-k="${r.id}-audio" ontoggle="loadAudioBox(this,'${r.id}')"><summary>&#9654; audio + timestamps</summary><div class="audio-slot"></div></details>` : ''}
       ${r.status === 'done' || r.status === 'error' || r.status === 'split_pending' ? `<details class="tx-box" data-k="${r.id}-tx" ontoggle="loadTranscript(this,'${r.id}')"><summary>Transcript</summary><div class="tx-slot"></div></details>` : ''}
     </div>`).join('');
+  // a full page means there are probably older recordings behind it -- they're still
+  // in the tree and the pickers (allRows), just not carried as cards on every tick.
+  if (!audioPlaying && !uploading && rows.length >= listLimit)
+    document.getElementById('list').insertAdjacentHTML('beforeend',
+      `<p class="gs-note"><button class="pill-btn" onclick="showOlder(this)">Show older recordings (${allRows.length - rows.length} more)</button></p>`);
   for (const d of document.querySelectorAll('#list details[data-k]'))
     if (openK.has(d.dataset.k)) d.open = true;
   fillSummaries(rows);
@@ -1750,11 +1809,11 @@ async function refresh() {
   // above, so re-opened boxes (openK) need an explicit kick to (re)fill their now-empty slot.
   document.querySelectorAll('#list details.audio-box[open]').forEach(d => loadAudioBox(d, d.dataset.k.replace('-audio', '')));
   document.querySelectorAll('#list details.tx-box[open]').forEach(d => loadTranscript(d, d.dataset.k.replace('-tx', '')));
-  renderTree(rows);
-  renderPending(rows);
-  renderMerge(rows);
-  renderPractice(rows);
-  renderReview(rows);
+  renderTree(allRows);
+  renderPending(rows);      // staged uploads only, never older than this page
+  renderMerge(allRows);
+  renderPractice(allRows);
+  renderReview(allRows);
 }
 
 // google-style suggestions while typing labels: native <datalist>, options = existing labels.
@@ -2058,6 +2117,7 @@ async function deleteTopic(rids) {
   if (!confirm(`Delete ${rids.length} recordings under this topic (audio + notes)? This cannot be undone.`)) return;
   // sequential — the backend rewrites the shared combined note on each delete
   for (const rid of rids) await fetch(`/recordings/${rid}`, { method: 'DELETE' });
+  labelsStale = true;
   document.activeElement?.blur();
   refresh();
 }
