@@ -495,6 +495,7 @@ def get_segments(rid: str):
     return row.get("segments") or []
 
 
+
 @app.post("/label/{rid}")
 def label(rid: str, payload: dict = Body(...)):
     """User-corrected labels + notes (JSON body — notes can exceed URL limits):
@@ -906,7 +907,29 @@ def delete_unit(payload: dict = Body(...)):
 
 
 def _set(rid, **fields):
-    sb.table("recordings").update(fields).eq("id", rid).execute()
+    # ponytail: one retry — PostgREST's gateway returns a 504 on an occasional
+    # slow write (measured 2026-09-11: a 5031ms PATCH among ~1/s progress
+    # writes), and every caller here is a single small row update worth
+    # retrying. Two attempts, not a backoff ladder; if the DB is really down
+    # the caller should hear about it.
+    for attempt in range(2):
+        try:
+            return sb.table("recordings").update(fields).eq("id", rid).execute()
+        except Exception:
+            if attempt:
+                raise
+            time.sleep(1)
+
+
+def _checkpoint(rid, **fields):
+    """Best-effort progress write. Losing one costs a little resume accuracy,
+    never the job — so a transient DB failure here must not reach process()'s
+    except, which would mark the whole transcription errored and strand every
+    segment decoded so far. Never raises."""
+    try:
+        _set(rid, **fields)
+    except Exception as e:
+        print(f"[listen] checkpoint for {rid} failed, continuing: {e}", flush=True)
 
 
 def _report_model_progress(rid, stop_event):
@@ -914,7 +937,7 @@ def _report_model_progress(rid, stop_event):
     while not stop_event.wait(2):
         pct = _model_progress["pct"]
         if pct != last:
-            _set(rid, progress=pct)
+            _checkpoint(rid, progress=pct)
             last = pct
 
 
@@ -979,7 +1002,7 @@ def process(rid):
                                 "t": seg.text.strip()})
                 pct = min(99, int(seg.end / duration * 100) // 5 * 5)
                 if pct != last_pct:
-                    _set(rid, progress=pct, segments=_cap_entries(entries))
+                    _checkpoint(rid, progress=pct, segments=_cap_entries(entries))
                     last_pct = pct
         transcript = " ".join(e["t"] for e in entries).strip()
         _set(rid, segments=_cap_entries(entries))
@@ -1792,6 +1815,7 @@ def cards_due():
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return (sb.table("cards").select("*").lte("due_at", now)
             .order("due_at").execute().data)
+
 
 
 @app.post("/cards/{cid}/review")

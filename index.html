@@ -174,7 +174,7 @@
   button:active { transform: translateY(1px) scale(.985); filter: brightness(.95); }
   @media (prefers-reduced-motion: reduce) { button:active { transform: none; } }
 
-  button#btn, button#pauseBtn, button.upload-btn {
+  button#btn, button#pauseBtn, button#meetBtn, button.upload-btn {
     font-family: var(--font-display);
     font-weight: 600;
     font-size: var(--t-sm);
@@ -189,8 +189,8 @@
     transition: transform .12s ease, background .2s ease, box-shadow .2s ease;
   }
   button#btn { padding-left: 1.3rem; padding-right: 1.3rem; }
-  button#btn:hover, button#pauseBtn:hover, button.upload-btn:hover { background: linear-gradient(180deg, #4A453E, #3B3731); }
-  button#btn:active, button#pauseBtn:active, button.upload-btn:active { transform: translateY(1px); }
+  button#btn:hover, button#pauseBtn:hover, button#meetBtn:hover, button.upload-btn:hover { background: linear-gradient(180deg, #4A453E, #3B3731); }
+  button#btn:active, button#pauseBtn:active, button#meetBtn:active, button.upload-btn:active { transform: translateY(1px); }
   .deck-group.upload { display: flex; flex-wrap: wrap; gap: var(--s2); }
   .deck-group.upload > .deck-label { flex: 1 1 100%; margin-bottom: var(--s1); }
 
@@ -298,6 +298,9 @@
     border: 0;
     border-radius: 0;
     padding: var(--s4) 1.1rem 1.1rem;
+    /* grid items default to min-width:auto, so one wide row (a long "Unit / Topic")
+       stretches the whole rail past .side, which clips it. Let them shrink instead. */
+    min-width: 0;
   }
   .side > .folders:first-child { padding-top: 1.1rem; }
 
@@ -350,12 +353,25 @@
     gap: var(--s1) var(--s3); padding: var(--s2) 0;
     border-bottom: 1px solid var(--rail-soft); font-size: var(--t-sm);
   }
-  .merge-sugg em { font-style: normal; font-weight: 600; }
+  /* each name in its own chip: the pair wraps onto several lines in this narrow
+     rail, and without a box you cannot see where one topic ends and the next
+     begins. max-width lets a long chip wrap INSIDE its border rather than
+     becoming an unshrinkable block that stretches the rail again. */
+  .merge-sugg em {
+    font-style: normal; font-weight: 600;
+    display: inline-block; max-width: 100%; overflow-wrap: anywhere;
+    padding: .12rem .42rem;
+    border: 1px solid var(--rail-dark); border-radius: var(--radius-ctl);
+    background: var(--paper-deep);
+  }
+  /* "Unit / Topic -> Unit / Topic" is far wider than this rail, and the panel clips
+     rather than scrolls -- give the names their own row and let them wrap. */
+  .merge-sugg > span:first-child { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; }
   .merge-cls {
     font-family: var(--font-mono); font-size: var(--t-xs);
     color: var(--ink-soft); margin-left: .45rem;
   }
-  .merge-actions { display: flex; gap: var(--s1); }
+  .merge-actions { display: flex; gap: var(--s1); flex-wrap: wrap; }
   #weakSpots .gs-note { margin: 0 0 var(--s2); display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 
   /* control cluster shared by Practice / Ask / Review / manual merge */
@@ -373,6 +389,12 @@
     background: var(--paper); color: var(--ink);
   }
   .merge-manual select:hover, .merge-manual input[type="text"]:hover { border-color: var(--ink-soft); }
+  /* Topic keys run "Unit / Topic" under a class-named optgroup -- past the 13rem
+     cap the shared cluster wants, and a native select clips instead of wrapping.
+     In the merge panel the two selects get a row each at full panel width. */
+  #merge .merge-manual { flex-direction: column; align-items: stretch; }
+  #merge .merge-manual select { max-width: none; width: 100%; }
+  #merge .merge-manual button { align-self: flex-start; }
 
   /* ---- practice quizzes ---- */
   .pq-row {
@@ -386,6 +408,14 @@
     font-family: var(--font-mono); font-size: var(--t-xs);
     font-variant-numeric: tabular-nums; color: var(--ink-soft);
   }
+  /* semester divider in the past-quiz list — quieter than .deck-label, which
+     labels the whole card and would compete with it at the same weight */
+  .pq-sem {
+    font-family: var(--font-display); font-size: var(--t-xs); font-weight: 700;
+    letter-spacing: .14em; text-transform: uppercase; color: var(--ink-soft);
+    opacity: .75; margin: var(--s3) 0 .25rem;
+  }
+  .pq-sem:first-child { margin-top: var(--s2); }
   .quiz {
     background: var(--card); border: 1px solid var(--rail);
     border-radius: var(--radius-card); padding: 1.1rem 1.2rem; margin: 0 0 var(--s3);
@@ -644,6 +674,10 @@
     font-family: var(--font-mono); font-size: var(--t-xs); text-transform: uppercase; letter-spacing: .06em;
     background: #E6DEF5; color: #5B3F8F; border-radius: 999px; padding: .1rem .5rem;
   }
+  .clip {
+    font-family: var(--font-mono); font-size: var(--t-xs); letter-spacing: .04em;
+    background: #DCE9F5; color: #2C577F; border-radius: 999px; padding: .1rem .5rem;
+  }
 
   .labels { display: flex; flex-wrap: wrap; gap: var(--s2); margin: var(--s3) 0 var(--s1); }
   .labels input {
@@ -676,10 +710,10 @@
   .md table { border-collapse: collapse; margin: var(--s2) 0; font-size: var(--t-sm); }
   .md th, .md td { border: 1px solid var(--rail-dark); padding: var(--s1) var(--s2); text-align: left; }
   .md th { background: var(--rail-soft); }
-  .md .mermaid { overflow-x: auto; margin: var(--s2) 0; }
+  .md .mermaid, .md .figure { overflow-x: auto; margin: var(--s2) 0; }
   /* max-width only ever shrinks — mermaid renders at natural size (useMaxWidth
      off), so this caps an oversized diagram without stretching a small one */
-  .md .mermaid svg { max-width: 100%; height: auto; }
+  .md .mermaid svg, .md .figure svg { max-width: 100%; height: auto; }
 
   /* ---- cheat sheet: a document, not a sidebar card. Full page width so the
      formula tables and diagrams have room, and printable — that's what a cheat
@@ -690,12 +724,12 @@
   .sheet .md { column-gap: var(--s5); }
   @media (min-width: 1100px) { .sheet .md { columns: 2; } }
   /* a table or diagram split down the middle of a column break is unreadable */
-  .sheet .md table, .sheet .md .mermaid, .sheet .md pre { break-inside: avoid; }
+  .sheet .md table, .sheet .md .mermaid, .sheet .md .figure, .sheet .md pre { break-inside: avoid; }
   .sheet .md h2, .sheet .md h3 { break-after: avoid; }
   .sheet .md > h1 { column-span: all; }
   /* .wide is set in drawDiagrams — only diagrams that would shrink past
      legibility break out of the column (see the comment there) */
-  .sheet .md .mermaid { text-align: center; }
+  .sheet .md .mermaid, .sheet .md .figure { text-align: center; }
   .sheet .md .mermaid.wide { column-span: all; }
   .cs-actions { display: flex; gap: var(--s3); align-items: baseline; font-size: var(--t-sm); }
   .cs-actions button, .cs-actions a {
@@ -739,6 +773,7 @@ if (window.mermaid) mermaid.initialize({
       <div id="controls">
         <button id="btn">&#9679; Record</button>
         <button id="pauseBtn" hidden>&#10074;&#10074; Pause</button>
+        <button id="meetBtn" title="Record an online class or meeting: captures the meeting tab&#39;s audio (everyone else) mixed with your mic. Chrome only — tick &quot;Also share tab audio&quot; in the picker.">&#9788; Meeting</button>
         <span id="timer" class="timer">0:00</span>
         <select id="micSelect" title="Microphone"></select>
         <button id="liveTx" class="pill-btn" title="Show rolling transcript while recording — uses noticeably more battery (extra Whisper decodes)">Live transcript</button>
@@ -750,8 +785,8 @@ if (window.mermaid) mermaid.initialize({
     </div>
     <div class="deck-group upload">
       <span class="deck-label">Upload</span>
-      <button id="uploadBtn" class="upload-btn" title="Upload audio, PDF, PowerPoint, or Word (or drop it anywhere on the page)">&#8686; Audio / Docs</button>
-      <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg,.pdf,.pptx,.docx" hidden>
+      <button id="uploadBtn" class="upload-btn" title="Upload audio or video (Zoom/Teams recordings included), PDF, PowerPoint, or Word (or drop it anywhere on the page)">&#8686; Audio / Docs</button>
+      <input type="file" id="fileInput" accept=".mp3,.m4a,.wav,.webm,.ogg,.mp4,.mov,.pdf,.pptx,.docx" hidden>
       <button id="hwBtn" class="upload-btn" title="Upload homework (PDF or photo) — auto-filed, then link it to a due date">&#8686; Homework</button>
       <input type="file" id="hwInput" accept=".pdf,image/*" hidden>
       <button id="ytBtn" class="upload-btn" title="Add a YouTube video — save the link as a reference note, or transcribe it like a lecture">&#9654; YouTube</button>
@@ -845,10 +880,13 @@ if (window.mermaid) mermaid.initialize({
 
 <script>
 let mr, rid, recording = false;
-let audioCtx, analyser, rafId, timerId, startTime;
+let audioCtx, analyser, rafId, timerId, startTime, waveBuf;
+let mixCtx;  // meeting mode only: mixes tab audio + mic into one track
 let openAssignments = [];
+let vaultTree = {};  // {semester: [class, ...]} from the vault; classes with no recordings yet
 let retentionDays = 7;  // overwritten by /app_settings; used only in the "audio expired" message
 const btn = document.getElementById('btn');
+const meetBtn = document.getElementById('meetBtn');
 const timer = document.getElementById('timer');
 const mic = document.getElementById('mic');
 const micSelect = document.getElementById('micSelect');
@@ -862,6 +900,8 @@ const ctx = canvas.getContext('2d');
 // The iPad now reaches this over https (tailscale serve, docs/ipad-workflow.md),
 // but the guard stays: a plain-http bind is one .env edit away.
 const canRecord = !!navigator.mediaDevices?.getUserMedia;
+// Tab audio capture is Chromium-only, and needs the same secure origin.
+const canShare = canRecord && !!navigator.mediaDevices?.getDisplayMedia;
 const INSECURE_MSG = 'Recording needs a secure origin (https, or http on localhost). '
   + 'This page is plain http, so the browser hides the microphone. '
   + 'Record on the machine running the server (set LISTEN_HOST=127.0.0.1 in .env, open '
@@ -884,6 +924,9 @@ if (canRecord) {
   btn.title = micSelect.title = INSECURE_MSG;
   micSelect.hidden = true;
 }
+if (!canShare) {
+  meetBtn.hidden = true;  // Firefox/Safari: no tab audio to mix, so no meeting mode
+}
 
 function fmt(s) { return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
 
@@ -901,16 +944,23 @@ function stampNote(e, ta) {
 
 function drawWave() {
   rafId = requestAnimationFrame(drawWave);
-  const buf = new Uint8Array(analyser.fftSize);
-  analyser.getByteTimeDomainData(buf);
+  analyser.getByteTimeDomainData(waveBuf);
+  const buf = waveBuf;
   // peak deviation from the 128 silence baseline → is the mic actually hearing anything?
   let peak = 0;
   for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128));
   if (peak > 3) { mic.textContent = '● receiving audio'; mic.style.color = '#3FA78C'; }
   else { mic.textContent = '● no input'; mic.style.color = '#D9432F'; }
-  // size the backing store to the displayed size so the line isn't stretched
-  canvas.width = canvas.clientWidth;
-  canvas.height = canvas.clientHeight;
+  // Size the backing store to the displayed size so the line isn't stretched -- but
+  // only when it actually changed. Reading clientWidth forces a style+layout flush and
+  // writing .width reallocates the backing store, so doing both unconditionally was 60
+  // forced reflows a second fighting whatever else held the main thread. A 0 read (the
+  // well not laid out yet) used to make slice 0 and stack every point at x=0, which
+  // looks exactly like a frozen waveform.
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.lineWidth = 2;
   ctx.strokeStyle = '#DE9A32';
@@ -928,6 +978,7 @@ function startMeters(stream) {
   audioCtx = new AudioContext();
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 2048;
+  waveBuf = new Uint8Array(analyser.fftSize);  // allocated once, not 60 times a second
   audioCtx.createMediaStreamSource(stream).connect(analyser);
   canvas.classList.add('on');
   mic.classList.add('on');
@@ -950,42 +1001,101 @@ function stopMeters() {
   timer.classList.remove('on');
   mic.classList.remove('on');
   if (audioCtx) audioCtx.close();
+  if (mixCtx) { mixCtx.close(); mixCtx = null; }
+}
+
+function micAudio() {
+  return micSelect.value
+    ? { deviceId: { exact: micSelect.value }, autoGainControl: true, noiseSuppression: true }
+    : { autoGainControl: true, noiseSuppression: true };
+}
+
+// Shared by both start buttons. `stream` is what MediaRecorder writes; `extra`
+// carries source tracks that aren't in it -- in meeting mode the recorded stream
+// is the mixer's output, so stopping only that would leave the tab capture and
+// the mic live (and Chrome's "sharing this tab" bar up) after the recording ended.
+async function beginRec(stream, extra = []) {
+  rid = (await (await fetch('/start', { method: 'POST' })).json()).id;
+  mr = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+  mr.ondataavailable = e => { if (e.data.size) fetch('/chunk/' + rid, { method: 'POST', body: e.data }); };
+  mr.onstop = () => {
+    fetch('/stop/' + rid, { method: 'POST' });
+    [...stream.getTracks(), ...extra].forEach(t => t.stop());
+    refresh();
+  };
+  mr.start(10000); // 10s chunks → survives a tab crash
+  startMeters(stream);
+  recording = true;
+  btn.textContent = '■ Stop';
+  btn.classList.add('recording');
+  pauseBtn.hidden = false;
+  pauseBtn.textContent = '❙❙ Pause';
+  meetBtn.hidden = true; // one recording at a time -- Stop lives on #btn for both
+}
+
+function stopRec() {
+  if (mr.state === 'paused') mr.resume(); // stop while paused loses the tail otherwise
+  mr.stop();
+  recording = false;
+  btn.textContent = '● Record';
+  btn.classList.remove('recording');
+  pauseBtn.hidden = true;
+  meetBtn.hidden = !canShare;
+  stopMeters();
 }
 
 btn.onclick = async () => {
-  if (!recording) {
-    if (!canRecord) { alert(INSECURE_MSG); return; }
-    let stream;
-    try {
-      const audio = micSelect.value
-        ? { deviceId: { exact: micSelect.value }, autoGainControl: true, noiseSuppression: true }
-        : { autoGainControl: true, noiseSuppression: true };
-      stream = await navigator.mediaDevices.getUserMedia({ audio });
-    } catch (e) {
-      alert('Mic access failed: ' + e.name + ' — ' + e.message + '\nAllow the microphone for 127.0.0.1 and try again.');
-      return;
-    }
-    loadMics(); // labels are blank until permission is granted once
-    rid = (await (await fetch('/start', { method: 'POST' })).json()).id;
-    mr = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-    mr.ondataavailable = e => { if (e.data.size) fetch('/chunk/' + rid, { method: 'POST', body: e.data }); };
-    mr.onstop = () => { fetch('/stop/' + rid, { method: 'POST' }); stream.getTracks().forEach(t => t.stop()); refresh(); };
-    mr.start(10000); // 10s chunks → survives a tab crash
-    startMeters(stream);
-    recording = true;
-    btn.textContent = '■ Stop';
-    btn.classList.add('recording');
-    pauseBtn.hidden = false;
-    pauseBtn.textContent = '❙❙ Pause';
-  } else {
-    if (mr.state === 'paused') mr.resume(); // stop while paused loses the tail otherwise
-    mr.stop();
-    recording = false;
-    btn.textContent = '● Record';
-    btn.classList.remove('recording');
-    pauseBtn.hidden = true;
-    stopMeters();
+  if (recording) { stopRec(); return; }
+  if (!canRecord) { alert(INSECURE_MSG); return; }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: micAudio() });
+  } catch (e) {
+    alert('Mic access failed: ' + e.name + ' — ' + e.message + '\nAllow the microphone for 127.0.0.1 and try again.');
+    return;
   }
+  loadMics(); // labels are blank until permission is granted once
+  beginRec(stream);
+};
+
+// Meeting mode. A plain mic recording of a Teams/Zoom call keeps only your own
+// half: everyone else arrives as speaker output, which echoCancellation exists
+// to remove, and headphones drop them entirely. So capture the meeting tab's own
+// audio and mix the mic into it. Chrome only offers the "share tab audio"
+// checkbox when video is requested too, so we ask for video and never read it.
+meetBtn.onclick = async () => {
+  let disp, micStream;
+  try {
+    disp = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  } catch (e) {
+    return; // picker dismissed -- not worth an alert
+  }
+  if (!disp.getAudioTracks().length) {
+    disp.getTracks().forEach(t => t.stop());
+    alert('That share carries no audio, so only your own voice would be recorded.\n\n'
+      + 'Share it again, pick the meeting *tab*, and tick "Also share tab audio" in the picker.\n'
+      + 'A whole-screen or single-window share cannot carry audio in Chrome.');
+    return;
+  }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: micAudio() });
+  } catch (e) {
+    disp.getTracks().forEach(t => t.stop());  // don't leave the tab captured
+    alert('Mic access failed: ' + e.name + ' — ' + e.message);
+    return;
+  }
+  loadMics();
+  // Both halves onto one track: Whisper gets a single timeline, and the summary
+  // prompt's speaker inference sees the questions and the answers side by side.
+  mixCtx = new AudioContext();
+  const out = mixCtx.createMediaStreamDestination();
+  mixCtx.createMediaStreamSource(new MediaStream(disp.getAudioTracks())).connect(out);
+  mixCtx.createMediaStreamSource(micStream).connect(out);
+  // Chrome ends the captured audio when the video track ends ("Stop sharing"),
+  // so stop the recording there instead of quietly finishing the meeting on the
+  // mic alone -- that failure looks fine until you read the transcript.
+  disp.getVideoTracks()[0].onended = () => { if (recording) stopRec(); };
+  beginRec(out.stream, [...disp.getTracks(), ...micStream.getTracks()]);
 };
 
 const pauseBtn = document.getElementById('pauseBtn');
@@ -1007,7 +1117,17 @@ pauseBtn.onclick = () => {
 function esc(s) { return s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
 // summaries/key points are markdown with $...$ math; render instead of <pre>-dumping.
 // esc first so any raw HTML from the model stays inert, then marked turns md syntax into tags.
-function md(s) { return window.marked ? `<div class="md">${marked.parse(esc(s))}</div>` : `<pre>${esc(s)}</pre>`; }
+// The one exception is a raw <svg> block -- a figure the model drew (boxplot, vector
+// diagram, conic) that Obsidian renders natively. It is parked as escaped source in a
+// <pre class="svgsrc"> and swapped for a sanitized node in drawDiagrams, so every other
+// byte still goes through esc() and nothing else can inject HTML.
+function md(s) {
+  if (!window.marked) return `<pre>${esc(s || '')}</pre>`;
+  const html = (s || '').split(/(<svg[\s\S]*?<\/svg>)/i)
+    .map((part, i) => i % 2 ? `<pre class="svgsrc">${esc(part)}</pre>` : marked.parse(esc(part)))
+    .join('');
+  return `<div class="md">${html}</div>`;
+}
 // call after innerHTML that may contain md(); no-op offline (CDN unreachable)
 function typeset(el) {
   if (window.renderMathInElement) renderMathInElement(el, {
@@ -1016,11 +1136,46 @@ function typeset(el) {
   });
   drawDiagrams(el);  // after katex, which skips <code> — so the source is still there
 }
+// Allowlists, not denylists: an element or attribute the model invents is dropped
+// because it is absent here, so there is no threat to have enumerated first.
+const SVG_TAGS = new Set(['svg', 'g', 'line', 'rect', 'circle', 'ellipse', 'path',
+  'polyline', 'polygon', 'text', 'tspan', 'title']);
+const SVG_ATTRS = new Set(['viewBox', 'width', 'height', 'x', 'y', 'dx', 'dy',
+  'x1', 'y1', 'x2', 'y2', 'cx', 'cy', 'r', 'rx', 'ry', 'd', 'points', 'transform',
+  'fill', 'stroke', 'stroke-width', 'stroke-dasharray', 'stroke-linecap',
+  'stroke-linejoin', 'fill-opacity', 'stroke-opacity', 'opacity', 'text-anchor',
+  'dominant-baseline', 'font-size', 'font-family', 'font-weight', 'font-style',
+  'letter-spacing', 'preserveAspectRatio', 'class']);
+// No style=, no href/xlink:href, no url() anywhere: that rules out <use>, <image>,
+// external fetches and CSS-loaded resources without naming any of them.
+function cleanSvg(src) {
+  const root = new DOMParser().parseFromString(src, 'image/svg+xml').documentElement;
+  if (root.nodeName !== 'svg') return null;  // parsererror, or not an svg at all
+  const scrub = el => {
+    for (const a of [...el.attributes]) {
+      if (!SVG_ATTRS.has(a.name) || /url\s*\(/i.test(a.value)) el.removeAttributeNode(a);
+    }
+    for (const kid of [...el.children]) {
+      if (SVG_TAGS.has(kid.nodeName)) scrub(kid); else kid.remove();
+    }
+  };
+  scrub(root);
+  return root;
+}
 let diagramN = 0;
 // marked leaves a ```mermaid fence as <code class="language-mermaid">; swap each
 // for its rendered svg. md() escapes before marked, and marked escapes code text
 // again, so the source comes back one entity layer deep — decode it before parsing.
 async function drawDiagrams(el) {
+  // figures first -- they need no CDN, so they still draw when mermaid is unreachable
+  for (const pre of el.querySelectorAll('pre.svgsrc')) {
+    const svg = cleanSvg(pre.textContent);  // escaped once by md(), decoded once by the DOM
+    if (!svg) continue;                     // malformed: leave the source visible
+    const box = document.createElement('div');
+    box.className = 'figure';
+    box.appendChild(svg);
+    pre.replaceWith(box);
+  }
   if (!window.mermaid) return;
   for (const code of el.querySelectorAll('code.language-mermaid')) {
     const src = new DOMParser().parseFromString(code.textContent, 'text/html')
@@ -1050,10 +1205,19 @@ const STAGE_LABEL = { loading_model: 'loading model', transcribing: 'transcribin
 // the first time it's opened (data-loaded guard -- the 5s refresh() wipe re-renders
 // the <details> empty, so this gets called again next open via the ontoggle wiring
 // and once more per poll while open, from refresh()'s post-render pass below).
+// Same shape of waste as the summaries below: refresh() wipes #list every 5s and hands
+// back a blank slot, so an open audio box used to refetch /segments and rebuild its
+// <audio> element on every tick. Segments never change once transcribed, so keep the
+// filled node and re-adopt it after the wipe -- that also carries playback position
+// across a refresh instead of resetting it.
+const audioBoxCache = new Map();  // rid -> the filled .audio-slot node
 async function loadAudioBox(details, rid) {
   const slot = details.querySelector('.audio-slot');
   if (!details.open || !slot || slot.dataset.loaded) return;
+  const cached = audioBoxCache.get(rid);
+  if (cached) { slot.replaceWith(cached); return; }
   slot.dataset.loaded = '1';
+  audioBoxCache.set(rid, slot);
   const segs = await (await fetch(`/segments/${rid}`)).json();
   const segHtml = segs.map(s => `<span class="seg" data-s="${s.s}">[${fmt(Math.floor(s.s))}] ${esc(s.t)}</span> `).join('');
   slot.innerHTML = `<audio controls preload="none" src="/audio/${rid}"></audio><div class="live-tx">${segHtml}</div>`;
@@ -1073,20 +1237,20 @@ function labelEditor(r) {
     : '';
   const editor = `<div class="labels" data-rid="${r.id}">
     <input class="lbl-sem"   list="dl-sem"   placeholder="semester" value="${escAttr(r.semester)}">
-    <input class="lbl-class" list="dl-class" placeholder="class" value="${escAttr(r.class)}">
-    <input class="lbl-unit"  list="dl-unit"  placeholder="unit"  value="${escAttr(r.unit)}">
-    <input class="lbl-topic" list="dl-topic" placeholder="topic" value="${escAttr(r.topic)}">
+    <input class="lbl-class" list="dl-class" placeholder="class" value="${escAttr(r.class)}" onfocus="scopeDL(this,'class')">
+    <input class="lbl-unit"  list="dl-unit"  placeholder="unit"  value="${escAttr(r.unit)}" onfocus="scopeDL(this,'unit')">
+    <input class="lbl-topic" list="dl-topic" placeholder="topic" value="${escAttr(r.topic)}" onfocus="scopeDL(this,'topic')">
     <textarea class="lbl-notes" rows="2" oninput="localStorage.setItem('notes-draft-${r.id}', this.value)"
       onblur="if (localStorage.getItem('notes-draft-${r.id}') !== null) saveLabels('${r.id}')"
       ${r.status === 'recording' ? 'onkeydown="stampNote(event, this)"' : ''}
       placeholder="your notes — woven into the AI summary on save">${esc(localStorage.getItem('notes-draft-' + r.id) ?? r.notes ?? '')}</textarea>
     <button onclick="saveLabels('${r.id}')">${filed ? 'Update note' : live ? 'Save labels' : 'Save to Obsidian'}</button>
-    <button class="ocr-btn" onclick="ocrNotes('${r.id}', this)" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the notes box">&#128247; Add notes from file</button>
+    <button class="ocr-btn" data-sel=".lbl-notes" onclick="ocrNotes('${r.id}', this)" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the notes box">&#128247; Add notes from file</button>
     ${live ? '' : `
     <textarea class="lbl-addendum" rows="2" oninput="localStorage.setItem('addendum-draft-${r.id}', this.value)"
       placeholder="correction / addition — appended to the note as-is, no re-summary">${esc(localStorage.getItem('addendum-draft-' + r.id) ?? '')}</textarea>
     <button onclick="saveAddendum('${r.id}')">Append to note</button>
-    <button class="ocr-btn" onclick="ocrNotes('${r.id}', this, '.lbl-addendum')" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the correction box">&#128247; From file</button>`}
+    <button class="ocr-btn" data-sel=".lbl-addendum" onclick="ocrNotes('${r.id}', this, '.lbl-addendum')" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the correction box">&#128247; From file</button>`}
     ${hint}
   </div>`;
   // filed already -> tuck the editor away; relabelling moves the note
@@ -1130,10 +1294,11 @@ async function stagePage(f) {
   if (!f) return;
   const btn = document.getElementById('pendingBtn');
   const old = btn.textContent;
-  btn.disabled = true; btn.textContent = 'reading…';
+  btn.disabled = true; btn.textContent = 'uploading…';
   try {
-    const resp = await (await fetch(`/pending?filename=${encodeURIComponent(f.name)}`,
-      { method: 'POST', body: f })).json();
+    const resp = await postFile(`/pending?filename=${encodeURIComponent(f.name)}`, f,
+      pct => btn.textContent = pct === null ? 'reading…' : `uploading ${pct}%`,
+      () => btn.textContent = 'reading…');
     if (resp.error) { alert(resp.error); return; }
     await refresh();
   } finally { btn.disabled = false; btn.textContent = old; }
@@ -1236,10 +1401,10 @@ document.getElementById('liveTx').onclick = async () => {
 loadAppSettings();
 
 document.getElementById('uploadBtn').onclick = () => fileInput.click();
-fileInput.onchange = () => { uploadFile(fileInput.files[0]); fileInput.value = ''; };
+fileInput.onchange = () => { uploadFile(fileInput.files[0], null, document.getElementById('uploadBtn')); fileInput.value = ''; };
 const hwInput = document.getElementById('hwInput');
 document.getElementById('hwBtn').onclick = () => hwInput.click();
-hwInput.onchange = () => { uploadFile(hwInput.files[0], 'homework'); hwInput.value = ''; };
+hwInput.onchange = () => { uploadFile(hwInput.files[0], 'homework', document.getElementById('hwBtn')); hwInput.value = ''; };
 const pendingInput = document.getElementById('pendingInput');
 document.getElementById('pendingBtn').onclick = () => pendingInput.click();
 pendingInput.onchange = () => { stagePage(pendingInput.files[0]); pendingInput.value = ''; };
@@ -1258,15 +1423,25 @@ document.getElementById('ytBtn').onclick = async () => {
 document.body.addEventListener('dragover', e => e.preventDefault());
 document.body.addEventListener('drop', e => { e.preventDefault(); uploadFile(e.dataTransfer.files[0]); });
 
-async function uploadFile(f, forceKind) {
+async function uploadFile(f, forceKind, btn) {
   if (!f) return;
   let kind = forceKind || 'audio';
   if (!forceKind && /\.(pdf|pptx|docx)$/i.test(f.name)) {
     kind = confirm('Is this a syllabus?\nOK = syllabus (extract due dates to calendar)\nCancel = lecture material') ? 'syllabus' : 'pdf';
   }
-  const resp = await (await fetch(`/upload?kind=${kind}&filename=${encodeURIComponent(f.name)}`,
-    { method: 'POST', body: f })).json();
-  if (resp.error) alert(resp.error);
+  // a dropped file has no button of its own -- borrow the one it stands in for
+  btn = btn || document.getElementById('uploadBtn');
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = 'uploading\u2026';
+  let resp;
+  try {
+    resp = await postFile(`/upload?kind=${kind}&filename=${encodeURIComponent(f.name)}`, f,
+      pct => btn.textContent = pct === null ? 'starting\u2026' : `uploading ${pct}%`,
+      () => btn.textContent = 'starting\u2026');
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+  if (resp.error) { alert(resp.error); return; }
   // focus may still sit inside #list (same trap as deleteRec) — blur or refresh() skips
   document.activeElement.blur();
   refresh();
@@ -1290,6 +1465,50 @@ async function deleteRec(rid) {
   refresh();
 }
 
+// POST one file with upload progress. fetch() reports none, so a phone photo or a
+// 30-page PDF sat on 'transcribing...' through the whole upload with no sign it was
+// moving -- and the wait after that is Claude reading it, which is a different wait.
+// onProgress(pct|null) during the upload, onDone() the moment the bytes are all sent.
+function postFile(url, file, onProgress, onDone) {
+  return new Promise(resolve => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    // xhr.upload.onload fires when the bytes are sent, not when the server is
+    // done -- the wait after that is Claude reading the page while whisper has
+    // the CPU, and with no timeout a request that simply hangs left the button
+    // on 'reading...' forever. Generous, because a 30-page PDF really is slow;
+    // the point is only that it ends.
+    xhr.timeout = 15 * 60 * 1000;
+    xhr.upload.onprogress = e => onProgress(e.lengthComputable ? Math.round(e.loaded / e.total * 100) : null);
+    xhr.upload.onload = () => onDone();   // bytes sent; the server is working now
+    // Never reject: every caller wraps this in try/finally with no catch, so a
+    // rejection used to unwind past them, reset the button to its idle label and
+    // leave no trace -- on the iPad, where the server is busy transcribing and
+    // Safari drops the request when the tab backgrounds, that is the common case
+    // and it looked identical to a clean upload. An {error} always reaches the
+    // callers' `if (resp.error) alert(...)`.
+    xhr.onload = () => {
+      let body = null;
+      try { body = JSON.parse(xhr.responseText); } catch {}
+      // FastAPI's default 500 is {"detail": "..."} -- valid JSON with no `error`
+      // key, so status has to be checked or a crash reads as success and
+      // `undefined` gets appended to the notes.
+      if (xhr.status < 200 || xhr.status >= 300)
+        resolve({ error: (body && (body.error || body.detail)) || `Upload failed — the server returned ${xhr.status}.` });
+      else
+        resolve(body || { error: `Upload failed — the server's reply could not be read (status ${xhr.status}).` });
+    };
+    xhr.onerror = () => resolve({ error: 'Upload failed — no reply from the server. Still on the same Wi-Fi / Tailscale?' });
+    xhr.onabort = () => resolve({ error: 'Upload stopped before it finished — nothing was saved. Try again.' });
+    xhr.ontimeout = () => resolve({ error: 'Upload timed out — nothing was saved. Try again.' });
+    xhr.send(file);
+  });
+}
+
+// >0 while an /ocr upload is in flight -- refresh() leaves #list alone until it
+// drops back to 0, so the button reporting progress is still the one on screen.
+let uploading = 0;
+
 async function ocrNotes(rid, btn, sel = '.lbl-notes') {
   const picker = document.createElement('input');
   picker.type = 'file';
@@ -1297,20 +1516,44 @@ async function ocrNotes(rid, btn, sel = '.lbl-notes') {
   picker.onchange = async () => {
     const f = picker.files[0];
     if (!f) return;
+    // Browsing Files takes seconds, and nothing gates the 5s tick until the
+    // counter moves below -- so the button captured at render time is usually
+    // already detached by now, and writing progress to it would show nothing.
+    // Re-resolve against the live DOM first. (Bumping the counter before
+    // picker.click() instead would leave it stuck at 1 on a cancelled picker,
+    // freezing the list for the rest of the session.)
+    btn = document.querySelector(`.labels[data-rid="${rid}"] .ocr-btn[data-sel="${sel}"]`) || btn;
     const old = btn.textContent;
-    btn.disabled = true; btn.textContent = 'transcribing…';
+    btn.disabled = true; btn.textContent = 'uploading…';
+    uploading++;
+    let resp;
     try {
-      const resp = await (await fetch(`/ocr?filename=${encodeURIComponent(f.name)}&rid=${encodeURIComponent(rid)}`,
-        { method: 'POST', body: f })).json();
-      if (resp.error) { alert(resp.error); return; }
-      const ta = document.querySelector(`.labels[data-rid="${rid}"] ${sel}`);
-      ta.value = (ta.value.trim() ? ta.value.trimEnd() + '\n\n' : '') + resp.text;
-      const key = sel === '.lbl-addendum' ? 'addendum-draft-' : 'notes-draft-';
-      localStorage.setItem(key + rid, ta.value); // programmatic set skips oninput
-      ta.focus(); // review before save; focus also pauses the 5s refresh wipe
+      resp = await postFile(`/ocr?filename=${encodeURIComponent(f.name)}&rid=${encodeURIComponent(rid)}`,
+        f, pct => btn.textContent = pct === null ? 'reading…' : `uploading ${pct}%`,
+        () => btn.textContent = 'reading…');
     } finally {
+      uploading--;
       btn.disabled = false; btn.textContent = old;
     }
+    if (resp.error) { alert(resp.error); return; }
+    // the page itself is only kept for types Obsidian can embed -- say so, rather
+    // than storing nothing and looking identical to a success
+    if (!resp.attached) alert(`Read "${f.name}", but the file itself was not kept. Only PDF and image pages are embedded in the note.`);
+    // the row can flip to split_pending or error mid-upload, and neither renders
+    // a label editor; without this the assignment throws and the text is lost
+    const ta = document.querySelector(`.labels[data-rid="${rid}"] ${sel}`);
+    if (!ta) { alert('This recording changed while the file uploaded. Transcribed text:\n\n' + resp.text); return; }
+    const key = sel === '.lbl-addendum' ? 'addendum-draft-' : 'notes-draft-';
+    const merged = (ta.value.trim() ? ta.value.trimEnd() + '\n\n' : '') + resp.text;
+    ta.value = merged;
+    localStorage.setItem(key + rid, merged); // programmatic set skips oninput
+    // the chip only appears once the card re-renders, and refresh() skips that
+    // while focus sits in #list -- so blur, repaint, then take focus back. The
+    // rebuilt textarea rehydrates from the draft we just stored.
+    document.activeElement?.blur();
+    await refresh();
+    const live = document.querySelector(`.labels[data-rid="${rid}"] ${sel}`) || ta;
+    live.focus(); // review before save; focus also pauses the 5s refresh wipe
   };
   picker.click();
 }
@@ -1376,6 +1619,39 @@ function progressBar(r) {
   return `<div class="progress"><div class="bar">${fill}</div><span class="progress-label">${esc(label)}${known ? ' — ' + r.progress + '%' : '…'}</span>${pauseBtn}</div>`;
 }
 
+// Summaries are the expensive half of a row: markdown with $math$, mermaid decision
+// trees and inline SVG figures (app.py asks the model for all three). refresh() wipes
+// #list every 5s, so every tick used to re-parse them and re-run katex plus a full
+// mermaid layout for every finished lecture -- hundreds of ms of blocking main-thread
+// work on a loop. That is what stalled the page and froze the waveform, and it fires
+// hardest while recording, when live_transcript changes the markup every tick.
+// So render each summary once into a detached node and re-adopt that same node after
+// the wipe: innerHTML detaches it, the cache holds the only reference so it survives.
+// Keyed on the summary text, not the id, so /resummarize still repaints.
+const summaryCache = new Map();  // id -> { src, node }
+function fillSummaries(rows) {
+  for (const slot of document.querySelectorAll('#list .sum-slot')) {
+    const id = slot.dataset.sum;
+    const row = rows.find(r => r.id === id);
+    if (!row) continue;
+    let hit = summaryCache.get(id);
+    if (!hit || hit.src !== row.summary) {
+      const node = document.createElement('div');
+      node.innerHTML = md(row.summary);
+      hit = { src: row.summary, node };
+      summaryCache.set(id, hit);
+      slot.replaceWith(node);
+      typeset(node);  // katex + mermaid, paid once per summary instead of every 5s
+    } else {
+      slot.replaceWith(hit.node);
+    }
+  }
+  // a deleted recording's node would otherwise be held forever by the cache alone
+  const live = new Set(rows.map(r => r.id));
+  for (const id of summaryCache.keys()) if (!live.has(id)) summaryCache.delete(id);
+  for (const id of audioBoxCache.keys()) if (!live.has(id)) audioBoxCache.delete(id);
+}
+
 async function refresh() {
   // ponytail: don't blow away a label field the user is mid-edit on the 5s tick
   if (document.activeElement && document.getElementById('list').contains(document.activeElement)) return;
@@ -1384,15 +1660,21 @@ async function refresh() {
   // ponytail: progress bars inside #list freeze during playback; acceptable.
   const audioPlaying = [...document.querySelectorAll('#list audio')].some(a => !a.paused);
   const rows = await (await fetch('/recordings')).json();
+  // folders in the vault, so a semester scaffolded but not yet recorded into still shows up.
+  // guarded like openAssignments below: a failed fetch (old server, no endpoint) must not blank the tree.
+  try { vaultTree = await (await fetch('/vault_tree')).json() || {}; } catch { vaultTree = {}; }
   openAssignments = [];  // never let a failed fetch (e.g. migration not yet applied) be non-array — hwLinker.filter would throw and blank the list
   if (rows.some(r => r.source === 'homework' && r.status === 'done')) {
     try { const a = await (await fetch('/assignments_open')).json(); if (Array.isArray(a)) openAssignments = a; } catch {}
   }
   updateDatalists(rows);
   const openK = new Set([...document.querySelectorAll('#list details[open]')].map(d => d.dataset.k).filter(Boolean));
-  if (!audioPlaying) document.getElementById('list').innerHTML = rows.map(r => `
+  // uploading: iOS Safari never focuses a tapped <button>, so the activeElement
+  // guard above does not hold on the iPad -- the rewrite detached the button
+  // mid-upload and every progress write landed on a dead node.
+  if (!audioPlaying && !uploading) document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
-      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.obsidian_uri ? ` <a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">&#8599; Obsidian</a>` : ''}${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload'))}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
+      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.obsidian_uri ? ` <a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">&#8599; Obsidian</a>` : ''}${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload'))}</span>` : ''}${(r.attachments || []).length ? ` <span class="clip" title="${escAttr(r.attachments.join(', '))}">&#128206; ${r.attachments.length} page${r.attachments.length > 1 ? 's' : ''}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
       ${r.status === 'transcribing' ? progressBar(r) : ''}
       ${r.status === 'recording' && r.live_transcript ? `<div class="live-tx">${esc(r.live_transcript)}</div>` : ''}
       ${r.status === 'recording' && r.id !== rid ? `<p><button class="pill-btn" title="This tab isn't recording it — transcribe the audio saved so far" onclick="finishStuck('${r.id}')">Finish &amp; transcribe</button></p>` : ''}
@@ -1400,7 +1682,7 @@ async function refresh() {
       ${r.status === 'done' && !r.transcript ? '<p><em>No speech detected.</em></p>' : ''}
       ${r.status === 'split_pending' ? splitCard(r) : r.status !== 'error' ? labelEditor(r) : ''}
       ${r.source === 'homework' && r.status === 'done' ? hwLinker(r) : ''}
-      ${r.status === 'done' && r.summary ? `<h4>Summary</h4>${md(r.summary)}` : ''}
+      ${r.status === 'done' && r.summary ? `<h4>Summary</h4><div class="sum-slot" data-sum="${r.id}"></div>` : ''}
       ${r.source === 'syllabus' && r.status === 'done' ? `<p><a href="/assignments/${r.id}.ics">&#128197; Download due dates (.ics) — import into Google Calendar</a></p>` : ''}
       ${r.status === 'done' && (r.tokens_in || r.tokens_out) ? `<p class="tokens">${r.tokens_in || 0} in / ${r.tokens_out || 0} out tokens</p>` : ''}
       ${r.status === 'done' ? `<details class="audio-box" data-k="${r.id}-audio" ontoggle="loadAudioBox(this,'${r.id}')"><summary>&#9654; audio + timestamps</summary><div class="audio-slot"></div></details>` : ''}
@@ -1408,6 +1690,7 @@ async function refresh() {
     </div>`).join('');
   for (const d of document.querySelectorAll('#list details[data-k]'))
     if (openK.has(d.dataset.k)) d.open = true;
+  fillSummaries(rows);
   typeset(document.getElementById('list'));
   // details start closed by default -- ontoggle only fires on the open<->closed transitions
   // above, so re-opened boxes (openK) need an explicit kick to (re)fill their now-empty slot.
@@ -1419,14 +1702,46 @@ async function refresh() {
   renderReview(rows);
 }
 
-// google-style suggestions while typing labels: native <datalist>, options = existing labels
+// google-style suggestions while typing labels: native <datalist>, options = existing labels.
+// Scoped to the row being edited -- units belong to a class, topics to a unit -- so
+// filing a Calculus lecture doesn't offer every Physics unit in the vault. Rescoped on
+// focus rather than at render time: refresh() bails out while focus is inside #list, so a
+// render-time list would never see a class the user just typed into a blank row.
+const DL = { semester: 'dl-sem', class: 'dl-class', unit: 'dl-unit', topic: 'dl-topic' };
+const PARENTS = { semester: [], class: ['semester'], unit: ['semester', 'class'], topic: ['semester', 'class', 'unit'] };
+let lastRows = [];        // rows from the last refresh, for scopeDL between refreshes
+const norm = v => (v || '').trim().toLowerCase();
+
+// Pure: the options for `field` given the row's already-filled parent fields. A blank
+// parent doesn't filter; a filled one matches case-insensitively ("physics" vs "Physics"
+// must not empty the unit list). An empty result is honest -- first unit in a new class.
+function scopeVals(rows, field, sel, tree) {
+  const ok = r => PARENTS[field].every(p => !norm(sel[p]) || norm(r[p]) === norm(sel[p]));
+  const semKey = Object.keys(tree).find(s => norm(s) === norm(sel.semester));
+  const fromVault = field === 'semester' ? Object.keys(tree)
+    : field === 'class' ? (norm(sel.semester) ? (semKey ? tree[semKey] : []) : Object.values(tree).flat())
+    : [];
+  return [...new Set([...rows.filter(ok).map(r => r[field]), ...fromVault]
+    .map(v => (v || '').trim()).filter(Boolean))].sort();
+}
+
+function fillDL(field, vals) {
+  let dl = document.getElementById(DL[field]);
+  if (!dl) { dl = document.createElement('datalist'); dl.id = DL[field]; document.body.appendChild(dl); }
+  dl.innerHTML = vals.map(v => `<option value="${escAttr(v)}">`).join('');
+}
+
 function updateDatalists(rows) {
-  for (const [id, field] of [['dl-sem', 'semester'], ['dl-class', 'class'], ['dl-unit', 'unit'], ['dl-topic', 'topic']]) {
-    let dl = document.getElementById(id);
-    if (!dl) { dl = document.createElement('datalist'); dl.id = id; document.body.appendChild(dl); }
-    const vals = [...new Set(rows.map(r => (r[field] || '').trim()).filter(Boolean))].sort();
-    dl.innerHTML = vals.map(v => `<option value="${escAttr(v)}">`).join('');
-  }
+  lastRows = rows;
+  for (const field of Object.keys(DL)) fillDL(field, scopeVals(rows, field, {}, vaultTree));
+}
+
+// onfocus on a label input: narrow its datalist to that row's semester/class/unit
+function scopeDL(el, field) {
+  const box = el.closest('.labels');
+  const val = c => box?.querySelector('.' + c)?.value || '';
+  fillDL(field, scopeVals(lastRows, field,
+    { semester: val('lbl-sem'), class: val('lbl-class'), unit: val('lbl-unit') }, vaultTree));
 }
 
 // ---- tree drag-drop: drag a unit summary or topic div onto a sibling of the same kind
@@ -1456,6 +1771,13 @@ function applyTreeSel() {
     if (treeSel.has(el.dataset.k + '||' + el.dataset.name)) el.classList.add('sel');
 }
 
+// "en-M1-2_ The AI Revolution" -> [1, 2]: lecture files carry <unit>-<topic> in
+// the name. It orders the course; it is never a label. Mirrors _split_ordinal in app.py.
+const ORDINAL = /^\W*(?:[A-Za-z]{2,3}[-_ ])?(?:M(?:od(?:ule)?)?|U(?:nit)?|W(?:eek)?)?\s*(\d{1,2})[-._ ](\d{1,3})(?=[^0-9A-Za-z]|$)/i;
+const LAST = 1e9;  // unnumbered sorts after everything numbered, then alphabetically
+const ordOf = t => { const m = ORDINAL.exec(t || ''); return m ? [+m[1], +m[2]] : null; };
+const unitOrd = recs => Math.min(LAST, ...recs.map(r => ordOf(r.title)?.[0] ?? LAST));
+
 function renderTree(rows) {
   if (treeDragging || menuEl) return; // a rewrite here would yank the dragged node, or the right-clicked node, out from under the interaction
   // semester > class > unit > topics, from filed recordings only
@@ -1464,6 +1786,8 @@ function renderTree(rows) {
     if (r.status !== 'done' || !r.semester || !r.class || !r.unit) continue;
     (((tree[r.semester] ??= {})[r.class] ??= {})[r.unit] ??= []).push(r);
   }
+  for (const [sem, classes] of Object.entries(vaultTree))
+    for (const cls of classes) (tree[sem] ??= {})[cls] ??= {};  // empty = class node with no units yet
   const open = new Set([...document.querySelectorAll('#tree details[open]')].map(d => d.dataset.k));
   const det = (k, label, inner) =>
     `<details data-k="${escAttr(k)}"${open.has(k) ? ' open' : ''}><summary>${esc(label)}</summary>${inner}</details>`;
@@ -1490,7 +1814,8 @@ function renderTree(rows) {
   };
 
   const unitHtml = (sem, cls, unit, recs) => {
-    recs.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+    recs.sort((a, b) => (ordOf(a.title)?.[1] ?? LAST) - (ordOf(b.title)?.[1] ?? LAST)
+      || (a.created_at || '').localeCompare(b.created_at || ''));
     const byTopic = {}, groups = [];  // one group per distinct topic; topicless rows stay solo
     for (const r of recs) {
       if (r.topic && byTopic[r.topic]) byTopic[r.topic].push(r);
@@ -1507,7 +1832,8 @@ function renderTree(rows) {
   const treeDiv = document.getElementById('tree');
   treeDiv.innerHTML = Object.keys(tree).sort().map(sem =>
     det(sem, sem, Object.keys(tree[sem]).sort().map(cls =>
-      det(sem + '/' + cls, cls, Object.keys(tree[sem][cls]).sort()
+      det(sem + '/' + cls, cls, Object.keys(tree[sem][cls])
+        .sort((a, b) => unitOrd(tree[sem][cls][a]) - unitOrd(tree[sem][cls][b]) || a.localeCompare(b))
         .map(unit => unitHtml(sem, cls, unit, tree[sem][cls][unit])).join(''))
     ).join(''))
   ).join('');
@@ -1836,6 +2162,77 @@ function setMergeLevel(l) {
   document.activeElement?.blur(); // toggle button holds focus in the panel — guard would skip the re-render
   refresh();
 }
+// Which two units/topics should be merged. Topic level scores the SUMMARIES, not
+// the names: an intro lecture that touches a topic in passing and the lecture that
+// covers it properly rarely share a title. Pure -- test_merge_opts.js drives it directly.
+const MERGE_BAR = 0.5;   // containment below this isn't "highly suggested"
+const MERGE_CAP = 4;     // suggest a few, or the panel is just the topic list again
+const mergeWords = s => new Set(String(s || '').toLowerCase().split(/[^a-z0-9]+/)
+  .filter(w => w.length >= 4).map(w => w.replace(/s$/, '')));
+
+function mergeSuggestions(rows, level) {
+  const groups = {};   // "sem||cls" -> { "unit" | "unit||topic" -> {title, text} }
+  for (const r of rows) {
+    if (r.status !== 'done' || !r.semester || !r.class || !r.unit) continue;
+    if (level === 'topic' && !r.topic) continue;
+    const g = (groups[r.semester + '||' + r.class] ??= {});
+    const name = level === 'unit' ? r.unit : r.unit + '||' + r.topic;
+    // per TOPIC, not per row: a topic spanning three recordings is one candidate
+    // with three summaries behind it, not three copies of the same suggestion.
+    (g[name] ??= { title: level === 'unit' ? r.unit : r.topic, text: '' }).text += ' ' + (r.summary || '');
+  }
+  const out = [];
+  for (const [k, g] of Object.entries(groups)) {
+    const names = Object.keys(g).sort();
+    if (level === 'unit') {
+      // Unit dupes are name forks ("Unit 3" / "Unit 3 Vectors"). Content says nothing
+      // at this level -- every unit in a class shares the course's whole vocabulary.
+      for (let i = 0; i < names.length; i++)
+        for (let j = i + 1; j < names.length; j++)
+          if ([...mergeWords(names[i])].some(w => mergeWords(names[j]).has(w)))
+            out.push({ k, a: names[i], b: names[j] });
+      continue;
+    }
+    const terms = {}, seen = {}, depth = {};
+    for (const n of names) {
+      terms[n] = mergeWords(g[n].text);
+      depth[n] = terms[n].size;   // ground actually covered, measured BEFORE the trim below equalises the sets
+      for (const w of terms[n]) seen[w] = (seen[w] || 0) + 1;
+    }
+    // Poor-man's IDF, trimmed at both ends. Above: a term in more than half this
+    // class's topics is course vocabulary ("function", "example", "problem") and
+    // drowns the signal. Below: a term only one topic
+    // uses can never signal shared coverage, and leaving it in the denominator
+    // penalises the intro for its own filler ("overview", "welcome") -- the exact
+    // words that make a passing mention look unrelated to the lecture it belongs to.
+    // The floor of 2 is because in a small class half the topics IS two, and those
+    // are the very terms a pair shares.
+    const common = Math.max(2, names.length / 2);
+    for (const n of names) terms[n] = new Set([...terms[n]].filter(w => seen[w] >= 2 && seen[w] <= common));
+    // ponytail: O(n^2) over one class's topics -- fine at a student's scale
+    for (let i = 0; i < names.length; i++)
+      for (let j = i + 1; j < names.length; j++) {
+        // thinner coverage gets absorbed into the fuller one -- on raw breadth, since
+        // trimming leaves both sides holding the same shared terms and no ordering at all
+        const [a, b] = depth[names[i]] <= depth[names[j]] ? [names[i], names[j]] : [names[j], names[i]];
+        const small = terms[a], big = terms[b];
+        if (small.size < 3) continue;   // two or three coincident words are not a topic in common
+        // containment, not Jaccard: an intro shares most of ITS OWN terms with the
+        // deep lecture but few of the lecture's, so symmetric overlap scores that
+        // pair near zero -- exactly the case this is meant to catch.
+        let hit = 0;
+        for (const w of small) if (big.has(w)) hit++;
+        // A shared title word LOWERS the bar, it does not raise the score. Added to the
+        // score it became the primary sort key -- content pairs bunch near 1.0, so every
+        // rename-dupe outranked them and ate the cap the deep-coverage pairs are for.
+        const sameName = [...mergeWords(g[a].title)].some(w => mergeWords(g[b].title).has(w));
+        const score = hit / small.size;
+        if (score >= (sameName ? 0.3 : MERGE_BAR)) out.push({ k, a, b, score, hit });
+      }
+  }
+  return level === 'unit' ? out : out.sort((p, q) => q.score - p.score || q.hit - p.hit).slice(0, MERGE_CAP);
+}
+
 function renderMerge(rows) {
   const panel = document.getElementById('merge');
   if (document.activeElement && panel.contains(document.activeElement)) return; // mid-pick on the 5s tick
@@ -1845,20 +2242,18 @@ function renderMerge(rows) {
     if (mergeLevel === 'unit') (groups[r.semester + '||' + r.class] ??= new Set()).add(r.unit);
     else if (r.topic) (groups[r.semester + '||' + r.class] ??= new Set()).add(r.unit + '||' + r.topic);
   }
-  const words = u => new Set(u.toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 4).map(w => w.replace(/s$/, '')));
-  const cmp = u => mergeLevel === 'topic' ? u.split('||')[1] : u;         // dupe-compare on topic name only, ignore unit
   const dn = u => mergeLevel === 'topic' ? u.split('||').join(' / ') : u; // display: "unit / topic" or plain unit
-  const sugg = [];
+  const sugg = mergeSuggestions(rows, mergeLevel);
   const opts = [];                        // every full key, for the manual selects
-  for (const [k, set] of Object.entries(groups)) {
-    const us = [...set].sort();
-    for (const u of us) opts.push(k + '||' + u);
-    for (let i = 0; i < us.length; i++)
-      for (let j = i + 1; j < us.length; j++)
-        if ([...words(cmp(us[i]))].some(w => words(cmp(us[j])).has(w)))
-          sugg.push({ k, a: us[i], b: us[j] });
-  }
+  for (const [k, set] of Object.entries(groups))
+    for (const u of [...set].sort()) opts.push(k + '||' + u);
   const ctx = k => k.split('||').slice(1).join(' / ');  // context label without the semester
+  // An option carries only its unit (/ topic); the class name -- long and identical
+  // for every option under it -- rides on the optgroup label instead. A native
+  // select clips rather than wraps, so shorter option text is the real fix.
+  const nParts = mergeLevel === 'unit' ? 1 : 2;
+  const byClass = {};
+  for (const o of opts) (byClass[o.split('||').slice(0, -nParts).join('||')] ??= []).push(o);
   panel.hidden = false;
   panel.innerHTML = `
     <span class="deck-label">Merge</span>
@@ -1867,17 +2262,19 @@ function renderMerge(rows) {
       <button class="${mergeLevel === 'topic' ? 'on' : ''}" onclick="setMergeLevel('topic')">Topics</button>
     </div>
     ${opts.length < 2 ? `<p class="merge-hint">Nothing to merge — need two ${mergeLevel}s under the same class.</p>` : `
-    ${sugg.length ? '<p class="merge-hint">Possible duplicates:</p>' : ''}
+    ${sugg.length ? `<p class="merge-hint">${mergeLevel === 'unit' ? 'Possible duplicates:' : 'These cover the same material:'}</p>` : ''}
     ${sugg.map(s => `<div class="merge-sugg">
-      <span><em>${esc(dn(s.a))}</em> &harr; <em>${esc(dn(s.b))}</em><span class="merge-cls">${esc(ctx(s.k))}</span></span>
+      <span><em>${esc(dn(s.a))}</em> &rarr; <em>${esc(dn(s.b))}</em><span class="merge-cls">${esc(ctx(s.k))}</span></span>
       <span class="merge-actions">
-        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.a)}" data-to="${escAttr(s.b)}">keep &ldquo;${esc(dn(s.b))}&rdquo;</button>
-        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.b)}" data-to="${escAttr(s.a)}">keep &ldquo;${esc(dn(s.a))}&rdquo;</button>
+        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.a)}" data-to="${escAttr(s.b)}" title="Merge &ldquo;${escAttr(dn(s.a))}&rdquo; into &ldquo;${escAttr(dn(s.b))}&rdquo;">Merge</button>
+        <button data-k="${escAttr(s.k)}" data-from="${escAttr(s.b)}" data-to="${escAttr(s.a)}" title="Merge &ldquo;${escAttr(dn(s.b))}&rdquo; into &ldquo;${escAttr(dn(s.a))}&rdquo;">Reverse</button>
       </span>
     </div>`).join('')}
     <div class="merge-manual">
-      <select id="mergeFrom" onchange="mergeFromChanged()">${opts.map(o =>
-        `<option value="${escAttr(o)}">${esc(ctx(o))}</option>`).join('')}</select>
+      <select id="mergeFrom" onchange="mergeFromChanged()">${Object.entries(byClass).map(([g, os]) =>
+        `<optgroup label="${escAttr(ctx(g))}">${os.map(o =>
+          `<option value="${escAttr(o)}">${esc(o.split('||').slice(-nParts).join(' / '))}</option>`
+        ).join('')}</optgroup>`).join('')}</select>
       <span class="merge-into">into</span>
       <select id="mergeTo"></select>
       <button onclick="manualMerge()">Merge</button>
@@ -2015,11 +2412,20 @@ async function loadPastQuizzes() {
   if (Date.now() - pastLoaded < 30000) return; // past list barely changes — poll it gently
   pastLoaded = Date.now();
   const qs = await (await fetch('/quizzes')).json();
-  document.getElementById('pastQuizzes').innerHTML = qs.map(q => `
+  // grouped by semester, in the order each one first appears — /quizzes comes
+  // back newest-first, so the semester you're in heads the list without sorting
+  const bySem = new Map();
+  for (const q of qs) {
+    const sem = q.semester || 'No semester';
+    if (!bySem.has(sem)) bySem.set(sem, []);
+    bySem.get(sem).push(q);
+  }
+  document.getElementById('pastQuizzes').innerHTML = [...bySem].map(([sem, list]) =>
+    `<div class="pq-sem">${esc(sem)}</div>` + list.map(q => `
     <div class="pq-row" onclick="openQuiz('${q.id}')">
       <span>${esc(q.kind)} · ${esc(q.class || '')}${q.unit ? ' / ' + esc(q.unit) : ''}</span>
       <span class="pq-score">${q.score === null ? 'unfinished' : q.score + '%'} · ${(q.created_at || '').slice(0, 10)}</span>
-    </div>`).join('');
+    </div>`).join('')).join('');
 }
 
 let weakLoaded = 0;
@@ -2284,7 +2690,19 @@ async function gradeCard(grade) {
 }
 function closeReview() { document.getElementById('reviewArea').innerHTML = ''; reviewQueue = []; }
 
-setInterval(refresh, 5000);
+// refresh() is async but setInterval never waited for it: a slow tick (cold mermaid,
+// a throttled background tab) overlapped the next one, and the second wipe detached the
+// nodes the first was still writing into. Skip while hidden too -- rebuilding a list
+// nobody is looking at only buys a stall at the moment the window comes back.
+let refreshing = false;
+setInterval(async () => {
+  if (refreshing || document.hidden) return;
+  refreshing = true;
+  try { await refresh(); } finally { refreshing = false; }
+}, 5000);
+// ...but don't leave up-to-5s-stale rows on screen the moment the window comes back,
+// which is exactly the app-switching this guard exists for.
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 refresh();
 </script>
 </body>

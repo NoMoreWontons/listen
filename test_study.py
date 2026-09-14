@@ -188,9 +188,11 @@ def test_flashcards():
         out = app.study_generate({"kind": "flashcards", "class": "Biology", "scopes": [{"unit": "Cells"}]})
         assert out["count"] == 1, out
         assert app.sb.cards[0]["unit"] == "Cells"
-        # deck snapshot lands in the unit's Exam Prep folder, alongside quizzes/exams
+        # deck snapshot lands in the class's Exam Prep folder, alongside quizzes/
+        # exams; the unit it was scoped to is in the filename, not the path
         p = pathlib.Path(out["path"])
-        assert p == pathlib.Path(d) / "Untitled" / "Biology" / "Cells" / app.PREP_DIR / "Flashcards.md", p
+        assert p == (pathlib.Path(d) / "Untitled" / "Biology" / app.PREP_DIR
+                     / "Biology Cells flashcards.md"), p
         assert "**f1** — b1" in p.read_text(encoding="utf-8")
     print("ok: flashcards -> generate+insert, deck note filed under Exam Prep")
 
@@ -204,7 +206,7 @@ def test_cheatsheet():
         assert out["filename"] == "Biology Cells cheatsheet.md", out
         assert "# Biology" in out["markdown"] and "```mermaid" in out["markdown"], out
         p = pathlib.Path(out["path"])
-        assert p == (pathlib.Path(d) / "Untitled" / "Biology" / "Cells" / app.PREP_DIR
+        assert p == (pathlib.Path(d) / "Untitled" / "Biology" / app.PREP_DIR
                      / "Biology Cells cheatsheet.md"), p
         # the filed note is the sheet plus the vault links write_prep_note appends
         text = p.read_text(encoding="utf-8")
@@ -244,7 +246,7 @@ def test_semester_falls_back_to_rows():
         out = app.study_generate({"kind": "cheatsheet", "class": "Biology",
                                   "scopes": [{"unit": "Cells"}]})
         assert pathlib.Path(out["path"]).parent == (
-            pathlib.Path(d) / "Fall 26" / "Biology" / "Cells" / app.PREP_DIR), out["path"]
+            pathlib.Path(d) / "Fall 26" / "Biology" / app.PREP_DIR), out["path"]
 
         app.sb = FakeSB(rows)
         app.claude.messages.create = fake_quiz_msg
@@ -275,6 +277,43 @@ def test_migrate_prep_dirs():
     print("ok: Practice folders migrate to Exam Prep, merging into an existing one")
 
 
+def test_flatten_prep_dirs():
+    """Unit-level Exam Prep folders fold up into the class's one — one amber
+    node per class, not one per unit. Same filename from two units keeps both,
+    and the notes' hub links get repointed at the class hub."""
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        bio = pathlib.Path(d) / "Fall 26" / "Biology"
+        for unit in ("Cells", "Genetics"):
+            prep = bio / unit / app.PREP_DIR
+            prep.mkdir(parents=True)
+            (prep / f"{app.PREP_DIR}.md").write_text("old unit hub", encoding="utf-8")
+            (prep / "Midterm 1.md").write_text(
+                "---\nclass: Biology\ntags: [exam]\n---\n\n# Midterm 1\n"
+                f"\nExam Prep: [[Fall 26/Biology/{unit}/{app.PREP_DIR}/{app.PREP_DIR}|{app.PREP_DIR}]]\n",
+                encoding="utf-8")
+
+        app._flatten_prep_dirs()
+        app._prune_exam_links()
+
+        assert not (bio / "Cells" / app.PREP_DIR).exists()
+        assert not (bio / "Genetics" / app.PREP_DIR).exists()
+        prep = bio / app.PREP_DIR
+        names = sorted(p.name for p in prep.glob("*.md"))
+        # both midterms survive, one renamed by its unit; the unit hubs are gone
+        assert names == [f"{app.PREP_DIR}.md", "Midterm 1 (Genetics).md", "Midterm 1.md"], names
+        for n in ("Midterm 1.md", "Midterm 1 (Genetics).md"):
+            text = (prep / n).read_text(encoding="utf-8")
+            assert f"Exam Prep: [[Fall 26/Biology/{app.PREP_DIR}/{app.PREP_DIR}|" in text, text
+        hub = (prep / f"{app.PREP_DIR}.md").read_text(encoding="utf-8")
+        assert "Class: [[Fall 26/Biology/Biology|Biology]]" in hub, hub
+        assert "Unit: " not in hub, hub
+
+        app._flatten_prep_dirs()  # idempotent
+        assert sorted(p.name for p in prep.glob("*.md")) == names
+    print("ok: unit-level Exam Prep folders flatten into one per class")
+
+
 if __name__ == "__main__":
     test_scope_rows()
     test_validation_errors()
@@ -287,4 +326,5 @@ if __name__ == "__main__":
     test_quiz_files_ungraded()
     test_semester_falls_back_to_rows()
     test_migrate_prep_dirs()
+    test_flatten_prep_dirs()
     print("test_study: OK")
