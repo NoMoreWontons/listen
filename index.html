@@ -1275,12 +1275,12 @@ function labelEditor(r) {
       ${r.status === 'recording' ? 'onkeydown="stampNote(event, this)"' : ''}
       placeholder="your notes — woven into the AI summary on save">${esc(localStorage.getItem('notes-draft-' + r.id) ?? r.notes ?? '')}</textarea>
     <button onclick="saveLabels('${r.id}')">${filed ? 'Update note' : live ? 'Save labels' : 'Save to Obsidian'}</button>
-    <button class="ocr-btn" data-sel=".lbl-notes" onclick="ocrNotes('${r.id}', this)" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the notes box">&#128247; Add notes from file</button>
+    ${live ? `<button class="ocr-btn" data-sel=".lbl-notes" onclick="ocrNotes('${r.id}', this)" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the notes box, woven into the summary when the lecture is analyzed">&#128247; Add notes from file</button>` : ''}
     ${live ? '' : `
     <textarea class="lbl-addendum" rows="2" oninput="localStorage.setItem('addendum-draft-${r.id}', this.value)"
       placeholder="correction / addition — appended to the note as-is, no re-summary">${esc(localStorage.getItem('addendum-draft-' + r.id) ?? '')}</textarea>
     <button onclick="saveAddendum('${r.id}')">Append to note</button>
-    <button class="ocr-btn" data-sel=".lbl-addendum" onclick="ocrNotes('${r.id}', this, '.lbl-addendum')" title="Photo, PDF, PowerPoint, Word, or text file — transcribed into the correction box">&#128247; From file</button>`}
+    <button class="ocr-btn" data-sel=".lbl-addendum" onclick="ocrNotes('${r.id}', this, '.lbl-addendum')" title="Photo, PDF, PowerPoint, Word, or text file — read and appended to the note straight away">&#128247; Add pages to note</button>`}
     ${hint}
   </div>`;
   // filed already -> tuck the editor away; relabelling moves the note
@@ -1289,6 +1289,14 @@ function labelEditor(r) {
 
 function splitCard(r) {
   const segs = r.pending_segments || [];
+  // No proposal in hand means the fetch hasn't landed or the server and this page
+  // disagree about where pending_segments comes from (it left the poll in 4942296).
+  // Offering "Keep as one" against an empty list asks the user to fold a split they
+  // cannot see -- and that fold is irreversible. Wait for the segments instead.
+  if (!segs.length)
+    return `<div class="split-card" data-rid="${r.id}">
+      <p class="lbl-hint">This recording covers multiple topics — loading the proposed split…</p>
+    </div>`;
   const preview = s => esc((s.summary || '').slice(0, 120)) + ((s.summary || '').length > 120 ? '…' : '');
   return `<div class="split-card" data-rid="${r.id}">
     <p class="lbl-hint">This recording covers multiple topics — file as separate notes?</p>
@@ -1578,6 +1586,12 @@ async function ocrNotes(rid, btn, sel = '.lbl-notes') {
     const merged = (ta.value.trim() ? ta.value.trimEnd() + '\n\n' : '') + resp.text;
     ta.value = merged;
     localStorage.setItem(key + rid, merged); // programmatic set skips oninput
+    // A page added to a FINISHED recording is an addition, not a correction to
+    // review: append it now rather than making the user hunt for a second button.
+    // Verbatim, no Claude call -- the summary the lecture already earned stands.
+    // ponytail: no undo in the UI; the source page is embedded beside the text,
+    // so a misread transcription is visible and fixable in Obsidian.
+    if (sel === '.lbl-addendum') { await saveAddendum(rid); return; }
     // the chip only appears once the card re-renders, and refresh() skips that
     // while focus sits in #list -- so blur, repaint, then take focus back. The
     // rebuilt textarea rehydrates from the draft we just stored.
