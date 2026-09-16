@@ -773,7 +773,7 @@ if (window.mermaid) mermaid.initialize({
       <div id="controls">
         <button id="btn">&#9679; Record</button>
         <button id="pauseBtn" hidden>&#10074;&#10074; Pause</button>
-        <button id="meetBtn" title="Record an online class or meeting: captures the meeting tab&#39;s audio (everyone else) mixed with your mic. Chrome only — tick &quot;Also share tab audio&quot; in the picker.">&#9788; Meeting</button>
+        <button id="meetBtn" title="Record an online class or meeting: records the shared audio only, never your mic. Chromium/Opera — turn on &quot;Also share system audio&quot; in the picker, and pick Your Entire Screen for a desktop app like Teams.">&#9788; Meeting</button>
         <span id="timer" class="timer">0:00</span>
         <select id="micSelect" title="Microphone"></select>
         <button id="liveTx" class="pill-btn" title="Show rolling transcript while recording — uses noticeably more battery (extra Whisper decodes)">Live transcript</button>
@@ -881,7 +881,6 @@ if (window.mermaid) mermaid.initialize({
 <script>
 let mr, rid, recording = false;
 let audioCtx, analyser, rafId, timerId, startTime, waveBuf;
-let mixCtx;  // meeting mode only: mixes tab audio + mic into one track
 let openAssignments = [];
 let vaultTree = {};  // {semester: [class, ...]} from the vault; classes with no recordings yet
 let retentionDays = 7;  // overwritten by /app_settings; used only in the "audio expired" message
@@ -992,6 +991,37 @@ function startMeters(stream) {
   }, 1000);
 }
 
+// A share with "Also share system audio" left off still hands over an audio
+// track -- it just never carries sound. On 2026-09-16 that cost a 76-minute
+// Teams lecture: the waveform moved (the mic was in the mix, picking up the
+// room) so the capture looked live while the meeting half was silence. The mic
+// is out of meeting mode now, and this says so out loud while the class is
+// still running.
+const SILENT_PEAK = 2;  // out of 128 -- under this a track is digital silence
+
+function peakLevel(buf) {  // loudest deviation from silence in one frame
+  let p = 0;
+  for (let i = 0; i < buf.length; i++) p = Math.max(p, Math.abs(buf[i] - 128));
+  return p;
+}
+
+function watchShareAudio(seconds = 45) {
+  let peak = 0;
+  const started = Date.now();
+  const id = setInterval(() => {
+    if (!recording) return clearInterval(id);
+    analyser.getByteTimeDomainData(waveBuf);
+    peak = Math.max(peak, peakLevel(waveBuf));
+    if (Date.now() - started < seconds * 1000) return;
+    clearInterval(id);
+    if (peak < SILENT_PEAK) {
+      alert('No sound has reached this recording in its first ' + seconds + ' seconds.\n\n'
+        + 'The share is silent -- "Also share system audio" was almost certainly left off '
+        + 'in the picker. Stop, share again with it on, and restart the recording.');
+    }
+  }, 1000);
+}
+
 function stopMeters() {
   cancelAnimationFrame(rafId);
   clearInterval(timerId);
@@ -1001,7 +1031,6 @@ function stopMeters() {
   timer.classList.remove('on');
   mic.classList.remove('on');
   if (audioCtx) audioCtx.close();
-  if (mixCtx) { mixCtx.close(); mixCtx = null; }
 }
 
 function micAudio() {
@@ -1012,8 +1041,8 @@ function micAudio() {
 
 // Shared by both start buttons. `stream` is what MediaRecorder writes; `extra`
 // carries source tracks that aren't in it -- in meeting mode the recorded stream
-// is the mixer's output, so stopping only that would leave the tab capture and
-// the mic live (and Chrome's "sharing this tab" bar up) after the recording ended.
+// holds only the share's audio track, so stopping it would leave the capture's
+// video track live and Chrome's "sharing this tab" bar up after the recording ended.
 async function beginRec(stream, extra = []) {
   rid = (await (await fetch('/start', { method: 'POST' })).json()).id;
   mr = new MediaRecorder(stream, { mimeType: 'audio/webm' });
@@ -1060,11 +1089,13 @@ btn.onclick = async () => {
 
 // Meeting mode. A plain mic recording of a Teams/Zoom call keeps only your own
 // half: everyone else arrives as speaker output, which echoCancellation exists
-// to remove, and headphones drop them entirely. So capture the meeting tab's own
-// audio and mix the mic into it. Chrome only offers the "share tab audio"
+// to remove, and headphones drop them entirely. So record the shared audio
+// itself -- and ONLY that. Mixing the mic in used to mean a silent share still
+// drew a moving waveform off room noise, which reads as "the meeting is coming
+// through" right up until you read the transcript. Chrome only offers the audio
 // checkbox when video is requested too, so we ask for video and never read it.
 meetBtn.onclick = async () => {
-  let disp, micStream;
+  let disp;
   try {
     disp = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
   } catch (e) {
@@ -1072,30 +1103,18 @@ meetBtn.onclick = async () => {
   }
   if (!disp.getAudioTracks().length) {
     disp.getTracks().forEach(t => t.stop());
-    alert('That share carries no audio, so only your own voice would be recorded.\n\n'
-      + 'Share it again, pick the meeting *tab*, and tick "Also share tab audio" in the picker.\n'
-      + 'A whole-screen or single-window share cannot carry audio in Chrome.');
+    alert('That share carries no audio, so the recording would be silent.\n\n'
+      + 'Share again and turn ON "Also share system audio" in the picker.\n'
+      + 'A meeting running in a desktop app (Teams, Zoom) is only captured by '
+      + '"Your Entire Screen" with that toggle on -- a tab share carries only the sound of that one tab.');
     return;
   }
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: micAudio() });
-  } catch (e) {
-    disp.getTracks().forEach(t => t.stop());  // don't leave the tab captured
-    alert('Mic access failed: ' + e.name + ' — ' + e.message);
-    return;
-  }
-  loadMics();
-  // Both halves onto one track: Whisper gets a single timeline, and the summary
-  // prompt's speaker inference sees the questions and the answers side by side.
-  mixCtx = new AudioContext();
-  const out = mixCtx.createMediaStreamDestination();
-  mixCtx.createMediaStreamSource(new MediaStream(disp.getAudioTracks())).connect(out);
-  mixCtx.createMediaStreamSource(micStream).connect(out);
   // Chrome ends the captured audio when the video track ends ("Stop sharing"),
-  // so stop the recording there instead of quietly finishing the meeting on the
-  // mic alone -- that failure looks fine until you read the transcript.
+  // so stop the recording there instead of quietly finishing the meeting on
+  // silence -- that failure looks fine until you read the transcript.
   disp.getVideoTracks()[0].onended = () => { if (recording) stopRec(); };
-  beginRec(out.stream, [...disp.getTracks(), ...micStream.getTracks()]);
+  await beginRec(new MediaStream(disp.getAudioTracks()), disp.getTracks());
+  watchShareAudio();
 };
 
 const pauseBtn = document.getElementById('pauseBtn');

@@ -6,6 +6,7 @@ import threading
 import datetime
 import pathlib
 import subprocess
+import traceback
 import tempfile
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -154,6 +155,39 @@ def _gate(rid):
     return _transcribe_gates.setdefault(rid, e)
 
 
+def _spawn_process(rid):
+    """Start a transcription worker, claiming the gate before the thread exists.
+    The gate is what tells a running job from a stranded row (see
+    _retry_if_stranded), and _gate is a setdefault -- so claiming it here closes
+    the window between the status write and the thread's first line, where a
+    sweep would otherwise start a second decode of the same recording."""
+    _gate(rid)
+    threading.Thread(target=process, args=(rid,), daemon=True).start()
+
+
+_swept = set()  # rids the stranded-row retry has already taken once this run
+
+
+def _retry_if_stranded(row, gate):
+    """A worker that dies before it can write status='error' -- its own error
+    write can fail too -- leaves the row reading 'transcribing' for ever, with
+    nothing running and nothing shown (2026-09-16: a 76-minute lecture sat like
+    that for an hour). The gate is held for the whole of process(), so
+    'transcribing' + no gate + audio on disk means stranded: retry it. Once per
+    server run, because a worker that dies instantly would respawn on every poll.
+    ponytail: rides the list poll instead of a timer thread -- it only heals
+    while the page is open, which is where a stranded row is noticed anyway.
+    PDF and still-downloading YouTube rows have no audio file and are skipped.
+    """
+    rid = row["id"]
+    if (row["status"] != "transcribing" or gate or rid in _swept
+            or not audio_path(rid).exists()):
+        return
+    _swept.add(rid)
+    print(f"[listen] {rid} stranded in 'transcribing' with no worker - retrying", flush=True)
+    _spawn_process(rid)
+
+
 def _download_progress_tqdm():
     """faster_whisper hardcodes tqdm_class=disabled_tqdm for its download —
     that's why a slow download used to look identical to a hang. Bypass it by
@@ -273,7 +307,7 @@ def resume_stuck():
     for row in stuck:
         if audio_path(row["id"]).exists():
             _set(row["id"], status="transcribing")
-            threading.Thread(target=process, args=(row["id"],), daemon=True).start()
+            _spawn_process(row["id"])
 
 
 def adopt_orphan_audio():
@@ -304,7 +338,7 @@ def adopt_orphan_audio():
             print(f"[listen] orphan audio {f.name} not adopted: {e}")
             continue
         print(f"[listen] adopted orphan audio {rid} ({f.stat().st_size / 1e6:.0f} MB)")
-        threading.Thread(target=process, args=(rid,), daemon=True).start()
+        _spawn_process(rid)
 
 
 def _warm_model():
@@ -380,7 +414,7 @@ async def chunk(rid: str, request: Request):
 @app.post("/stop/{rid}")
 def stop(rid: str):
     sb.table("recordings").update({"status": "transcribing"}).eq("id", rid).execute()
-    threading.Thread(target=process, args=(rid,), daemon=True).start()
+    _spawn_process(rid)
     return {"ok": True}
 
 
@@ -414,7 +448,7 @@ async def upload(request: Request, kind: str = "audio", filename: str = ""):
         # ponytail: .webm name whatever the real container — ffmpeg sniffs the format
         # from content, and sweep_old_audio's *.webm glob keeps covering the file
         audio_path(rid).write_bytes(data)
-        threading.Thread(target=process, args=(rid,), daemon=True).start()
+        _spawn_process(rid)
     else:
         pdf_path(rid).write_bytes(data)  # survives a crash; recovery = re-upload
         # A syllabus is administrative -- nothing to look at later. Course
@@ -481,6 +515,7 @@ def recordings(limit: int = LIST_PAGE):
         r["obsidian_uri"] = _obsidian_uri(r.get("obsidian_path"))
         g = _transcribe_gates.get(r["id"])
         r["paused"] = bool(g) and not g.is_set()
+        _retry_if_stranded(r, g)
         # Pages attached to a still-transcribing recording are otherwise invisible
         # until the note is filed -- the upload looked like it did nothing.
         r["attachments"] = _attachments(r["id"])
@@ -1068,7 +1103,15 @@ def process(rid):
         _set(rid, segments=_cap_entries(entries))
         finalize(rid, transcript)
     except Exception as e:
-        _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]", live_transcript=None)
+        traceback.print_exc()
+        try:
+            _set(rid, status="error", stage=None, progress=None,
+                 summary=f"[error: {e}]", live_transcript=None)
+        except Exception:
+            # Marking the failure failed too: the row still reads 'transcribing'
+            # and only _retry_if_stranded will pick it up. Leave a line behind so
+            # the console says what happened.
+            print(f"[listen] {rid} failed AND could not be marked errored", flush=True)
     finally:
         _transcribe_gates.pop(rid, None)  # restart/finish always comes up unpaused
 
@@ -1285,19 +1328,42 @@ def split(rid: str, payload: dict = Body(...)):
     return {"ok": True, "rows": ids}
 
 
+def _known_units(rows, semester):
+    """{class: [units]} already filed in a semester — the labels an upload should
+    reuse instead of forking a near-duplicate folder. _snap_labels only catches
+    near-identical wording ('Multivariable Calculus' against the filed
+    'Differentiation of Multivariable Functions' scores 0.2 and does not snap),
+    so the model gets the list up front instead of being corrected after."""
+    out = {}
+    for r in rows:
+        if (r.get("semester") or "") != semester:
+            continue
+        cls, unit = (r.get("class") or "").strip(), (r.get("unit") or "").strip()
+        if cls and unit and unit not in out.setdefault(cls, []):
+            out[cls].append(unit)
+    return out
+
+
 def process_pdf(rid):
     """Summarize + label an uploaded PDF and file it like a lecture: one Claude
     call on the raw document, key points into the transcript column, then the
-    same write_note tail."""
+    same write_note tail. A document covering several topics parks as
+    split_pending for the user to confirm, exactly like a multi-topic lecture."""
     try:
         pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source,created_at")
                .eq("id", rid).single().execute().data or {})
         syllabus = pre.get("source") == "syllabus"
-        summary, sem, cls, unit, topic, key_points, assignments, tokens_in, tokens_out = analyze_pdf(
-            pdf_path(rid).read_bytes(), pre.get("notes") or "", syllabus=syllabus,
-            homework=pre.get("source") == "homework")
         keep = lambda k, v: (pre.get(k) or "").strip() or v
         created_at = pre.get("created_at") or datetime.datetime.now().isoformat()
+        # the document may name its own semester, but the label candidates have to
+        # be picked before the call -- resolve the term without it (the full
+        # precedence chain runs on the reply below)
+        filed = sb.table("recordings").select("class,unit,topic,semester").eq("status", "done").execute().data
+        segments, sem, key_points, assignments, tokens_in, tokens_out = analyze_pdf(
+            pdf_path(rid).read_bytes(), pre.get("notes") or "", syllabus=syllabus,
+            homework=pre.get("source") == "homework",
+            known_units=_known_units(filed, keep("semester", os.getenv("SEMESTER_OVERRIDE", "").strip()
+                                                or _semester(created_at))))
         # precedence: user label > SEMESTER_OVERRIDE > semester stated in the
         # document > recording date (_semester applies the override itself)
         sem_default = os.getenv("SEMESTER_OVERRIDE", "").strip() or _norm_sem(sem) or _semester(created_at)
@@ -1305,10 +1371,27 @@ def process_pdf(rid):
         # snap before keep(), same as the lecture path: an upload labelled off the
         # document alone forks a near-duplicate class/unit folder otherwise. A label
         # the user typed still wins -- keep() is applied to the snapped value.
-        seg = _snap_labels(
-            [{"class": cls, "unit": unit, "topic": topic}],
-            sb.table("recordings").select("class,unit,topic").eq("status", "done").execute().data,
-            vault_tree().get(semester, []))[0]
+        # transcript is what write_note files on -- an empty one files nothing at all,
+        # so a reply that folded its key_points into the segments still leaves a note
+        key_points = key_points.strip() or _segments_summary(segments)
+        segments = _snap_labels(segments, filed, vault_tree().get(semester, []))
+        pre_class = (pre.get("class") or "").strip()
+        if pre_class:  # user already told us the class -- it applies to every segment
+            for s in segments:
+                s["class"] = pre_class
+        # A handout covering several topics splits like a multi-topic lecture, and
+        # through the same confirm-then-file path (see finalize()). A topic the user
+        # typed is the exception: they named ONE note, so honour it and file single.
+        if len(segments) > 1 and not (pre.get("topic") or "").strip():
+            _set(rid, status="split_pending", stage=None, progress=None,
+                 transcript=key_points, tokens_in=tokens_in, tokens_out=tokens_out,
+                 semester=semester, pending_segments=segments,
+                 source=pre.get("source") or "pdf")
+            return
+        seg = segments[0]
+        # one note after all (single topic, or a topic the user named): a multi-topic
+        # document still keeps every segment's summary, under '## <topic>' headers
+        summary = seg.get("summary", "") if len(segments) == 1 else _segments_summary(segments)
         fields = {
             "status": "done", "stage": None, "progress": None,
             "transcript": key_points, "summary": summary,
@@ -2067,6 +2150,7 @@ def upload_yt(payload: dict = Body(...)):
         "notes": f"Source video: {url}",  # analyze() weaves the link into the summary
     }).execute().data[0]
     _set(row["id"], stage="loading_model")
+    _gate(row["id"])  # _yt_process downloads into audio_path before process() claims it
     threading.Thread(target=_yt_process, args=(row["id"], url), daemon=True).start()
     return {"id": row["id"]}
 
@@ -2091,12 +2175,15 @@ def _doc_block(data):
     raise ValueError("unsupported file type — upload a PDF, pptx, docx, or a jpg/png/gif/webp photo")
 
 
-def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
+def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False, known_units=None):
     """One Claude call on a PDF (native document block — no OCR dependency,
-    scanned pages included). Returns (summary, semester, class, unit, topic,
-    key_points, assignments, tokens_in, tokens_out); assignments is [] unless
+    scanned pages included). Returns (segments, semester, key_points,
+    assignments, tokens_in, tokens_out): segments is one {class, unit, topic,
+    summary} per topic the document covers, same shape the lecture path uses, so
+    a multi-topic handout files as several notes. assignments is [] unless
     syllabus=True. homework=True swaps the distill-the-slides framing for a
-    readable per-problem write-up."""
+    readable per-problem write-up — a syllabus and a problem set are each one
+    document by definition, so both stay single-segment."""
     doc_block = _doc_block(pdf_bytes)
     notes_part = (
         "\nThe student took their own notes on this material. Integrate them "
@@ -2112,6 +2199,30 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
         "format (free text, e.g. '50 multiple choice, closed book') and topics "
         "(array of strings) when the document states them; omit otherwise.\n"
     ) if syllabus else ""
+    units_part = (
+        "\nUnits the student already files under, by class: "
+        + "; ".join(f"'{c}': " + ", ".join(f"'{u}'" for u in us)
+                    for c, us in sorted((known_units or {}).items()))
+        + ". If this document belongs under one of them, write that string EXACTLY "
+        "as `unit`, character for character. Only name a new unit when it fits "
+        "none of them.\n"
+    ) if known_units else ""
+    # A packet of lecture notes routinely covers several topics -- the lecture path
+    # has split them into their own notes since 2026-07-10, the upload path filed
+    # them as one note called 'Tangent Planes and Chain Rule'. Same 'and' test,
+    # same cap. A syllabus and a problem set are each one document by definition.
+    split_part = "" if (syllabus or homework) else (
+        "If the document covers more than ONE topic, replace the class, unit, topic "
+        "and summary keys with a 'segments' key: an array of one "
+        "{class, unit, topic, summary} object per topic, each filled in by the rules "
+        "above and below. key_points and semester stay at the TOP LEVEL either way — "
+        "one copy for the whole document, never inside a segment. "
+        "Test: if the topic label you would write needs an 'and' to "
+        "cover the document (e.g. 'Tangent planes and chain rule'), that is TWO "
+        "topics, not one -- split it and give each half its own label and summary. "
+        "Worked examples are not topics: several problems practising one concept all "
+        "belong to that concept. Usually 1-2, sometimes 3 -- NEVER more than 4.\n"
+    )
     content_part = (
         "- key_points: the assignment rewritten as clean, readable markdown "
         "(this stands in for a transcript): one '### Problem <number or short "
@@ -2162,7 +2273,7 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
                     "- topic: the specific topic of THIS document, 5 words max "
                     "(used as the note title)\n"
                     "- semester: the term if stated in the document (e.g. 'Fall 26'), else \"\"\n"
-                    + content_part + syllabus_part + notes_part
+                    + units_part + split_part + content_part + syllabus_part + notes_part
                 )},
             ],
         }],
@@ -2173,14 +2284,27 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
         # model sometimes returns a bullet list as a JSON array — flatten to markdown
         return "\n".join(f"- {x}" for x in v) if isinstance(v, list) else (v or "")
 
+    def segs(d):
+        """The reply's topics as lecture-shaped segments. A single-topic document
+        answers with flat class/unit/topic/summary keys (and older replies always
+        did), so that shape stays the fallback."""
+        listed = [s for s in (d.get("segments") or []) if isinstance(s, dict)]
+        if not listed:
+            listed = [d]
+        return [{"class": txt(s.get("class")), "unit": txt(s.get("unit")),
+                 "topic": txt(s.get("topic")), "summary": txt(s.get("summary"))}
+                for s in listed]
+
     try:
         d = json.loads(raw)
-        parts = (txt(d.get("summary")), txt(d.get("semester")), txt(d.get("class")),
-                 txt(d.get("unit")), txt(d.get("topic")), txt(d.get("key_points")),
+        parts = (segs(d), txt(d.get("semester")), txt(d.get("key_points")),
                  d.get("assignments", []))
     except (json.JSONDecodeError, AttributeError):
         # ponytail: model ignored the JSON ask — keep its text, Unsorted bucket
-        parts = (raw, "", "Unsorted", "Unsorted", "Untitled", raw, [])
+        parts = ([{"class": "Unsorted", "unit": "Unsorted", "topic": "Untitled",
+                   "summary": raw}], "", raw, [])
+    if syllabus or homework:
+        parts = (parts[0][:1], *parts[1:])  # one document, one note — never split
     return (*parts, msg.usage.input_tokens, msg.usage.output_tokens)
 
 

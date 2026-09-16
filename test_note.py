@@ -358,11 +358,94 @@ def test_analyze_pdf_homework_prompt():
     assert "homework assignment" in prompt, prompt
     assert "### Problem" in prompt, prompt
     assert "**Answer:**" in prompt, prompt
+    assert "segments" not in prompt, "a problem set is one document -- never split it"
     app.analyze_pdf(b"%PDF-fake")  # default keeps the course-material framing
     prompt = captured["messages"][0]["content"][1]["text"]
     assert "course material" in prompt, prompt
     assert "Worked examples" in prompt, prompt
+    assert "'segments' key" in prompt, prompt
+    # key_points is the note's transcript -- a reply that buries it inside the
+    # segments files nothing (2026-09-16: three notes written with no body)
+    assert "key_points and semester stay at the TOP LEVEL" in prompt, prompt
     print("ok: analyze_pdf homework flag swaps in the per-problem write-up prompt")
+
+
+def test_analyze_pdf_segments():
+    """A handout covering several topics comes back as several segments -- the
+    shape /split already files as one note each (see process_pdf)."""
+    reply = {"text": ""}
+
+    class FakeMsg:
+        content = [type("T", (), {"text": property(lambda self: reply["text"])})()]
+        usage = type("U", (), {"input_tokens": 1, "output_tokens": 2})()
+
+    app.claude.messages.create = lambda **kw: FakeMsg()
+
+    reply["text"] = ('{"semester":"Fall 26","key_points":"# notes","segments":['
+                     '{"class":"MATH 2110Q","unit":"Differentiation","topic":"Tangent planes",'
+                     '"summary":"- plane"},'
+                     '{"class":"MATH 2110Q","unit":"Differentiation","topic":"Chain rule",'
+                     '"summary":"- chain"}]}')
+    segs, sem, key_points, assignments, _, _ = app.analyze_pdf(b"%PDF-fake")
+    assert [s["topic"] for s in segs] == ["Tangent planes", "Chain rule"], segs
+    assert segs[0]["summary"] == "- plane" and sem == "Fall 26", segs
+    assert key_points == "# notes" and assignments == [], (key_points, assignments)
+
+    # a one-topic document still answers with flat keys, and so do older replies
+    reply["text"] = ('{"class":"C","unit":"U","topic":"T","semester":"",'
+                     '"key_points":"kp","summary":"- s"}')
+    segs, _, _, _, _, _ = app.analyze_pdf(b"%PDF-fake")
+    assert segs == [{"class": "C", "unit": "U", "topic": "T", "summary": "- s"}], segs
+
+    # a syllabus or problem set is one note even if the model volunteers segments
+    reply["text"] = ('{"key_points":"kp","segments":['
+                     '{"class":"C","unit":"U","topic":"A","summary":"a"},'
+                     '{"class":"C","unit":"U","topic":"B","summary":"b"}]}')
+    segs, _, _, _, _, _ = app.analyze_pdf(b"%PDF-fake", homework=True)
+    assert [s["topic"] for s in segs] == ["A"], segs
+
+    # the model ignored the JSON ask entirely -- one Unsorted note, text kept
+    reply["text"] = "I could not read this document."
+    segs, _, key_points, _, _, _ = app.analyze_pdf(b"%PDF-fake")
+    assert len(segs) == 1 and segs[0]["topic"] == "Untitled", segs
+    assert key_points == "I could not read this document.", key_points
+    print("ok: a multi-topic handout parses into per-topic segments")
+
+
+def test_known_units_hint():
+    """An upload has to reuse the unit folders the class already has: the
+    2026-09-16 re-run relabelled 'Differentiation of Multivariable Functions'
+    as 'Multivariable Calculus', which _snap_labels scores 0.2 and lets through."""
+    filed = [
+        {"semester": "Fall 26", "class": "MATH 2110Q", "unit": "Differentiation", "topic": "a"},
+        {"semester": "Fall 26", "class": "MATH 2110Q", "unit": "Differentiation", "topic": "b"},
+        {"semester": "Fall 26", "class": "MATH 2110Q", "unit": "Vectors", "topic": "c"},
+        {"semester": "Fall 26", "class": "ENGR 3400", "unit": "Probability", "topic": "d"},
+        {"semester": "Spring 26", "class": "MATH 2110Q", "unit": "Old unit", "topic": "e"},
+        {"semester": "Fall 26", "class": "", "unit": "", "topic": "f"},  # unlabelled row
+    ]
+    units = app._known_units(filed, "Fall 26")
+    assert units == {"MATH 2110Q": ["Differentiation", "Vectors"],
+                     "ENGR 3400": ["Probability"]}, units
+
+    captured = {}
+
+    class FakeMsg:
+        content = [type("T", (), {"text": '{"class":"C","unit":"U","topic":"T","key_points":"k","summary":"s"}'})()]
+        usage = type("U", (), {"input_tokens": 1, "output_tokens": 2})()
+
+    def fake_create(**kw):
+        captured.clear()
+        captured.update(kw)
+        return FakeMsg()
+
+    app.claude.messages.create = fake_create
+    app.analyze_pdf(b"%PDF-fake", known_units=units)
+    prompt = captured["messages"][0]["content"][1]["text"]
+    assert "'MATH 2110Q': 'Differentiation', 'Vectors'" in prompt, prompt
+    app.analyze_pdf(b"%PDF-fake")  # no history yet -- no hint, no empty list
+    assert "already files under" not in captured["messages"][0]["content"][1]["text"]
+    print("ok: an upload is told which units its class already has")
 
 
 def test_parse_exams_defensive():
@@ -605,6 +688,8 @@ if __name__ == "__main__":
     test_analyze_keeps_mermaid_in_summary()
     test_analyze_keeps_svg_figure()
     test_analyze_pdf_homework_prompt()
+    test_analyze_pdf_segments()
+    test_known_units_hint()
     test_parse_exams_defensive()
     test_write_exam_note_files_class_level()
     test_write_exam_note_undated_no_format_overwrites()

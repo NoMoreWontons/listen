@@ -1,6 +1,7 @@
-// Meeting mode records the mixer's output, not the captures feeding it. Stopping
-// only the recorded stream would leave the tab capture and the mic live -- Chrome
-// keeps the "sharing this tab" bar up and the mic light on after you hit Stop.
+// Meeting mode records the share's own audio track and nothing else. Stopping
+// only the recorded stream would leave the capture's video track live -- Chrome
+// keeps the "sharing this tab" bar up after you hit Stop. The second half checks
+// peakLevel, which is how a share with system audio left off gets caught.
 // ponytail: pulls the function out of index.html by regex instead of a build step / module split.
 // Run: node test_meeting.js
 const fs = require('fs'), assert = require('assert');
@@ -27,9 +28,9 @@ async function run(mixed, extra) {
 }
 
 (async () => {
-  // meeting: one mixed output track out, tab + mic captures behind it
-  const out = track('mix'), tab = track('tab'), tabVid = track('tabVideo'), mic = track('mic');
-  for (const t of await run([out], [tab, tabVid, mic])) {
+  // meeting: the share's audio track is what's recorded, its video track rides along
+  const out = track('shareAudio'), tabVid = track('shareVideo');
+  for (const t of await run([out], [out, tabVid])) {
     assert(t.stopped, t.name + ' left running after stop');
   }
   // plain mic recording still stops its own track with no extra list
@@ -37,5 +38,25 @@ async function run(mixed, extra) {
   for (const t of await run([solo])) assert(t.stopped, t.name + ' left running after stop');
 
   assert.strictEqual(globalThis.recording, true, 'beginRec must flag the session recording');
+
+  // A share with "Also share system audio" off still yields an audio track, so
+  // silence is the only tell -- peakLevel is what watchShareAudio decides on.
+  const pm = src.match(/function peakLevel\(buf\) \{[\s\S]*?\n\}/);
+  assert(pm, 'peakLevel not found in index.html');
+  const peakLevel = eval('(' + pm[0].replace('function peakLevel', 'function') + ')');
+  const SILENT_PEAK = Number(src.match(/const SILENT_PEAK = (\d+)/)[1]);
+
+  const silent = new Uint8Array(2048).fill(128);       // what a muted share sends
+  assert.strictEqual(peakLevel(silent), 0, 'flat 128 frame must read as silence');
+  assert(peakLevel(silent) < SILENT_PEAK, 'silence must trip the warning');
+
+  const speech = Uint8Array.from({ length: 2048 },
+    (_, i) => 128 + Math.round(40 * Math.sin(i / 8)));  // audible, ~ -10 dBFS
+  assert.strictEqual(peakLevel(speech), 40, 'peak is the largest swing from 128');
+  assert(peakLevel(speech) >= SILENT_PEAK, 'real audio must not warn');
+
+  const oneBlip = new Uint8Array(2048).fill(128); oneBlip[7] = 128 - 9;
+  assert.strictEqual(peakLevel(oneBlip), 9, 'a negative swing counts as loudly as a positive one');
+
   console.log('test_meeting.js OK');
 })();

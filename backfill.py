@@ -47,9 +47,14 @@ def main():
             if pdf.exists():
                 # syllabus=False even for syllabi: assignments were already
                 # extracted on first upload; re-asking would duplicate them
-                summary, _, _, _, _, key_points, _, i, o = app.analyze_pdf(
+                segs, _, key_points, _, i, o = app.analyze_pdf(
                     pdf.read_bytes(), r.get("notes") or "",
                     homework=src == "homework")
+                # this rewrites one already-filed note in place, so a document the
+                # model now reads as several topics folds into one summary rather
+                # than re-splitting a row the user already labelled
+                summary = (segs[0]["summary"] if len(segs) == 1
+                           else app._segments_summary(segs))
                 app._set(rid, summary=summary, transcript=key_points)
             else:
                 summary, i, o = rewrite_md(r["summary"])
