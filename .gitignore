@@ -7,3 +7,4 @@ app_settings.json
 server.log
 .gstack/
 pending/
+logs/
