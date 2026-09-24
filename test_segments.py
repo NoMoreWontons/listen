@@ -29,6 +29,7 @@ class FakeQuery:
         self.mode = "select"
         self.payload = None
         self.want_single = False
+        self.cap = None
 
     def select(self, *a, **k):
         return self
@@ -37,15 +38,26 @@ class FakeQuery:
         self.filters.append(("eq", k, v))
         return self
 
+    def in_(self, k, vals):
+        self.filters.append(("in", k, list(vals)))
+        return self
+
     def single(self):
         self.want_single = True
         return self
 
+    def limit(self, n):
+        self.cap = n
+        return self
+
     def _match(self, r):
-        return all(r.get(k) == v for _, k, v in self.filters)
+        return all(r.get(k) in v if op == "in" else r.get(k) == v
+                   for op, k, v in self.filters)
 
     def execute(self):
         matched = [r for r in self.rows if self._match(r)]
+        if self.cap is not None:
+            matched = matched[:self.cap]
         data = (matched[0] if matched else None) if self.want_single else matched
         return FakeResult(data)
 
@@ -95,6 +107,21 @@ def test_get_segments_endpoint():
     print("ok: /segments/{rid} returns stored segments, [] when missing/unset")
 
 
+def test_get_transcript_and_summary_endpoints():
+    """Both columns were split out of /recordings (they cost the project its
+    Supabase egress quota riding along on the 5s poll), so the per-row endpoints
+    are now the only way the UI can reach them."""
+    rows = [{"id": "r1", "transcript": "hello world", "summary": "# notes"},
+            {"id": "r2", "transcript": None, "summary": None}]
+    app.sb = FakeSB(rows)
+    assert app.get_transcript("r1") == {"transcript": "hello world"}
+    assert app.get_transcript("r2") == {"transcript": ""}   # row exists, never transcribed
+    assert app.get_transcript("missing") == {"transcript": ""}  # no row at all
+    # /summaries is batched and skips ids it has no row for, so the client keeps ''
+    assert app.get_summaries(["r1", "r2", "missing"]) == {"r1": "# notes", "r2": ""}
+    print("ok: /transcript/{rid} and /summaries return the text, '' when missing/unset")
+
+
 def test_get_audio_serves_file_or_404():
     with tempfile.TemporaryDirectory() as d:
         app.AUDIO_DIR = pathlib.Path(d)
@@ -116,4 +143,5 @@ if __name__ == "__main__":
     test_seg_entries_shapes_and_rounds()
     test_seg_entries_truncates_past_2000()
     test_get_segments_endpoint()
+    test_get_transcript_and_summary_endpoints()
     test_get_audio_serves_file_or_404()

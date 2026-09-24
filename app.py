@@ -6,6 +6,7 @@ import threading
 import datetime
 import pathlib
 import subprocess
+import traceback
 import tempfile
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,8 @@ load_dotenv()
 HERE = pathlib.Path(__file__).parent
 AUDIO_DIR = HERE / "audio"
 AUDIO_DIR.mkdir(exist_ok=True)
+PENDING_DIR = HERE / "pending"   # pages uploaded before their lecture exists
+PENDING_DIR.mkdir(exist_ok=True)
 FRQ_UPLOAD_DIR = HERE / "frq_uploads"  # photographed/scanned FRQ answer pages, kept for the record
 FRQ_UPLOAD_DIR.mkdir(exist_ok=True)
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
@@ -37,20 +40,62 @@ OBSIDIAN_VAULT = pathlib.Path(
 # the scope spans units). Was "Practice"; _migrate_prep_dirs renames old ones.
 PREP_DIR = "Exam Prep"
 
+# Original uploaded pages (ink notes, diagrams, scanned handouts) live here so
+# the drawing survives Claude's transcription of it. Vault root, not beside the
+# note: wikilinks resolve by filename anywhere in the vault, and notes MOVE when
+# units/topics merge -- a per-unit folder would orphan its attachments. Excluded
+# from the semester scan in write_graph_config, or it reads as a semester.
+ATTACH_DIR = "Attachments"
+# Only what Obsidian actually embeds. A .docx would write an ![[x.docx]] that
+# renders as a broken link, so those stay text-only through /ocr.
+ATTACH_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif")
+
 # Shared by every prompt that may draw a diagram (lecture summaries, cheat
-# sheets). Obsidian renders mermaid fences natively and so does the in-app
-# view; a syntax error renders as an error box, which is worse than the prose
-# it replaced, so the syntax rules are deliberately narrow — one diagram type,
-# every label quoted. Widen only if the model proves it can stay valid.
+# sheets). Two forms, because they answer different questions: a flowchart for
+# how ideas connect, a drawing for what something looks like. A flowchart of a
+# boxplot ("summary -> draw rectangle -> done") says nothing the prose did not.
+# Obsidian renders both natively -- mermaid fences and inline SVG -- and so does
+# the in-app view, which strips the SVG down to the element and attribute lists
+# below before showing it. A syntax error renders as an error box, which is
+# worse than the prose it replaced, so both syntaxes are kept deliberately
+# narrow. Widen only if the model proves it can stay valid.
 DIAGRAM_RULES = (
-    "Draw diagrams as ```mermaid fenced code blocks using `flowchart TD` or "
-    "`flowchart LR` — that one type covers concept maps, hierarchies, process "
-    "steps, and 'which method do I use' decision trees.\n"
+    "You may draw TWO kinds of figure. Pick by what the content is.\n"
+    "\n"
+    "1. RELATIONSHIPS between ideas -- concept maps, hierarchies, process steps, "
+    "'which method do I use' decision trees -- as a ```mermaid fenced code block "
+    "using `flowchart TD` or `flowchart LR`.\n"
     "Mermaid syntax is strict. Every node label MUST be a double-quoted string: "
     'A["kinetic friction"] --> B["opposes sliding"]. Never put LaTeX, backticks, '
     "or a semicolon inside a label; keep labels under 40 characters and use plain "
     "words rather than math notation. Use `-->` for arrows and `-- \"text\" -->` "
     "for a labelled arrow. Do not use subgraphs, styling, or click handlers.\n"
+    "\n"
+    "2. ANYTHING WITH A SHAPE, AXIS, OR POSITION -- a boxplot with its whiskers "
+    "and outlier dots, a histogram, a skewed distribution with the mean and median "
+    "marked, a conic section, vectors and the angle between them, a projection, 3D "
+    "axes, a free-body diagram, a number line, a labelled triangle or circle -- as "
+    "a raw inline <svg> element on its own line, NOT inside a code fence.\n"
+    "Draw it to scale from the actual numbers in the lecture whenever there are "
+    "any: a boxplot's quartiles go where the data puts them. A figure that "
+    "contradicts the numbers printed beside it is worse than no figure.\n"
+    "Quote every SVG attribute with SINGLE quotes -- <svg viewBox='0 0 W H'>. "
+    "The figure travels back inside a JSON string, where a double quote has to be "
+    "escaped and one missed backslash loses the whole reply.\n"
+    "Write it as <svg viewBox='0 0 W H' width='W' height='H'> with W at most "
+    "620. Use only these elements: g, line, rect, circle, ellipse, path, polyline, "
+    "polygon, text, tspan. Use only these attributes: viewBox, width, height, x, "
+    "y, dx, dy, x1, y1, x2, y2, cx, cy, r, rx, ry, d, points, transform, fill, "
+    "stroke, stroke-width, stroke-dasharray, stroke-linecap, fill-opacity, "
+    "opacity, text-anchor, font-size, font-weight, font-style. Anything else is "
+    "stripped before the figure is shown, so a figure that depends on it renders "
+    "broken. Never use style=, href, <use>, <image>, <script>, or url(...).\n"
+    "Set stroke='currentColor' and fill='none' so the figure reads on both a "
+    "light and a dark background; for a filled region use fill='currentColor' "
+    "with fill-opacity='0.12'. Draw arrowheads as a <polygon>, never a marker. "
+    "Labels go in <text> at font-size 10-12 as plain words and numbers -- no "
+    "LaTeX, no HTML entities. Leave ~20 units of margin inside the viewBox so "
+    "nothing clips.\n"
 )
 
 sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
@@ -110,6 +155,39 @@ def _gate(rid):
     return _transcribe_gates.setdefault(rid, e)
 
 
+def _spawn_process(rid):
+    """Start a transcription worker, claiming the gate before the thread exists.
+    The gate is what tells a running job from a stranded row (see
+    _retry_if_stranded), and _gate is a setdefault -- so claiming it here closes
+    the window between the status write and the thread's first line, where a
+    sweep would otherwise start a second decode of the same recording."""
+    _gate(rid)
+    threading.Thread(target=process, args=(rid,), daemon=True).start()
+
+
+_swept = set()  # rids the stranded-row retry has already taken once this run
+
+
+def _retry_if_stranded(row, gate):
+    """A worker that dies before it can write status='error' -- its own error
+    write can fail too -- leaves the row reading 'transcribing' for ever, with
+    nothing running and nothing shown (2026-09-16: a 76-minute lecture sat like
+    that for an hour). The gate is held for the whole of process(), so
+    'transcribing' + no gate + audio on disk means stranded: retry it. Once per
+    server run, because a worker that dies instantly would respawn on every poll.
+    ponytail: rides the list poll instead of a timer thread -- it only heals
+    while the page is open, which is where a stranded row is noticed anyway.
+    PDF and still-downloading YouTube rows have no audio file and are skipped.
+    """
+    rid = row["id"]
+    if (row["status"] != "transcribing" or gate or rid in _swept
+            or not audio_path(rid).exists()):
+        return
+    _swept.add(rid)
+    print(f"[listen] {rid} stranded in 'transcribing' with no worker - retrying", flush=True)
+    _spawn_process(rid)
+
+
 def _download_progress_tqdm():
     """faster_whisper hardcodes tqdm_class=disabled_tqdm for its download —
     that's why a slow download used to look identical to a hang. Bypass it by
@@ -134,6 +212,13 @@ def _download_progress_tqdm():
 
 
 def _load_model():
+    # ctranslate2 loads cublas/cudnn with plain LoadLibrary, which searches PATH
+    # and ignores os.add_dll_directory — so the pip nvidia-*-cu12 wheels are
+    # invisible unless their bin dirs are on PATH before the first CUDA call.
+    import sys, glob
+    dlls = glob.glob(os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", "*", "bin"))
+    os.environ["PATH"] = os.pathsep.join(dlls + [os.environ["PATH"]])
+
     from faster_whisper import WhisperModel
     from faster_whisper.utils import _MODELS
     from huggingface_hub import snapshot_download
@@ -156,8 +241,9 @@ def _load_model():
         import numpy as np
         next(model.transcribe(np.zeros(16000, dtype=np.float32))[0], None)
         return model
-    except Exception:
+    except Exception as e:
         # ponytail: CPU fallback when CUDA libs aren't present; slower but works
+        print(f"[whisper] CUDA unavailable ({e}); falling back to CPU", flush=True)
         return WhisperModel(model_path, device="cpu", compute_type="int8")
 
 
@@ -221,7 +307,38 @@ def resume_stuck():
     for row in stuck:
         if audio_path(row["id"]).exists():
             _set(row["id"], status="transcribing")
-            threading.Thread(target=process, args=(row["id"],), daemon=True).start()
+            _spawn_process(row["id"])
+
+
+def adopt_orphan_audio():
+    """The mirror of resume_stuck: audio on disk with no row at all.
+
+    /start creates the row before any chunk arrives, so a file can never
+    legitimately outlive its row — an orphan is always bookkeeping damage
+    (a delete whose unlink failed, or a crash between write and insert).
+    The UI lists rows, so an orphan is a lecture nobody can reach; adopting
+    it costs one insert and is the difference between a silent loss and a
+    recording that just shows up transcribed.
+    """
+    known = {r["id"] for r in sb.table("recordings").select("id").execute().data}
+    for f in sorted(AUDIO_DIR.glob("*.webm")):
+        rid = f.stem
+        if rid in known or not f.stat().st_size:
+            continue
+        mt = datetime.datetime.fromtimestamp(f.stat().st_mtime, datetime.timezone.utc)
+        try:
+            sb.table("recordings").insert({
+                "id": rid,  # a non-uuid filename fails here, which is the point
+                "title": mt.astimezone().strftime("%Y-%m-%d %H:%M") + " (recovered)",
+                "status": "transcribing",
+                "source": "local",
+                "created_at": mt.isoformat(),
+            }).execute()
+        except Exception as e:
+            print(f"[listen] orphan audio {f.name} not adopted: {e}")
+            continue
+        print(f"[listen] adopted orphan audio {rid} ({f.stat().st_size / 1e6:.0f} MB)")
+        _spawn_process(rid)
 
 
 def _warm_model():
@@ -238,7 +355,11 @@ async def lifespan(app):
     # ponytail: warm the model in the background so the first recording
     # doesn't cold-start the download; server still starts immediately.
     threading.Thread(target=_warm_model, daemon=True).start()
-    resume_stuck()
+    try:  # a dead DB must not kill startup
+        resume_stuck()
+        adopt_orphan_audio()  # after the sweep, so nothing retention just dropped comes back
+    except Exception as e:
+        print(f"[listen] startup housekeeping skipped -- database unreachable: {e}")
     yield
 
 
@@ -247,7 +368,11 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def index():
-    return FileResponse(HERE / "index.html")
+    # no-cache, not no-store: keeps the etag round-trip (304 when unchanged) but
+    # forbids serving a stale copy without asking. Matters most for the iPad
+    # home-screen web app, which has no address bar and so no way to force a
+    # reload -- without this it can sit on old JS with no visible fix.
+    return FileResponse(HERE / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.post("/start")
@@ -289,7 +414,7 @@ async def chunk(rid: str, request: Request):
 @app.post("/stop/{rid}")
 def stop(rid: str):
     sb.table("recordings").update({"status": "transcribing"}).eq("id", rid).execute()
-    threading.Thread(target=process, args=(rid,), daemon=True).start()
+    _spawn_process(rid)
     return {"ok": True}
 
 
@@ -323,9 +448,13 @@ async def upload(request: Request, kind: str = "audio", filename: str = ""):
         # ponytail: .webm name whatever the real container — ffmpeg sniffs the format
         # from content, and sweep_old_audio's *.webm glob keeps covering the file
         audio_path(rid).write_bytes(data)
-        threading.Thread(target=process, args=(rid,), daemon=True).start()
+        _spawn_process(rid)
     else:
         pdf_path(rid).write_bytes(data)  # survives a crash; recovery = re-upload
+        # A syllabus is administrative -- nothing to look at later. Course
+        # material and homework can carry diagrams worth keeping verbatim.
+        if kind != "syllabus":
+            save_attachment(rid, filename, data)
         _set(rid, stage="summarizing")
         threading.Thread(target=process_pdf, args=(rid,), daemon=True).start()
     return {"id": rid}
@@ -343,14 +472,42 @@ def _obsidian_uri(path):
             + "&file=" + urllib.parse.quote(rel.with_suffix("").as_posix()))
 
 
+LIST_PAGE = 200   # cards per poll; "show older" asks for more
+
+
+@app.get("/labels")
+def labels():
+    """Every recording, labels only -- what the vault tree, the merge panel, the
+    scope pickers and the datalists read. Split out of /recordings because those
+    panels need the whole library while the card list only needs a page of it:
+    on the poll, the full set is the one payload that still grew forever.
+    Clients fetch this once and refetch only when a label or status actually moves.
+    """
+    rows = (sb.table("recordings")
+            .select("id,created_at,status,semester,class,unit,topic,obsidian_path,source,title")
+            .order("created_at", desc=True).execute().data)
+    for r in rows:
+        r["obsidian_uri"] = _obsidian_uri(r.get("obsidian_path"))
+    return rows
+
+
 @app.get("/recordings")
-def recordings():
+def recordings(limit: int = LIST_PAGE):
     rows = (
         sb.table("recordings")
-        .select("id,title,created_at,status,transcript,summary,stage,progress,"
+        # transcript (2 MB table-wide) and summary (267 kB) are deliberately NOT
+        # selected: pulling them on every 5s tick burned the whole Supabase egress
+        # quota in an afternoon (402 exceed_egress_quota, 2026-09-14) and the project
+        # got restricted. Both are lazy-loaded per row -- /transcript/{rid} when the
+        # <details> opens, /summary/{rid} once per page load -- like /segments/{rid}.
+        # pending_segments is out for the same reason and stays on disk in the DB:
+        # it's 8.6 kB of proposed splits sitting on rows that resolved theirs long
+        # ago, and only a split_pending card ever reads it (/pending_split/{rid}).
+        .select("id,title,created_at,status,stage,progress,"
                 "tokens_in,tokens_out,semester,class,unit,topic,obsidian_path,source,notes,"
-                "pending_segments,live_transcript")
+                "live_transcript")
         .order("created_at", desc=True)
+        .limit(max(1, limit))   # a page of cards; /labels carries the rest of the library
         .execute()
         .data
     )
@@ -358,6 +515,10 @@ def recordings():
         r["obsidian_uri"] = _obsidian_uri(r.get("obsidian_path"))
         g = _transcribe_gates.get(r["id"])
         r["paused"] = bool(g) and not g.is_set()
+        _retry_if_stranded(r, g)
+        # Pages attached to a still-transcribing recording are otherwise invisible
+        # until the note is filed -- the upload looked like it did nothing.
+        r["attachments"] = _attachments(r["id"])
     return rows
 
 
@@ -396,8 +557,34 @@ def get_audio(rid: str):
 def get_segments(rid: str):
     """Timestamped transcript segments -- split out of /recordings since it's
     a big payload the 5s poll doesn't need."""
-    row = sb.table("recordings").select("segments").eq("id", rid).single().execute().data or {}
-    return row.get("segments") or []
+    rows = sb.table("recordings").select("segments").eq("id", rid).limit(1).execute().data
+    return (rows[0] if rows else {}).get("segments") or []
+
+
+@app.get("/transcript/{rid}")
+def get_transcript(rid: str):
+    """Plain transcript text -- split out of /recordings for the same reason as
+    /segments: it's the biggest column in the table and the 5s poll never shows it."""
+    rows = sb.table("recordings").select("transcript").eq("id", rid).limit(1).execute().data
+    return {"transcript": (rows[0] if rows else {}).get("transcript") or ""}
+
+
+@app.get("/pending_split/{rid}")
+def get_pending_split(rid: str):
+    """The proposed split for one split_pending row. Off the poll for the same
+    reason as transcript and summary: resolved rows keep their old proposals, so
+    the column is mostly dead weight the card list never renders."""
+    rows = sb.table("recordings").select("pending_segments").eq("id", rid).limit(1).execute().data
+    return {"pending_segments": (rows[0] if rows else {}).get("pending_segments") or []}
+
+
+@app.post("/summaries")
+def get_summaries(ids: list[str] = Body(...)):
+    """Summaries (and error messages) for the rows the client hasn't cached yet.
+    Batched, not per-row: the page needs every finished row's summary at once, and
+    97 separate round-trips would just trade egress for latency."""
+    rows = sb.table("recordings").select("id,summary").in_("id", ids).execute().data or []
+    return {r["id"]: r.get("summary") or "" for r in rows}
 
 
 @app.post("/label/{rid}")
@@ -407,10 +594,12 @@ def label(rid: str, payload: dict = Body(...)):
     recording, then re-file the Obsidian note (write_note moves it off the old
     path). Notes are saved before the Claude call so a failed re-summarize
     never loses them."""
-    old = (sb.table("recordings").select("status,transcript,notes,created_at")
+    old = (sb.table("recordings").select("status,transcript,notes,created_at,"
+                                         "semester,class,unit")
            .eq("id", rid).single().execute().data or {})
+    was = (old.get("semester"), old.get("class"), old.get("unit"))  # read before _set overwrites
     notes = payload.get("notes", "")
-    _set(rid, **{"semester": payload.get("semester", ""), "class": payload.get("klass", ""),
+    _set(rid, **{"semester": _norm_sem(payload.get("semester", "")), "class": payload.get("klass", ""),
                  "unit": payload.get("unit", ""), "topic": payload.get("topic", ""),
                  "notes": notes})
     error = None
@@ -422,14 +611,25 @@ def label(rid: str, payload: dict = Body(...)):
             # calendar/vault exam pipeline (finalize()'s job on first pass only)
             segments, _exams, tokens_in, tokens_out = analyze(
                 old["transcript"], notes, old.get("created_at"))
-            # row is already filed — a multi-segment reply here just folds into one summary
-            summary = segments[0]["summary"] if len(segments) == 1 else _segments_summary(segments)
-            _set(rid, summary=summary, tokens_in=tokens_in, tokens_out=tokens_out)
+            summary = _resummarized(rid, old, payload.get("topic", ""), segments)
+            if summary is None:
+                # a split row whose segment could not be identified — leaving the
+                # summary it already has beats overwriting it with the whole lecture
+                error = "notes saved, but the summary was left alone: could not tell " \
+                        "which half of the split lecture this row is"
+            else:
+                _set(rid, summary=summary, tokens_in=tokens_in, tokens_out=tokens_out)
         except Exception as e:
             error = f"notes saved, but re-summarize failed: {e}"
     row = sb.table("recordings").select("*").eq("id", rid).single().execute().data
     path = write_note(row)
     _set(rid, obsidian_path=path)
+    now = (row.get("semester"), row.get("class"), row.get("unit"))
+    if all(was) and was != now:
+        # write_note moved the note out; the unit it left behind keeps its hub
+        # note and folder forever otherwise. Guarded on an actual label change --
+        # every notes edit lands here too, via the textarea's onblur.
+        _cleanup_unit_dir(*was)
     return {"ok": error is None, "obsidian_path": path, "error": error}
 
 
@@ -453,13 +653,48 @@ def addendum(rid: str, payload: dict = Body(...)):
     return {"ok": True, "obsidian_path": path}
 
 
+def _resummarized(rid, old, topic, segments):
+    """The summary a re-analyzed row should keep, or None to leave it alone.
+
+    A lecture that was split covers several topics but every row keeps the WHOLE
+    transcript, so analyze() re-proposes every segment on a re-summarize. Folding
+    those together -- which is what this used to do -- hands each sibling the
+    entire lecture back and quietly undoes the split: the dot-product note grows
+    a cross-product section, and the cross-product note grows a dot-product one.
+    A row that shares its created_at with another is one of those halves, so pick
+    the segment its topic names and never fold. Returns None when the segment
+    cannot be identified: keeping a stale summary beats overwriting it with one
+    covering material that belongs to a sibling note."""
+    if len(segments) == 1:
+        return segments[0]["summary"]
+    split = (sb.table("recordings").select("id")
+             .eq("created_at", old.get("created_at") or "").neq("id", rid).execute().data)
+    if not split:
+        return _segments_summary(segments)  # genuinely one row, one note, several topics
+    # ranked, not thresholded: these are the segments of ONE lecture, so which
+    # of them a topic is closest to is meaningful even when the absolute overlap
+    # is low ('Cross product, determinants, applications' scores only 0.5 against
+    # 'Cross product in 3D', which _closest's 0.6 bar would reject outright).
+    ranked = sorted(((_overlap(topic or "", s.get("topic") or ""), s.get("summary") or "")
+                     for s in segments), key=lambda x: x[0], reverse=True)
+    clear = ranked[0][0] > 0 and (len(ranked) == 1 or ranked[0][0] > ranked[1][0])
+    return ranked[0][1] if clear else None
+
+
 def _cleanup_unit_dir(sem, cls, unit):
     """Removes a unit's hub note, Timeline base and folder if relabeling/deleting
     emptied it — shared tail for merge_units, merge_topics (cross-unit),
     delete_unit."""
     old_dir = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(unit)
+    hub, base = old_dir / f"{_slug(unit)}.md", old_dir / TIMELINE
     try:
-        for f in (old_dir / f"{_slug(unit)}.md", old_dir / TIMELINE):
+        # Check BEFORE unlinking: a cross-unit merge that moves one recording out
+        # of a unit that still holds notes must not take that unit's hub with it.
+        # Every remaining note's "Unit:" link points at the hub, and the rmdir
+        # below fails too late to put it back.
+        if any(f not in (hub, base) for f in old_dir.iterdir()):
+            return
+        for f in (hub, base):
             if f.exists():
                 f.unlink()  # both, or the rmdir below never sees an empty folder
         old_dir.rmdir()  # only succeeds if empty
@@ -536,14 +771,12 @@ def office_text(data, ext=None):
     return html.unescape("\n\n".join(parts))
 
 
-@app.post("/ocr")
-async def ocr(request: Request, filename: str = ""):
-    """Photo/PDF of handwritten or printed notes -> markdown text for the notes
-    box. Raw body like /upload. Returns the text; the browser appends it to the
-    notes textarea so the user reviews before saving."""
+def read_page(data, filename):
+    """Turn one uploaded page into markdown. Shared by /ocr (attach now) and
+    /pending (attach later). Returns {"text": ...} or {"error": ...} -- never
+    raises, since both callers hand the result straight back to the browser."""
     import base64
-    data = await request.body()
-    ext = pathlib.Path(filename).suffix.lower().lstrip(".")
+    ext = pathlib.Path(filename or "").suffix.lower().lstrip(".")
     media = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
              "gif": "image/gif", "webp": "image/webp"}.get(ext)
     if media:
@@ -567,13 +800,162 @@ async def ocr(request: Request, filename: str = ""):
             messages=[{"role": "user", "content": [block, {"type": "text", "text": (
                 "These are a student's notes (may be handwritten). Transcribe them "
                 "to markdown, faithful to the original wording and structure. Keep "
-                "lists as lists; mark anything illegible as [illegible]. Return "
-                "ONLY the transcription."
+                "lists as lists; mark anything illegible as [illegible].\n\n"
+                "Do NOT reproduce or infer diagrams. Where the page has one, write a "
+                "single placeholder line naming it and listing only labels you can "
+                "actually read, e.g. '[diagram: free-body diagram — labels: mg, N, f]'. "
+                "The original page is stored beside these notes and renders next to "
+                "them, so an honest placeholder is more useful than a guessed "
+                "description. Never state a value, direction, angle or relationship "
+                "the drawing does not clearly show.\n\n"
+                "Return ONLY the transcription."
             )}]}],
         )
         return {"text": _text(msg)}
     except Exception as e:
         return {"error": f"transcription failed: {e}"}
+
+
+def _pending_path(name):
+    """Resolve a staged page by name, refusing anything that escapes the
+    staging dir. `name` arrives from the browser, so treat it as hostile."""
+    p = (PENDING_DIR / name).resolve()
+    if p.parent != PENDING_DIR.resolve() or not p.name:
+        raise ValueError("bad pending name")
+    return p
+
+
+def _pending_row(page):
+    """One staged page as the browser sees it: the file plus its .json sidecar
+    (original filename + the typed-up text the user may have corrected)."""
+    meta = {}
+    side = page.with_name(page.name + ".json")
+    if side.exists():
+        try:
+            meta = json.loads(side.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"name": page.name,
+            "filename": meta.get("filename") or page.name,
+            "uploaded_at": meta.get("uploaded_at")
+            or datetime.datetime.fromtimestamp(page.stat().st_mtime).isoformat(),
+            "text": meta.get("text") or ""}
+
+
+@app.post("/pending")
+async def pending_add(request: Request, filename: str = ""):
+    """Stage a page that has no lecture to attach to yet — notes taken on the
+    iPad reach the laptop long before (or without) the audio. Transcribed now
+    so it can be proofread while the lecture is fresh; filed later from the
+    Pages waiting list once the recording exists."""
+    data = await request.body()
+    if not data:
+        return {"error": "empty upload"}
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    ext = pathlib.Path(filename or "").suffix.lower()
+    stem = _slug(pathlib.Path(filename or "page").stem)
+    i = 1
+    while (PENDING_DIR / f"{stamp}-{i}-{stem}{ext}").exists():
+        i += 1
+    page = PENDING_DIR / f"{stamp}-{i}-{stem}{ext}"
+    page.write_bytes(data)
+    got = read_page(data, filename)
+    if got.get("error"):
+        page.unlink(missing_ok=True)  # nothing readable to attach later
+        return got
+    page.with_name(page.name + ".json").write_text(json.dumps(
+        {"filename": filename or page.name, "text": got.get("text") or "",
+         "uploaded_at": datetime.datetime.now().isoformat()}), encoding="utf-8")
+    return {"name": page.name, "text": got.get("text") or ""}
+
+
+@app.get("/pending")
+def pending_list():
+    """Staged pages, newest first. The .json sidecars are metadata, not pages."""
+    if not PENDING_DIR.is_dir():
+        return []
+    pages = [p for p in PENDING_DIR.iterdir() if p.is_file() and p.suffix != ".json"]
+    return sorted((_pending_row(p) for p in pages),
+                  key=lambda r: r["uploaded_at"], reverse=True)
+
+
+@app.post("/pending/{name}")
+def pending_edit(name: str, payload: dict = Body(...)):
+    """Save the proofread text. Corrections happen here, before the page is
+    ever folded into a lecture summary."""
+    try:
+        page = _pending_path(name)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not page.exists():
+        return {"ok": False, "error": "that page is no longer waiting"}
+    row = _pending_row(page)
+    row["text"] = payload.get("text", "")
+    page.with_name(page.name + ".json").write_text(json.dumps(row), encoding="utf-8")
+    return {"ok": True}
+
+
+@app.post("/pending/{name}/attach")
+def pending_attach(name: str, payload: dict = Body(...)):
+    """File a staged page onto a recording: store the page in the vault, append
+    its text to that recording's notes, and let label() re-integrate the summary
+    and rewrite the note. The attachment is saved FIRST so the note write picks
+    up its embed in the same pass."""
+    rid = (payload.get("rid") or "").strip()
+    if not rid:
+        return {"ok": False, "error": "no recording chosen"}
+    try:
+        page = _pending_path(name)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not page.exists():
+        return {"ok": False, "error": "that page is no longer waiting"}
+    rows = sb.table("recordings").select("*").eq("id", rid).execute().data
+    if not rows:
+        return {"ok": False, "error": "that recording no longer exists"}
+    row = rows[0]
+    meta = _pending_row(page)
+    save_attachment(rid, meta["filename"], page.read_bytes())
+    text = (meta.get("text") or "").strip()
+    notes = "\n\n".join(x for x in [(row.get("notes") or "").strip(), text] if x)
+    # label() owns the re-summarize + refile path; reuse it rather than repeat it.
+    # Existing labels are passed back unchanged so only the notes actually move.
+    out = label(rid, {"semester": row.get("semester") or "", "klass": row.get("class") or "",
+                      "unit": row.get("unit") or "", "topic": row.get("topic") or "",
+                      "notes": notes})
+    page.unlink(missing_ok=True)
+    page.with_name(page.name + ".json").unlink(missing_ok=True)
+    return {"ok": out.get("ok", True), "error": out.get("error"),
+            "obsidian_path": out.get("obsidian_path")}
+
+
+@app.delete("/pending/{name}")
+def pending_drop(name: str):
+    try:
+        page = _pending_path(name)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    page.unlink(missing_ok=True)
+    page.with_name(page.name + ".json").unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.post("/ocr")
+async def ocr(request: Request, filename: str = "", rid: str = ""):
+    """Photo/PDF of handwritten or printed notes -> markdown text for the notes
+    box. Raw body like /upload. Returns the text; the browser appends it to the
+    notes textarea so the user reviews before saving. rid attaches the page
+    itself to that recording; without one, use /pending instead."""
+    data = await request.body()
+    # Store the page before transcribing it. Claude can misread a diagram, and
+    # without the original there is nothing to check the transcription against.
+    # Silent when rid is absent (the caller isn't attaching to a recording) or
+    # the type isn't embeddable.
+    attached = save_attachment(rid, filename, data) if rid else None
+    got = read_page(data, filename)
+    if got.get("error"):
+        return got
+    return {"text": got.get("text") or "", "attached": attached}
 
 
 @app.delete("/recordings/{rid}")
@@ -584,9 +966,14 @@ def delete_recording(rid: str):
     rows = (sb.table("recordings").select("obsidian_path,semester,class,unit,topic")
             .eq("id", rid).execute().data)
     row = rows[0] if rows else {}
-    sb.table("recordings").delete().eq("id", rid).execute()
+    # ponytail: files first, row last. Windows won't unlink a file an in-flight
+    # /chunk still holds open, and dropping the row first turned that failure
+    # into audio no query could reach. This way a failed unlink leaves the row
+    # in place, so the recording stays visible and the delete can be retried.
     audio_path(rid).unlink(missing_ok=True)
     pdf_path(rid).unlink(missing_ok=True)
+    sb.table("recordings").delete().eq("id", rid).execute()
+    drop_attachments(rid)  # nothing else references them; they'd sit in the vault forever
     if row.get("obsidian_path"):
         # _refile_group rebuilds from whatever remains under these labels (row
         # is already gone from the DB), or removes the file — vault check included
@@ -611,7 +998,33 @@ def delete_unit(payload: dict = Body(...)):
 
 
 def _set(rid, **fields):
-    sb.table("recordings").update(fields).eq("id", rid).execute()
+    # ponytail: one retry — PostgREST's gateway returns a 504 on an occasional
+    # slow write (measured 2026-09-11: a 5031ms PATCH among ~1/s progress
+    # writes), and every caller here is a single small row update worth
+    # retrying. Two attempts, not a backoff ladder; if the DB is really down
+    # the caller should hear about it.
+    for attempt in range(2):
+        try:
+            # returning="minimal": PostgREST echoes the whole updated row by default,
+            # so every progress checkpoint used to drag this row's transcript and
+            # segments back over the wire. No caller reads the result.
+            return (sb.table("recordings").update(fields, returning="minimal")
+                    .eq("id", rid).execute())
+        except Exception:
+            if attempt:
+                raise
+            time.sleep(1)
+
+
+def _checkpoint(rid, **fields):
+    """Best-effort progress write. Losing one costs a little resume accuracy,
+    never the job — so a transient DB failure here must not reach process()'s
+    except, which would mark the whole transcription errored and strand every
+    segment decoded so far. Never raises."""
+    try:
+        _set(rid, **fields)
+    except Exception as e:
+        print(f"[listen] checkpoint for {rid} failed, continuing: {e}", flush=True)
 
 
 def _report_model_progress(rid, stop_event):
@@ -619,7 +1032,7 @@ def _report_model_progress(rid, stop_event):
     while not stop_event.wait(2):
         pct = _model_progress["pct"]
         if pct != last:
-            _set(rid, progress=pct)
+            _checkpoint(rid, progress=pct)
             last = pct
 
 
@@ -684,13 +1097,21 @@ def process(rid):
                                 "t": seg.text.strip()})
                 pct = min(99, int(seg.end / duration * 100) // 5 * 5)
                 if pct != last_pct:
-                    _set(rid, progress=pct, segments=_cap_entries(entries))
+                    _checkpoint(rid, progress=pct, segments=_cap_entries(entries))
                     last_pct = pct
         transcript = " ".join(e["t"] for e in entries).strip()
         _set(rid, segments=_cap_entries(entries))
         finalize(rid, transcript)
     except Exception as e:
-        _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]", live_transcript=None)
+        traceback.print_exc()
+        try:
+            _set(rid, status="error", stage=None, progress=None,
+                 summary=f"[error: {e}]", live_transcript=None)
+        except Exception:
+            # Marking the failure failed too: the row still reads 'transcribing'
+            # and only _retry_if_stranded will pick it up. Leave a line behind so
+            # the console says what happened.
+            print(f"[listen] {rid} failed AND could not be marked errored", flush=True)
     finally:
         _transcribe_gates.pop(rid, None)  # restart/finish always comes up unpaused
 
@@ -708,12 +1129,19 @@ def live_preview(rid):
     'recording', the audio file disappears, or ffmpeg isn't on PATH."""
     model = None
     offset = 0.0
+    carried = ""   # our own running copy of live_transcript -- see the read below
     while True:
         time.sleep(45)
         try:
-            row = (sb.table("recordings").select("status,live_transcript").eq("id", rid)
-                   .single().execute().data)  # one round-trip: status check + current text
-            if not row or row["status"] != "recording":
+            # No .single(): PostgREST answers a missing row with 406/PGRST116, which
+            # raises into the except below instead of returning None -- a row deleted
+            # mid-recording used to leave this thread polling a dead id every 45s for
+            # the life of the process. Status only: we are the sole writer of
+            # live_transcript, so re-reading our own growing text every tick was
+            # egress spent to learn what `carried` already holds.
+            rows = (sb.table("recordings").select("status").eq("id", rid)
+                    .limit(1).execute().data)
+            if not rows or rows[0]["status"] != "recording":
                 return
             path = audio_path(rid)
             if not path.exists():
@@ -747,7 +1175,8 @@ def live_preview(rid):
                 # file from scratch when the recording actually stops.
                 offset += max(info.duration, 0.0)
                 if text:
-                    _set(rid, live_transcript=_append_live(row.get("live_transcript"), text))
+                    carried = _append_live(carried, text)
+                    _set(rid, live_transcript=carried)
             finally:
                 if tmp_path:
                     try:
@@ -769,23 +1198,32 @@ def finalize(rid, transcript, created_at=None):
     The row's own source value is preserved."""
     _set(rid, stage="summarizing", progress=100, live_transcript=None)
     # honor labels/notes the user set live/before stop; Claude only fills the blanks
-    pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source")
+    pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source,title")
            .eq("id", rid).single().execute().data or {})
     keep = lambda k, v: (pre.get(k) or "").strip() or v
     created_at = created_at or datetime.datetime.now().isoformat()
-    segments, exams, tokens_in, tokens_out = analyze(transcript, pre.get("notes") or "", created_at)
+    unit_no = _split_ordinal(pre.get("title"))[0]  # 'M1-2' -> this lecture is module 1
+    # the semester decides which vault classes are candidates, so resolve it first
+    semester = keep("semester", _semester(created_at))
+    known = vault_tree().get(semester, [])
+    # fetched before the Claude call rather than after, because the class hint
+    # is derived from it — so _snap_labels now works off a snapshot taken a few
+    # seconds earlier than it used to. The only difference is another recording
+    # finishing inside that window, which would not have been snapped to anyway.
+    done = (sb.table("recordings").select("class,unit,topic,created_at,source,semester")
+            .eq("status", "done").execute().data)
+    segments, exams, tokens_in, tokens_out = analyze(
+        transcript, pre.get("notes") or "", created_at, known,
+        _slot_class(created_at, done, semester))
 
     pre_class = (pre.get("class") or "").strip()
     if pre_class:  # user already told us the class — it applies to every segment
         for seg in segments:
             seg["class"] = pre_class
     # snap to existing labels so 'part 2' lectures land in the same unit/topic
-    done = (sb.table("recordings").select("class,unit,topic")
-            .eq("status", "done").execute().data)
-    segments = _snap_labels(segments, done)
+    segments = _snap_labels(segments, done, known)
 
     if len(segments) > 1:
-        semester = keep("semester", _semester(created_at))
         _set(rid, status="split_pending", stage=None, progress=None,
              transcript=transcript, tokens_in=tokens_in, tokens_out=tokens_out,
              semester=semester,
@@ -806,8 +1244,9 @@ def finalize(rid, transcript, created_at=None):
     fields = {
         "status": "done", "stage": None, "progress": None,
         "transcript": transcript, "summary": seg["summary"],
-        "semester": keep("semester", _semester(created_at)),
-        "class": keep("class", seg["class"]), "unit": keep("unit", seg["unit"]),
+        "semester": semester,
+        "class": keep("class", seg["class"]),
+        "unit": keep("unit", _module_unit(keep("class", seg["class"]), unit_no) or seg["unit"]),
         "topic": keep("topic", seg["topic"]),
         "tokens_in": tokens_in, "tokens_out": tokens_out,
         "source": pre.get("source") or "local",
@@ -889,28 +1328,76 @@ def split(rid: str, payload: dict = Body(...)):
     return {"ok": True, "rows": ids}
 
 
+def _known_units(rows, semester):
+    """{class: [units]} already filed in a semester — the labels an upload should
+    reuse instead of forking a near-duplicate folder. _snap_labels only catches
+    near-identical wording ('Multivariable Calculus' against the filed
+    'Differentiation of Multivariable Functions' scores 0.2 and does not snap),
+    so the model gets the list up front instead of being corrected after."""
+    out = {}
+    for r in rows:
+        if (r.get("semester") or "") != semester:
+            continue
+        cls, unit = (r.get("class") or "").strip(), (r.get("unit") or "").strip()
+        if cls and unit and unit not in out.setdefault(cls, []):
+            out[cls].append(unit)
+    return out
+
+
 def process_pdf(rid):
     """Summarize + label an uploaded PDF and file it like a lecture: one Claude
     call on the raw document, key points into the transcript column, then the
-    same write_note tail."""
+    same write_note tail. A document covering several topics parks as
+    split_pending for the user to confirm, exactly like a multi-topic lecture."""
     try:
         pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source,created_at")
                .eq("id", rid).single().execute().data or {})
         syllabus = pre.get("source") == "syllabus"
-        summary, sem, cls, unit, topic, key_points, assignments, tokens_in, tokens_out = analyze_pdf(
-            pdf_path(rid).read_bytes(), pre.get("notes") or "", syllabus=syllabus,
-            homework=pre.get("source") == "homework")
         keep = lambda k, v: (pre.get(k) or "").strip() or v
         created_at = pre.get("created_at") or datetime.datetime.now().isoformat()
+        # the document may name its own semester, but the label candidates have to
+        # be picked before the call -- resolve the term without it (the full
+        # precedence chain runs on the reply below)
+        filed = sb.table("recordings").select("class,unit,topic,semester").eq("status", "done").execute().data
+        segments, sem, key_points, assignments, tokens_in, tokens_out = analyze_pdf(
+            pdf_path(rid).read_bytes(), pre.get("notes") or "", syllabus=syllabus,
+            homework=pre.get("source") == "homework",
+            known_units=_known_units(filed, keep("semester", os.getenv("SEMESTER_OVERRIDE", "").strip()
+                                                or _semester(created_at))))
         # precedence: user label > SEMESTER_OVERRIDE > semester stated in the
         # document > recording date (_semester applies the override itself)
-        sem_default = os.getenv("SEMESTER_OVERRIDE", "").strip() or sem or _semester(created_at)
+        sem_default = os.getenv("SEMESTER_OVERRIDE", "").strip() or _norm_sem(sem) or _semester(created_at)
+        semester = keep("semester", sem_default)
+        # snap before keep(), same as the lecture path: an upload labelled off the
+        # document alone forks a near-duplicate class/unit folder otherwise. A label
+        # the user typed still wins -- keep() is applied to the snapped value.
+        # transcript is what write_note files on -- an empty one files nothing at all,
+        # so a reply that folded its key_points into the segments still leaves a note
+        key_points = key_points.strip() or _segments_summary(segments)
+        segments = _snap_labels(segments, filed, vault_tree().get(semester, []))
+        pre_class = (pre.get("class") or "").strip()
+        if pre_class:  # user already told us the class -- it applies to every segment
+            for s in segments:
+                s["class"] = pre_class
+        # A handout covering several topics splits like a multi-topic lecture, and
+        # through the same confirm-then-file path (see finalize()). A topic the user
+        # typed is the exception: they named ONE note, so honour it and file single.
+        if len(segments) > 1 and not (pre.get("topic") or "").strip():
+            _set(rid, status="split_pending", stage=None, progress=None,
+                 transcript=key_points, tokens_in=tokens_in, tokens_out=tokens_out,
+                 semester=semester, pending_segments=segments,
+                 source=pre.get("source") or "pdf")
+            return
+        seg = segments[0]
+        # one note after all (single topic, or a topic the user named): a multi-topic
+        # document still keeps every segment's summary, under '## <topic>' headers
+        summary = seg.get("summary", "") if len(segments) == 1 else _segments_summary(segments)
         fields = {
             "status": "done", "stage": None, "progress": None,
             "transcript": key_points, "summary": summary,
-            "semester": keep("semester", sem_default),
-            "class": keep("class", cls), "unit": keep("unit", unit),
-            "topic": keep("topic", topic),
+            "semester": semester,
+            "class": keep("class", seg["class"]), "unit": keep("unit", seg["unit"]),
+            "topic": keep("topic", seg["topic"]),
             "tokens_in": tokens_in, "tokens_out": tokens_out,
         }
         if syllabus:
@@ -947,6 +1434,21 @@ def save_assignments(rid, klass, items):
         if title:
             rows.append({"recording_id": rid, "title": title, "due_on": due,
                          "klass": klass, "kind": (a.get("kind") or "assignment")})
+    # A syllabus routinely lists several deliverables under one name ("Quiz",
+    # "WebAssign HW"), but the table is unique on (klass, title) -- and Postgres
+    # refuses an upsert whose own batch hits the same key twice ("ON CONFLICT DO
+    # UPDATE command cannot affect row a second time"), which errored the whole
+    # upload. Date-suffix only the titles that actually collide: each keeps its
+    # own row, ordinary syllabi are untouched, and re-uploading the same syllabus
+    # still upserts in place because the suffix is derived from the due date.
+    count = {}
+    for r in rows:
+        count[r["title"]] = count.get(r["title"], 0) + 1
+    for r in rows:
+        if count[r["title"]] > 1:
+            r["title"] = f'{r["title"]} ({r["due_on"]})'
+    # same title AND same date is a real duplicate, not two deliverables -- keep one
+    rows = list({r["title"]: r for r in rows}.values())
     if rows:
         sb.table("assignments").upsert(rows, on_conflict="klass,title").execute()
     return sorted(rows, key=lambda r: r["due_on"])
@@ -984,7 +1486,8 @@ def assignments_ics(rid: str):
 def assignments_open():
     """Open (not yet submitted) assignments, soonest due first — the homework
     card's link dropdown."""
-    return (sb.table("assignments").select("*").eq("status", "open")
+    # on the poll: only the columns hwLinker's <option> actually reads
+    return (sb.table("assignments").select("id,title,due_on,klass").eq("status", "open")
             .order("due_on").execute().data)
 
 
@@ -1078,7 +1581,9 @@ def weak_spots(cls: str = Query(..., alias="class"), semester: str = ""):
     q = sb.table("quizzes").select("questions,answers,semester,class,score").eq("class", cls)
     if semester:
         q = q.eq("semester", semester)
-    return weak_topics(q.execute().data)
+    # bounded: this reads whole question+answer blobs on a 30s timer, and weak spots
+    # from your last 20 quizzes is the useful answer anyway -- a lifetime scan isn't.
+    return weak_topics(q.order("created_at", desc=True).limit(20).execute().data)
 
 
 def grade_mcq(questions, answers):
@@ -1209,17 +1714,22 @@ def ask_notes(payload: dict = Body(...)):
         return {"error": "question required"}
     sem = (payload.get("semester") or "").strip()
     cls = (payload.get("class") or "").strip()
-    q = sb.table("recordings").select("semester,class,unit,topic,summary,obsidian_path").eq("status", "done")
+    # class required, like quiz/cards/cheatsheet: without it every filed summary in
+    # the library went into one Sonnet prompt. The picker always has a class
+    # selected, so this only closes the direct-API path -- the cap below is what
+    # keeps a long-running class from turning one question into a 100 kB prompt.
+    if not cls:
+        return {"error": "class required"}
+    q = (sb.table("recordings").select("semester,class,unit,topic,summary,obsidian_path")
+         .eq("status", "done").eq("class", cls))
     if sem:
         q = q.eq("semester", sem)
-    if cls:
-        q = q.eq("class", cls)
-    rows = q.execute().data
-    if not any((r.get("summary") or "").strip() for r in rows):
+    rows = [r for r in q.execute().data if (r.get("summary") or "").strip()]
+    if not rows:
         return {"error": "no filed notes in that scope yet"}
+    rows = _ask_scope(question, rows)
     material = "\n\n".join(
-        f"## {r.get('topic') or ''}\n{r.get('summary') or ''}"
-        for r in rows if (r.get("summary") or "").strip())
+        f"## {r.get('topic') or ''}\n{r.get('summary') or ''}" for r in rows)
     ask = (
         "Answer the student's question using ONLY the lecture-note summaries below. "
         "Be concise. If the notes don't cover it, say so. Return ONLY a JSON object "
@@ -1302,8 +1812,9 @@ def quiz_submit_frq(qid: str, payload: dict = Body(...)):
 
 @app.get("/quizzes")
 def quizzes():
+    # .limit() below: same 30s timer, and nobody reads past the first screen of history
     return (sb.table("quizzes").select("id,created_at,kind,semester,class,unit,score")
-            .order("created_at", desc=True).execute().data)
+            .order("created_at", desc=True).limit(50).execute().data)
 
 
 @app.get("/quiz/{qid}")
@@ -1385,7 +1896,7 @@ def study_generate(payload: dict = Body(...)):
         return {"error": f"generation failed: {e}"}
     fname = _slug(f"{cls} {unit or ''}".strip()) + " cheatsheet.md"
     # filed in the vault (opens in Obsidian) as well as returned for the in-app view
-    path = write_prep_note(sem, cls, unit or "", fname, md)
+    path = write_prep_note(sem, cls, fname, md)
     return {"filename": fname, "markdown": md,
             "path": path, "obsidian": _obsidian_uri(path)}
 
@@ -1464,6 +1975,17 @@ def cards_due():
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return (sb.table("cards").select("*").lte("due_at", now)
             .order("due_at").execute().data)
+
+
+@app.get("/cards/due_count")
+def cards_due_count():
+    """How many cards are due — all the 5s poll needs to paint the badge.
+    The rows themselves cost front+back for every due card and are only read
+    when the user actually starts a review, the same split /recordings had to
+    make after its poll pulled whole transcripts and cost us the egress quota."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    r = sb.table("cards").select("id", count="exact").lte("due_at", now).limit(1).execute()
+    return {"due": r.count or 0}
 
 
 @app.post("/cards/{cid}/review")
@@ -1566,7 +2088,7 @@ def cheatsheet(class_: str = Query("", alias="class"), unit: str = "", semester:
     except Exception as e:
         return Response(f"generation failed: {e}", media_type="text/plain", status_code=502)
     fname = _slug(f"{cls} {unit}".strip()) + " cheatsheet.md"
-    write_prep_note(sem, cls, unit, fname, md)  # file it, then serve the download
+    write_prep_note(sem, cls, fname, md)  # file it, then serve the download
     return Response(md, media_type="text/markdown",
                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
@@ -1628,6 +2150,7 @@ def upload_yt(payload: dict = Body(...)):
         "notes": f"Source video: {url}",  # analyze() weaves the link into the summary
     }).execute().data[0]
     _set(row["id"], stage="loading_model")
+    _gate(row["id"])  # _yt_process downloads into audio_path before process() claims it
     threading.Thread(target=_yt_process, args=(row["id"], url), daemon=True).start()
     return {"id": row["id"]}
 
@@ -1652,12 +2175,15 @@ def _doc_block(data):
     raise ValueError("unsupported file type — upload a PDF, pptx, docx, or a jpg/png/gif/webp photo")
 
 
-def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
+def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False, known_units=None):
     """One Claude call on a PDF (native document block — no OCR dependency,
-    scanned pages included). Returns (summary, semester, class, unit, topic,
-    key_points, assignments, tokens_in, tokens_out); assignments is [] unless
+    scanned pages included). Returns (segments, semester, key_points,
+    assignments, tokens_in, tokens_out): segments is one {class, unit, topic,
+    summary} per topic the document covers, same shape the lecture path uses, so
+    a multi-topic handout files as several notes. assignments is [] unless
     syllabus=True. homework=True swaps the distill-the-slides framing for a
-    readable per-problem write-up."""
+    readable per-problem write-up — a syllabus and a problem set are each one
+    document by definition, so both stay single-segment."""
     doc_block = _doc_block(pdf_bytes)
     notes_part = (
         "\nThe student took their own notes on this material. Integrate them "
@@ -1673,6 +2199,30 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
         "format (free text, e.g. '50 multiple choice, closed book') and topics "
         "(array of strings) when the document states them; omit otherwise.\n"
     ) if syllabus else ""
+    units_part = (
+        "\nUnits the student already files under, by class: "
+        + "; ".join(f"'{c}': " + ", ".join(f"'{u}'" for u in us)
+                    for c, us in sorted((known_units or {}).items()))
+        + ". If this document belongs under one of them, write that string EXACTLY "
+        "as `unit`, character for character. Only name a new unit when it fits "
+        "none of them.\n"
+    ) if known_units else ""
+    # A packet of lecture notes routinely covers several topics -- the lecture path
+    # has split them into their own notes since 2026-07-10, the upload path filed
+    # them as one note called 'Tangent Planes and Chain Rule'. Same 'and' test,
+    # same cap. A syllabus and a problem set are each one document by definition.
+    split_part = "" if (syllabus or homework) else (
+        "If the document covers more than ONE topic, replace the class, unit, topic "
+        "and summary keys with a 'segments' key: an array of one "
+        "{class, unit, topic, summary} object per topic, each filled in by the rules "
+        "above and below. key_points and semester stay at the TOP LEVEL either way — "
+        "one copy for the whole document, never inside a segment. "
+        "Test: if the topic label you would write needs an 'and' to "
+        "cover the document (e.g. 'Tangent planes and chain rule'), that is TWO "
+        "topics, not one -- split it and give each half its own label and summary. "
+        "Worked examples are not topics: several problems practising one concept all "
+        "belong to that concept. Usually 1-2, sometimes 3 -- NEVER more than 4.\n"
+    )
     content_part = (
         "- key_points: the assignment rewritten as clean, readable markdown "
         "(this stands in for a transcript): one '### Problem <number or short "
@@ -1699,8 +2249,12 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
     )
     msg = claude.messages.create(
         model="claude-haiku-4-5",
-        # 3000 truncated homework per-problem write-ups mid-JSON (unparseable -> raw blob stored)
-        max_tokens=8000,
+        # 3000 truncated homework per-problem write-ups mid-JSON (unparseable -> raw blob stored);
+        # 8000 then did the same to a real syllabus, which pays twice -- key_points restates the
+        # whole document AND every dated deliverable follows it, so the assignments array is what
+        # gets cut. haiku-4-5 allows 64000 out; 16000 is the ceiling that still returns inside the
+        # SDK's non-streaming HTTP timeout. Past that, switch this call to .stream().
+        max_tokens=16000 if syllabus else 8000,
         messages=[{
             "role": "user",
             "content": [
@@ -1719,7 +2273,7 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
                     "- topic: the specific topic of THIS document, 5 words max "
                     "(used as the note title)\n"
                     "- semester: the term if stated in the document (e.g. 'Fall 26'), else \"\"\n"
-                    + content_part + syllabus_part + notes_part
+                    + units_part + split_part + content_part + syllabus_part + notes_part
                 )},
             ],
         }],
@@ -1730,15 +2284,61 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False):
         # model sometimes returns a bullet list as a JSON array — flatten to markdown
         return "\n".join(f"- {x}" for x in v) if isinstance(v, list) else (v or "")
 
+    def segs(d):
+        """The reply's topics as lecture-shaped segments. A single-topic document
+        answers with flat class/unit/topic/summary keys (and older replies always
+        did), so that shape stays the fallback."""
+        listed = [s for s in (d.get("segments") or []) if isinstance(s, dict)]
+        if not listed:
+            listed = [d]
+        return [{"class": txt(s.get("class")), "unit": txt(s.get("unit")),
+                 "topic": txt(s.get("topic")), "summary": txt(s.get("summary"))}
+                for s in listed]
+
     try:
         d = json.loads(raw)
-        parts = (txt(d.get("summary")), txt(d.get("semester")), txt(d.get("class")),
-                 txt(d.get("unit")), txt(d.get("topic")), txt(d.get("key_points")),
+        parts = (segs(d), txt(d.get("semester")), txt(d.get("key_points")),
                  d.get("assignments", []))
     except (json.JSONDecodeError, AttributeError):
         # ponytail: model ignored the JSON ask — keep its text, Unsorted bucket
-        parts = (raw, "", "Unsorted", "Unsorted", "Untitled", raw, [])
+        parts = ([{"class": "Unsorted", "unit": "Unsorted", "topic": "Untitled",
+                   "summary": raw}], "", raw, [])
+    if syllabus or homework:
+        parts = (parts[0][:1], *parts[1:])  # one document, one note — never split
     return (*parts, msg.usage.input_tokens, msg.usage.output_tokens)
+
+
+def _escape_stray_quotes(raw):
+    """Backslashes double quotes the model left raw inside a JSON string.
+    Haiku writes prose like `(e.g., "Project A117 update" not "update")` inside
+    a summary value -- fine as English, fatal to the parse, and the whole
+    lecture then lands in the Unsorted bucket with the raw reply as its summary.
+    A quote really closes a string only when the next non-space character is one
+    of ,:}] or the text ends; anything else means the model is still mid-
+    sentence, so escape it and read on.
+
+    ponytail: a heuristic, not a JSON grammar -- prose that ends a quotation
+    right before a comma (`he said "hello", then left`) still fools it. Swap for
+    the API's structured-output/tool-use JSON mode if that ever shows up."""
+    out, in_str, esc = [], False, False
+    for i, c in enumerate(raw):
+        if esc:
+            out.append(c)
+            esc = False
+            continue
+        if c == "\\":
+            out.append(c)
+            esc = in_str
+            continue
+        if c == '"':
+            if not in_str:
+                in_str = True
+            elif next((d for d in raw[i + 1:] if not d.isspace()), "") in ",:}]":
+                in_str = False
+            else:
+                out.append("\\")
+        out.append(c)
+    return "".join(out)
 
 
 def _json_obj(raw):
@@ -1747,15 +2347,18 @@ def _json_obj(raw):
     trailing '---\n**Note on transcript quality:** ...' commentary no longer
     poisons the parse. Returns {} when there is no JSON object at all.
     Deliberately NOT brace-counting/regex brace-matching: summaries contain
-    LaTeX with literal braces (\\frac{1}{2}, x^{2}) that would break that."""
+    LaTeX with literal braces (\frac{1}{2}, x^{2}) that would break that.
+    One salvage attempt on failure, for unescaped quotes inside a value."""
     start = raw.find("{")
     if start == -1:
         return {}
-    try:
-        obj, _ = json.JSONDecoder().raw_decode(raw, start)
-    except (json.JSONDecodeError, ValueError):
-        return {}
-    return obj if isinstance(obj, dict) else {}
+    for text in (raw, _escape_stray_quotes(raw)):
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(text, start)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        return obj if isinstance(obj, dict) else {}
+    return {}
 
 
 def _parse_segments(raw):
@@ -1776,34 +2379,81 @@ def _parse_segments(raw):
     ]
 
 
+COURSE_CODE = re.compile(r"^\s*[A-Za-z]{2,4}\s*\d{3,4}[A-Za-z]?\b")
+
+
 def _norm_words(s):
     """Lowercase word set for fuzzy label matching: drops tiny words,
-    strips a trailing 's' so 'Derivatives' matches 'derivative'."""
-    return {w.rstrip("s") for w in re.findall(r"[a-z0-9]+", (s or "").lower()) if len(w) >= 3}
+    strips a trailing 's' so 'Derivatives' matches 'derivative'. A leading
+    course code goes too: the vault folder carries the catalogue name off the
+    syllabus ('MATH 2110Q Multivariable Calculus') while Claude, hearing only
+    the lecture, writes the plain one — without this they score 0.5 and the
+    plain name becomes a second folder. A class named by code alone strips to
+    an empty word set and simply never snaps."""
+    s = COURSE_CODE.sub("", s or "")
+    return {w.rstrip("s") for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) >= 3}
+
+
+def _overlap(a, b):
+    """Jaccard similarity of two labels' word sets, 0.0 to 1.0."""
+    aw, bw = _norm_words(a), _norm_words(b)
+    return len(aw & bw) / len(aw | bw) if (aw or bw) else 0.0
+
+
+ASK_NOTES_CAP = 40   # ~110 kB of summaries; past that a question is a shotgun anyway
+
+
+def _ask_scope(question, rows):
+    """The notes a question actually gets asked against, capped at ASK_NOTES_CAP.
+
+    Ranked by how much of the QUESTION each note covers, not by _overlap: that's
+    Jaccard, and a long summary shares few words with a short question, so the
+    most detailed lecture in the class would rank last. Rows that survive keep
+    their original newest-first order, and a question with no usable words falls
+    back to the most recent notes rather than an arbitrary slice.
+    """
+    if len(rows) <= ASK_NOTES_CAP:
+        return rows
+    qw = _norm_words(question)
+    if not qw:
+        return rows[:ASK_NOTES_CAP]
+
+    def covered(r):
+        text = " ".join(filter(None, (r.get("topic"), r.get("unit"), r.get("summary"))))
+        return len(qw & _norm_words(text)) / len(qw)
+
+    keep = sorted(range(len(rows)), key=lambda i: (-covered(rows[i]), i))[:ASK_NOTES_CAP]
+    return [rows[i] for i in sorted(keep)]
 
 
 def _closest(name, existing):
     """The existing label whose word set best overlaps name's (Jaccard),
-    or None when nothing clears the bar — exact matches trivially win."""
-    w = _norm_words(name)
+    or None when nothing clears the bar — exact matches trivially win.
+    Ties break toward the LONGER name: once a class has forked into both
+    'MATH 2110Q Multivariable Calculus' and 'Multivariable Calculus' they
+    normalize identically and both score 1.0, and picking by set iteration
+    order would file each new lecture into whichever folder hashed first.
+    The catalogue name is the one to converge on."""
     best, score = None, 0.0
     for e in existing:
-        ew = _norm_words(e)
-        j = len(w & ew) / len(w | ew) if (w or ew) else 0.0
-        if j > score:
+        j = _overlap(name, e)
+        if (j, len(e)) > (score, len(best or "")):
             best, score = e, j
     return best if score >= 0.6 else None
 
 
-def _snap_labels(segments, rows):
+def _snap_labels(segments, rows, vault_classes=()):
     """Snaps each segment's class/unit/topic to the closest existing label
     (rows = done recordings' class/unit/topic dicts), so a lecture continuing
     a topic in another session files into the same folders/note name instead
     of a near-duplicate ('Implicit Differentiation Part 2' -> 'Implicit
-    Differentiation'). Pure — testable without DB. Mutates and returns
-    segments."""
+    Differentiation'). vault_classes are this semester's class folders — a
+    class scaffolded from the syllabus but not yet recorded into is otherwise
+    invisible here, so the first lecture forks a folder beside it. Pure —
+    testable without DB. Mutates and returns segments."""
     for seg in segments:
-        c = _closest(seg.get("class"), {r["class"] for r in rows if r.get("class")})
+        c = _closest(seg.get("class"),
+                     {r["class"] for r in rows if r.get("class")} | set(vault_classes))
         if c:
             seg["class"] = c
         u = _closest(seg.get("unit"), {r["unit"] for r in rows
@@ -1818,6 +2468,71 @@ def _snap_labels(segments, rows):
     return segments
 
 
+# Record is pressed at the bell or a little after, never before, so a slot needs
+# slack for a late start. Less of it across weekdays: a timetable repeats at the
+# SAME clock time on its other days, and a wide window there starts colliding
+# with a different class that happens to meet near that time on another day.
+SLOT_MINUTES = 30
+SLOT_MINUTES_OTHER_DAY = 10
+
+
+def _local(ts):
+    """Wall-clock local time for a stored timestamp. The weekly timetable lives
+    in local time, so comparing the raw UTC values would drift by an hour at the
+    daylight-saving boundary halfway through a semester."""
+    try:
+        return datetime.datetime.fromisoformat(ts).astimezone()
+    except (TypeError, ValueError):
+        return None
+
+
+def _slot_class(created_at, rows, semester=""):
+    """The class that already meets in this recording's weekly slot.
+
+    College classes run on a fixed timetable, which makes the start time the
+    strongest available signal about which class a lecture belongs to -- and
+    nothing in the pipeline was using it. Given only a list of course names,
+    the model re-guesses from scratch every lecture, and files 'dot product,
+    cross product, determinants' under a data-analysis course because the words
+    fit as well as they fit multivariable calculus.
+
+    Matched on time of day rather than weekday, because one class meets on
+    several of them (the Monday lecture is what identifies the Wednesday one),
+    with the same weekday preferred when it disambiguates two classes sharing a
+    start time. Nearest start wins, so a lecture started a few minutes late still
+    matches its own slot instead of falling between two of them. Only live
+    recordings count: an upload's created_at is when the file was sent, not when
+    the class met, and so does only the semester asked for -- a replay over the
+    real history had last term's 14:46 physics slot naming this term's 14:46
+    communications lecture. Returns None when nothing is close or two classes
+    tie -- no hint beats a wrong one. Pure -- no DB, no Claude.
+
+    ponytail: compares minute-of-day, so a slot spanning midnight never matches.
+    """
+    when = _local(created_at)
+    if not when:
+        return None
+    mins = lambda t: t.hour * 60 + t.minute
+    near = []
+    for r in rows:
+        # 'local' is the only source whose created_at is the real class time
+        if r.get("source") != "local" or not r.get("class"):
+            continue
+        if semester and r.get("semester") != semester:
+            continue  # last term's timetable says nothing about this one's
+        t = _local(r.get("created_at"))
+        if not t:
+            continue
+        gap, other_day = abs(mins(t) - mins(when)), t.weekday() != when.weekday()
+        if gap <= (SLOT_MINUTES_OTHER_DAY if other_day else SLOT_MINUTES):
+            near.append((other_day, gap, r["class"]))
+    if not near:
+        return None
+    near.sort(key=lambda c: c[:2])   # same weekday first, then nearest start
+    tied = {c[2] for c in near if c[:2] == near[0][:2]}
+    return near[0][2] if len(tied) == 1 else None
+
+
 def _parse_exams(raw):
     """Parses analyze()'s {"exams": [...]} JSON reply defensively — missing
     key, non-list, or unparseable JSON all fall back to no exams detected.
@@ -1826,7 +2541,7 @@ def _parse_exams(raw):
     return exams if isinstance(exams, list) else []
 
 
-def analyze(transcript, notes="", created_at=None):
+def analyze(transcript, notes="", created_at=None, known_classes=(), slot_class=""):
     """One Claude call: splits the lecture into topic segments — almost always
     just one — and produces college-lecture labels (class/unit/topic) +
     summary per segment, plus any announced upcoming exams/quizzes. User
@@ -1839,10 +2554,37 @@ def analyze(transcript, notes="", created_at=None):
     if not transcript:
         return [{"class": "", "unit": "", "topic": "", "summary": ""}], [], 0, 0
     notes_part = (
-        "\nThe student took their own notes during this lecture. Integrate them "
-        "into the summary, giving weight to anything they flagged:\n"
+        "\nThe student took their own notes during this lecture. These are sparse "
+        "on purpose: they cover what the audio could NOT carry — material the "
+        "lecturer wrote on the board without saying aloud, diagrams, and the "
+        "correct spelling of technical terms a single-microphone transcript "
+        "often garbles. Where the notes and the transcript disagree, TRUST THE "
+        "NOTES, especially for names, symbols, numbers and spellings. Integrate "
+        "them into the summary, giving weight to anything they flagged. A line "
+        "like '[diagram: ...]' is a placeholder for a drawing filed beside this "
+        "note — mention what it depicts, never describe detail you were not "
+        "given:\n"
         + notes.strip() + "\n"
     ) if (notes or "").strip() else ""
+    # the vault folder is the catalogue name off the syllabus; hearing only the
+    # lecture, the model writes the plain one and forks a second class folder.
+    # _snap_labels is the net under this, but naming it here is what stops it.
+    classes_part = (
+        "\nThe student already has these classes: "
+        + ", ".join(f"'{c}'" for c in known_classes)
+        + ". If this lecture belongs to one of them, use that string EXACTLY as "
+        "`class`, character for character, including any course code. Only write "
+        "a new class name if the lecture genuinely fits none of them.\n"
+    ) if known_classes else ""
+    # course names alone do not separate two classes that both touch vectors --
+    # the timetable does. A hint, not a pre-set: a makeup session or an exam
+    # review recorded in the slot has to be able to say otherwise.
+    slot_part = (
+        f"\nEvery lecture the student has recorded in this same weekly time slot "
+        f"has been '{slot_class}'. Classes meet on a fixed timetable, so this one "
+        "is very probably that class too — use it unless the content plainly "
+        "belongs to a different class in the list above.\n"
+    ) if slot_class else ""
     lecture_date = (created_at or "")[:10]
     date_part = (
         f"\nThis lecture was recorded on {lecture_date}. Resolve any relative "
@@ -1856,7 +2598,9 @@ def analyze(transcript, notes="", created_at=None):
             {
                 "role": "user",
                 "content": (
-                    "This is a college lecture transcript from a single microphone — "
+                    classes_part
+                    + slot_part
+                    + "This is a college lecture transcript from a single microphone — "
                     "speakers are not labelled. Infer who is speaking from content: "
                     "the lecturer teaches; students ask questions or answer prompts.\n"
                     "First, check whether the lecture moves between distinct topics: "
@@ -1894,8 +2638,10 @@ def analyze(transcript, notes="", created_at=None):
                     "as a bullet list — built from the LECTURER's material; ignore student "
                     "chatter unless the lecturer engages it. Where a picture carries an "
                     "idea better than a paragraph — how concepts relate, the steps of a "
-                    "procedure, a classification, a cause-and-effect chain, or a diagram "
-                    "the lecturer drew on the board — draw it instead of describing it. "
+                    "procedure, a classification, a cause-and-effect chain, what "
+                    "something looks like (a shape, a plot, a distribution, a boxplot, "
+                    "vectors and an angle), or a diagram the lecturer drew on the "
+                    "board — draw it instead of describing it. "
                     "At most two diagrams per summary, and none at all if the material "
                     "genuinely isn't visual.\n" + DIAGRAM_RULES +
                     "Then, if the lecturer worked "
@@ -1932,6 +2678,49 @@ def analyze(transcript, notes="", created_at=None):
     segments = _parse_segments(raw)
     exams = _parse_exams(raw)
     return segments, exams, msg.usage.input_tokens, msg.usage.output_tokens
+
+
+# "en-M1-2_ The AI Revolution", "M1-2 ...", "1-2 ..." -- lecture files are often
+# named <unit>-<topic>. The numbers order the course; they are NOT labels, so they
+# never reach the class/unit/topic columns. Anchored at the start and followed by a
+# non-word char so "MATH 2110Q" and "2026-08-30" can't match.
+_ORDINAL_RE = re.compile(r"""^\W*
+    (?:[A-Za-z]{2,3}[-_ ])?                  # language/source prefix, e.g. 'en-'
+    (?:M(?:od(?:ule)?)?|U(?:nit)?|W(?:eek)?)?\s*
+    (\d{1,2})[-._ ](\d{1,3})
+    (?=[^0-9A-Za-z]|$)""", re.X | re.I)
+
+
+def _split_ordinal(title):
+    """(unit_no, topic_no, title without the ordinal) -- (None, None, title)
+    when the title carries no <unit>-<topic> prefix."""
+    m = _ORDINAL_RE.match(title or "")
+    if not m:
+        return None, None, (title or "").strip()
+    return int(m.group(1)), int(m.group(2)), (title or "")[m.end():].lstrip(" _-.:").strip()
+
+
+def _module_unit(cls, unit_no):
+    """Unit label an earlier lecture of the same module number already used, so
+    M1-1 and M1-2 share one unit even when Claude names them differently."""
+    if not cls or unit_no is None:
+        return ""
+    rows = (sb.table("recordings").select("title,unit")
+            .eq("class", cls).eq("status", "done").execute().data)
+    for r in rows:
+        if _split_ordinal(r.get("title"))[0] == unit_no and (r.get("unit") or "").strip():
+            return r["unit"].strip()
+    return ""
+
+
+def _norm_sem(s):
+    """'Fall 2026' -> 'Fall 26', the shape _semester() mints. Claude reads the
+    term off a syllabus in whichever form the document uses, and the two
+    spellings mint two semester folders for one term. Anything that isn't
+    <Term> <4-digit year> passes through untouched, so 'Bridge' and a
+    SEMESTER_OVERRIDE of any shape keep working."""
+    return re.sub(r"\b(Spring|Summer|Fall|Winter)\s+\d{2}(\d{2})\b", r"\1 \2",
+                  (s or "").strip())
 
 
 def _semester(iso_date):
@@ -1978,6 +2767,21 @@ def _one_line(s, cap=200):
     return ""
 
 
+def _folded(text, title="Transcript"):
+    """Transcript in a collapsed Obsidian callout. The "-" after the type is
+    what starts it folded, so opening a note shows the summary rather than a
+    wall of raw speech -- native markdown, no plugin. Blank lines still need
+    their ">" or the callout ends at the first one."""
+    rows = (text or "").splitlines() or [""]
+    body = "\n".join(("> " + ln) if ln.strip() else ">" for ln in rows)
+    return f"> [!quote]- {title}\n{body}"
+
+
+# "2026-09-04 08:36", the title /start gives a recording nobody named — and
+# " (recovered)" is appended when a dropped upload is recovered.
+_STAMP_TITLE = re.compile(r"^\d{4}-\d{2}-\d{2} (?P<time>\d{2}:\d{2})( \(recovered\))?$")
+
+
 def _note_md(rows):
     """Combined note for every recording sharing one topic (rows: non-empty
     transcripts, oldest first — see _group_rows). Frontmatter/H1/date come
@@ -1995,6 +2799,9 @@ def _note_md(rows):
         "source": source,
         "summary": _one_line(first.get("summary")),
     }
+    u_no, t_no, _ = _split_ordinal(first.get("title"))
+    if u_no is not None:  # zero-padded: Bases sorts it as a string, so "01-10" must follow "01-02"
+        fm["seq"] = f"{u_no:02d}-{t_no:02d}"
     # json.dumps is a valid YAML double-quoted scalar. Labels and summaries carry
     # colons, quotes and unicode math; unquoted, one of those breaks the WHOLE
     # frontmatter block and the note drops out of every Timeline base.
@@ -2015,29 +2822,54 @@ def _note_md(rows):
         a = (r.get("addendum") or "").strip()
         return f"\n\n{h} Corrections & additions\n\n{a}" if a else ""
 
+    def pages(r, h):
+        """Embeds of the uploaded pages. Claude's transcription can misread a
+        diagram; the original renders right beside it, so the error is visible
+        and fixable instead of silently standing in for the drawing."""
+        names = _attachments(r.get("id"))
+        if not names:
+            return ""
+        return f"\n\n{h} Source pages\n\n" + "\n".join(f"![[{x}]]" for x in names)
+
     if len(rows) == 1:
         return (
             head
             + f"## Summary\n\n{first.get('summary') or ''}"
             + extra(first, "##")
-            + f"\n\n## Transcript\n\n{first.get('transcript') or ''}\n"
+            + pages(first, "##")
+            + "\n\n" + _folded(first.get("transcript") or "") + "\n"
         )
-    heading = lambda r: f"{(r.get('created_at') or '')[:10]} — {r.get('title') or r.get('topic') or 'Lecture'}"
+    def heading(r):
+        """Dated section header for one recording inside a combined note. A
+        recording nobody named gets a "%Y-%m-%d %H:%M" stamp for a title, which
+        rendered as "2026-09-04 — 2026-09-04 08:36" and said nothing about the
+        section. Fall back to the topic, keeping the stamp's time so two
+        unnamed recordings on one day still get distinct headers."""
+        day = (r.get("created_at") or "")[:10]
+        stamp = _STAMP_TITLE.match((r.get("title") or "").strip())
+        if stamp:
+            return f"{day} {stamp.group('time')} — {r.get('topic') or 'Lecture'}"
+        return f"{day} — {r.get('title') or r.get('topic') or 'Lecture'}"
     notes = "\n\n".join(
-        f"## {heading(r)}\n\n{r.get('summary') or ''}{extra(r, '###')}" for r in rows)
+        f"## {heading(r)}\n\n{r.get('summary') or ''}{extra(r, '###')}{pages(r, '###')}"
+        for r in rows)
     transcripts = "\n\n".join(
-        f"### {heading(r)}\n\n{r.get('transcript') or ''}" for r in rows)
+        _folded(r.get("transcript") or "", heading(r)) for r in rows)
     return head + notes + "\n\n## Transcripts\n\n" + transcripts + "\n"
 
 
-TIMELINE = "Timeline.base"
+TIMELINE = "Timeline.base"   # legacy: the block lives in the hub note now,
+# but _cleanup_unit_dir still unlinks any left over in an older vault
 
 
 def _timeline_base(rel):
     """An Obsidian Bases timeline over every lecture note at or under the
     vault-relative folder `rel` — inFolder() matches subfolders, so a class
     timeline picks up all of its units. Bases reads frontmatter only, which is
-    why _note_md carries date/summary/lectures."""
+    why _note_md carries date/summary/lectures.
+
+    One view, and only the properties it shows: inline in a note, Bases renders
+    the first view and offers no switcher, so a second view would be dead YAML."""
     return (
         "filters:\n"
         "  and:\n"
@@ -2046,30 +2878,40 @@ def _timeline_base(rel):
         "properties:\n"
         "  note.date:\n    displayName: Date\n"
         "  note.summary:\n    displayName: Summary\n"
-        "  note.unit:\n    displayName: Unit\n"
-        "  note.lectures:\n    displayName: Lectures\n"
+        "  note.seq:\n    displayName: Seq\n"   # not shown, but the cards sort on it
         "views:\n"
         "  - type: cards\n"
         "    name: Timeline\n"
         "    order:\n      - file.name\n      - date\n      - summary\n"
-        "    sort:\n      - property: date\n        direction: ASC\n"
-        "  - type: table\n"
-        "    name: Log\n"
-        "    order:\n      - file.name\n      - date\n      - unit\n      - lectures\n"
-        "    sort:\n      - property: date\n        direction: ASC\n"
+        "    sort:\n      - property: seq\n        direction: ASC\n"
+        "      - property: date\n        direction: ASC\n"
     )
 
 
-def _ensure_base(rel):
-    """Writes the Timeline base for vault-relative folder `rel` if missing.
-    Idempotent and independent of the hub note beside it, so a folder can never
-    end up with a hub embedding a base that was never written. Returns the
-    embed target."""
-    p = OBSIDIAN_VAULT / rel / TIMELINE
-    if not p.exists():
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(_timeline_base(rel), encoding="utf-8")
-    return f"{rel}/{TIMELINE}"
+def _fence(rel):
+    """The timeline as a fenced block, to live inside the hub note rather than
+    in a Timeline.base file of its own — one file per class and per unit was
+    half the vault."""
+    return "```base\n" + _timeline_base(rel) + "```"
+
+
+# a legacy ![[.../Timeline.base#View]] embed on its own line, or a ```base block
+BASE_BLOCK = re.compile(
+    r"(?ms)^!\[\[[^\]\n]*Timeline\.base#[^\]\n]*\]\][ \t]*$|^```base\n.*?^```[ \t]*$")
+
+
+def _sync_base(path, rel):
+    """Brings the hub note's timeline block up to date, folding a legacy
+    Timeline.base embed into an inline one on the way. Kept separate from the
+    hub's first write (which is once-only) because the block is generated: a
+    template change has to reach hubs that already exist, the way rewriting
+    Timeline.base used to. Anything the user wrote around the block survives."""
+    body = path.read_text(encoding="utf-8")
+    new, hits = BASE_BLOCK.subn(lambda _m: _fence(rel), body, count=1)
+    if not hits:  # hub predates timelines, or the user deleted the block
+        new = body.rstrip("\n") + "\n\n" + _fence(rel) + "\n"
+    if new != body:
+        path.write_text(new, encoding="utf-8")
 
 
 def ensure_hubs(row):
@@ -2079,50 +2921,56 @@ def ensure_hubs(row):
     lecture list IS the description, so nothing here goes stale.
     ponytail: hubs are written once and never refreshed — delete a hub file to
     regenerate it."""
-    sem, cls, unit = _slug(row.get("semester")), _slug(row.get("class")), _slug(row.get("unit"))
+    sem, cls = _slug(row.get("semester")), _slug(row.get("class"))
+    # _slug("") is "Untitled" -- fine for a note filename, wrong for a folder:
+    # an unlabelled unit used to mint a real "Untitled" unit folder + hub.
+    unit = _slug(row["unit"]) if (row.get("unit") or "").strip() else ""
     sem_p = OBSIDIAN_VAULT / sem / f"{sem}.md"
     cls_p = OBSIDIAN_VAULT / sem / cls / f"{cls}.md"
-    unit_p = OBSIDIAN_VAULT / sem / cls / unit / f"{unit}.md"
     if not sem_p.exists():
         sem_p.parent.mkdir(parents=True, exist_ok=True)
         sem_p.write_text(f"# {sem}\n", encoding="utf-8")
-    cls_base = _ensure_base(f"{sem}/{cls}")
-    unit_base = _ensure_base(f"{sem}/{cls}/{unit}")
-    # full paths in the embeds: every folder has a file named Timeline.base, and
-    # a shortest-path wikilink would resolve to whichever one Obsidian picks
+    cls_rel = f"{sem}/{cls}"
     if not cls_p.exists():
+        # _ensure_base used to mkdir the class folder on its way to writing
+        # Timeline.base in it; nothing else does, so the hub has to
+        cls_p.parent.mkdir(parents=True, exist_ok=True)
         cls_p.write_text(
-            f"# {cls}\n\n![[{cls_base}#Timeline]]\n\nSemester: [[{sem}/{sem}|{sem}]]\n",
+            f"# {cls}\n\n{_fence(cls_rel)}\n\nSemester: [[{sem}/{sem}|{sem}]]\n",
             encoding="utf-8")
-    if not unit_p.exists():
-        unit_p.write_text(
-            f"# {unit}\n\n![[{unit_base}#Timeline]]\n\nClass: [[{sem}/{cls}/{cls}|{cls}]]\n",
-            encoding="utf-8")
+    else:
+        _sync_base(cls_p, cls_rel)
+    if unit:
+        unit_rel = f"{sem}/{cls}/{unit}"
+        unit_p = OBSIDIAN_VAULT / sem / cls / unit / f"{unit}.md"
+        if not unit_p.exists():
+            unit_p.parent.mkdir(parents=True, exist_ok=True)
+            unit_p.write_text(
+                f"# {unit}\n\n{_fence(unit_rel)}\n\nClass: [[{sem}/{cls}/{cls}|{cls}]]\n",
+                encoding="utf-8")
+        else:
+            _sync_base(unit_p, unit_rel)
 
 
-def _prep_hub(sem, cls, unit=""):
-    """Hub note for a class's (or unit's) Exam Prep folder, so study material is
-    its own node in the graph: quiz/cheat sheet -> Exam Prep -> unit -> class.
+def _prep_hub(sem, cls):
+    """Hub note for a class's Exam Prep folder, so study material is its own
+    node in the graph: quiz/cheat sheet -> Exam Prep -> class. One per class,
+    never per unit — a prep folder inside every unit sprouted an amber node off
+    each unit and the graph stopped reading as the folder tree.
     Written once, like the other hubs. Returns the vault-relative link target."""
-    s_sem, s_cls, s_unit = _slug(sem), _slug(cls), _slug(unit)
-    base = OBSIDIAN_VAULT / s_sem / s_cls
-    rel = f"{s_sem}/{s_cls}"
-    if s_unit:
-        base, rel = base / s_unit, f"{rel}/{s_unit}"
-    rel = f"{rel}/{PREP_DIR}/{PREP_DIR}"
-    hub = base / PREP_DIR / f"{PREP_DIR}.md"
+    s_sem, s_cls = _slug(sem), _slug(cls)
+    hub = OBSIDIAN_VAULT / s_sem / s_cls / PREP_DIR / f"{PREP_DIR}.md"
     if not hub.exists():
-        up = (f"Unit: [[{s_sem}/{s_cls}/{s_unit}/{s_unit}|{s_unit}]]" if s_unit
-              else f"Class: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]")
         hub.parent.mkdir(parents=True, exist_ok=True)
         hub.write_text(f"# {PREP_DIR}\n\nPractice quizzes and tests, cheat sheets, "
-                       f"and flashcard decks.\n\n{up}\n", encoding="utf-8")
-    return rel
+                       f"and flashcard decks.\n\n"
+                       f"Class: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]\n", encoding="utf-8")
+    return f"{s_sem}/{s_cls}/{PREP_DIR}/{PREP_DIR}"
 
 
-def _prep_hub_link(sem, cls, unit=""):
+def _prep_hub_link(sem, cls):
     """The `Exam Prep:` line study material carries, creating the hub if needed."""
-    return f"\nExam Prep: [[{_prep_hub(sem, cls, unit)}|{PREP_DIR}]]\n"
+    return f"\nExam Prep: [[{_prep_hub(sem, cls)}|{PREP_DIR}]]\n"
 
 
 def _rgb(h, s, v):
@@ -2169,7 +3017,8 @@ def write_graph_config():
     # Trailing slash keeps a unit legitimately named "Exam Preparation" out.
     groups = [{"query": f'path:"{PREP_DIR}/"', "color": {"a": 1, "rgb": PREP_COLOR}}]
     sems = sorted(d for d in OBSIDIAN_VAULT.iterdir()
-                  if d.is_dir() and not d.name.startswith("."))
+                  if d.is_dir() and not d.name.startswith(".")
+                  and d.name != ATTACH_DIR)
     classes = [(sem, c) for sem in sems
                for c in sorted(p for p in sem.iterdir() if p.is_dir())]
     n = max(len(classes), 1)
@@ -2204,6 +3053,23 @@ def write_graph_config():
     cfg["colorGroups"] = groups
     cfg_p.parent.mkdir(parents=True, exist_ok=True)
     cfg_p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+@app.get("/vault_tree")
+def vault_tree():
+    """Semesters and classes that exist as vault folders, recordings or not.
+    A semester is scaffolded before anything is filed into it, and the UI
+    builds its tree from recording rows alone -- so a fresh term stayed
+    invisible in the app until its first recording landed."""
+    out = {}
+    if not OBSIDIAN_VAULT.is_dir():
+        return out
+    for sem in sorted(d for d in OBSIDIAN_VAULT.iterdir()
+                      if d.is_dir() and not d.name.startswith(".")
+                      and d.name != ATTACH_DIR):
+        out[sem.name] = sorted(p.name for p in sem.iterdir()
+                               if p.is_dir() and p.name != PREP_DIR)
+    return out
 
 
 @app.get("/graph_settings")
@@ -2241,7 +3107,10 @@ def _refile_group(sem, cls, unit, topic):
     (queried fresh from the DB), syncing each row's obsidian_path. Removes
     the file instead if the group is now empty. Returns the path (str), or
     None."""
-    dest = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(unit) / f"{_slug(topic)}.md"
+    # the unit hub owns <unit>/<unit>.md -- a topic named after its own unit
+    # used to overwrite the hub, leaving a note whose "Unit:" link pointed at itself
+    fname = _slug(topic) + (" (lecture)" if _slug(topic) == _slug(unit) else "")
+    dest = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / _slug(unit) / f"{fname}.md"
     group = _group_rows(sem, cls, unit, topic)
     if not group:
         if dest.exists() and dest.is_relative_to(OBSIDIAN_VAULT):
@@ -2306,17 +3175,56 @@ def _rows_semester(rows):
     return next((r.get("semester") for r in rows if r.get("semester")), "")
 
 
-def write_prep_note(sem, cls, unit, filename, body):
-    """Writes a study artifact into the unit's Exam Prep folder --
-    <vault>/<sem>/<cls>/<unit>/Exam Prep/<filename>, class-level when unit is
-    empty (a scope spanning units). Shared by the cheat-sheet and flashcard
-    exports; quizzes/exams build their own paths since they reuse existing
-    notes. Returns the path (str)."""
-    body += _prep_hub_link(sem, cls, unit)
-    base = OBSIDIAN_VAULT / _slug(sem) / _slug(cls)
-    if unit:
-        base = base / _slug(unit)
-    path = base / PREP_DIR / filename
+def save_attachment(rid, filename, data):
+    """Keep the uploaded page itself in the vault, not just Claude's reading of
+    it. A misread diagram is then correctable against the original instead of
+    being the only surviving record. Returns the stored filename, or None when
+    the type is one Obsidian won't embed.
+
+    Named "<original stem>-<rid8>-<n>.<ext>" so the folder stays skimmable by
+    hand while _attachments can still find one recording's pages."""
+    ext = pathlib.Path(filename or "").suffix.lower()
+    if ext not in ATTACH_EXTS:
+        return None
+    d = OBSIDIAN_VAULT / ATTACH_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    stem = _slug(pathlib.Path(filename).stem)  # returns "Untitled" if empty
+    i = 1
+    while (d / f"{stem}-{rid[:8]}-{i}{ext}").exists():
+        i += 1
+    dest = d / f"{stem}-{rid[:8]}-{i}{ext}"
+    dest.write_bytes(data)
+    return dest.name
+
+
+def _attachments(rid):
+    """Stored page filenames for one recording, oldest first. Read off disk
+    rather than a DB column: _refile_group rewrites notes wholesale, so the
+    embed list is regenerated on every write anyway, and derived-from-disk
+    cannot drift from what the vault actually holds."""
+    d = OBSIDIAN_VAULT / ATTACH_DIR
+    if not rid or not d.is_dir():
+        return []
+    # sort by length first: a plain sort puts "-10" before "-2"
+    return sorted((f.name for f in d.glob(f"*-{rid[:8]}-*") if f.is_file()),
+                  key=lambda s: (len(s), s))
+
+
+def drop_attachments(rid):
+    """Unlink one recording's stored pages. Called from delete_recording --
+    nothing else references them, so they would sit in the vault forever."""
+    d = OBSIDIAN_VAULT / ATTACH_DIR
+    for name in _attachments(rid):
+        (d / name).unlink(missing_ok=True)
+
+
+def write_prep_note(sem, cls, filename, body):
+    """Writes a study artifact into the class's Exam Prep folder --
+    <vault>/<sem>/<cls>/Exam Prep/<filename>. Shared by the cheat-sheet and
+    flashcard exports; quizzes/exams build their own filenames but the same
+    folder. Unit scope lives in the filename, not the path. Returns the path."""
+    body += _prep_hub_link(sem, cls)
+    path = OBSIDIAN_VAULT / _slug(sem) / _slug(cls) / PREP_DIR / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return str(path)
@@ -2336,15 +3244,18 @@ def write_cards_note(sem, cls, unit):
             f"# Flashcards — {unit or cls}\n\n"
             + "".join(f"- **{c.get('front', '')}** — {c.get('back', '')}\n" for c in cards)
             + f"\nClass: [[{_slug(sem)}/{_slug(cls)}/{_slug(cls)}|{_slug(cls)}]]\n")
-    return write_prep_note(sem, cls, unit, "Flashcards.md", body)
+    # unit in the filename, not the folder: one Exam Prep per class, so a
+    # per-unit deck would otherwise overwrite the class-wide one
+    fname = _slug(f"{cls} {unit}".strip()) + " flashcards.md"
+    return write_prep_note(sem, cls, fname, body)
 
 
 def _migrate_prep_dirs():
     """One-time rename of the old 'Practice' and 'Exams' folders to PREP_DIR so
-    old and new study notes don't sit in separate folders. Exam notes land in
-    the class-level Exam Prep; _refile_exam_notes then moves them to the unit
-    they cover. ponytail: runs on every import — a no-op once neither name is
-    left under the vault."""
+    old and new study notes don't sit in separate folders. _flatten_prep_dirs
+    then lifts any that landed inside a unit up to the class.
+    ponytail: runs on every import — a no-op once neither name is left under
+    the vault."""
     if not OBSIDIAN_VAULT.is_dir():
         return
     for old in ("Practice", "Exams"):
@@ -2363,96 +3274,33 @@ def _migrate_prep_dirs():
                 print(f"[listen] {old} -> {PREP_DIR} migration skipped for {p}: {e}")
 
 
-def _refile_exam_notes():
-    """Moves class-level exam notes into the unit their Covers resolve to (1-2
-    units; 3+ stays class-level, see write_exam_note). Exams filed before Covers
-    were matched by word overlap all landed class-level — this lifts them
-    without waiting for the exam to be re-detected in a later lecture."""
+def _flatten_prep_dirs():
+    """Lifts every unit-level Exam Prep folder into its class's one, then
+    removes the emptied folder. Study material used to file per unit, which hung
+    an amber Exam Prep node off every single unit; one node per class keeps the
+    graph reading as the folder tree it mirrors.
+    ponytail: runs on every import — a no-op once no unit holds a prep folder."""
     if not OBSIDIAN_VAULT.is_dir():
         return
-    for cls_dir in OBSIDIAN_VAULT.glob("*/*"):
-        prep = cls_dir / PREP_DIR
-        if not prep.is_dir():
-            continue
-        labels = _class_labels(cls_dir)
-        s_sem, s_cls = cls_dir.parent.name, cls_dir.name
-        for note, _title, covers in _exam_notes(cls_dir):
-            if not covers:
-                continue  # nothing to resolve
+    for prep in list(OBSIDIAN_VAULT.glob(f"*/*/*/{PREP_DIR}")):
+        sem, cls, unit = prep.relative_to(OBSIDIAN_VAULT).parts[:3]
+        dest = OBSIDIAN_VAULT / sem / cls / PREP_DIR
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in list(prep.iterdir()):
             try:
-                # Move first, so the hub link below points at the folder the
-                # exam actually ends up in.
-                if note.parent == prep:
-                    hit = _exam_units(covers, labels, cls_dir)
-                    if 1 <= len(hit) <= 2:
-                        dest = cls_dir / hit[0] / PREP_DIR / note.name
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        note.replace(dest)
-                        note = dest
-                # Rebuild from '## Covers' down — bullets written before word-
-                # overlap matching are plain text, so the exam has no graph edges
-                # yet, and the Exam Prep hub link is the section that follows.
-                head, sep, _ = note.read_text(encoding="utf-8").partition("## Covers")
-                if sep:
-                    unit = note.parent.parent.name if note.parent.parent != cls_dir else ""
-                    note.write_text(
-                        f"{head}## Covers\n\n{_covers_bullets(covers)}\n"
-                        + _prep_hub_link(s_sem, s_cls, unit), encoding="utf-8")
+                if f.name == f"{PREP_DIR}.md":
+                    f.unlink()  # the unit's own hub note; the class one replaces it
+                    continue
+                target = dest / f.name
+                if target.exists():  # same filename from two units — keep both
+                    target = dest / f"{f.stem} ({unit}){f.suffix}"
+                f.replace(target)
             except OSError as e:
-                print(f"[listen] exam refile skipped for {note}: {e}")
-
-
-# --- exam <-> study-material matching -------------------------------------
-# Claude writes an exam's Covers entries as free text ("Relative velocity",
-# "Collisions (elastic and inelastic)"), not as the unit/topic labels it filed
-# the lectures under. On the real vault, exact matching resolved 1 of 3 Covers
-# entries on one exam and 1 of 7 on another — so these match on shared words,
-# the same dupe heuristic the merge panel uses on unit/topic names.
-
-def _kw(s):
-    """Significant words of a label: lowercased, de-pluralized, short words
-    dropped so 'and'/'of' can't create a match."""
-    return {w.rstrip("s") for w in re.split(r"[^a-z0-9]+", (s or "").lower()) if len(w) >= 4}
-
-
-def _class_labels(cls_dir):
-    """{label: unit} for every unit folder and topic note under a class — the
-    vocabulary a free-text Covers entry is resolved against."""
-    labels = {}
-    if not cls_dir.is_dir():
-        return labels
-    for u in cls_dir.iterdir():
-        if not u.is_dir() or u.name == PREP_DIR:
-            continue
-        labels[u.name] = u.name
-        for note in u.glob("*.md"):
-            labels.setdefault(note.stem, u.name)
-    return labels
-
-
-def _match_unit(label, labels):
-    """The unit whose name or topic note shares the most words with `label`,
-    or None when nothing overlaps.
-    ponytail: bag of words, so the commoner word wins an ambiguous phrase —
-    "Angular momentum" lands on Momentum and Collisions, not Rotational Motion.
-    Per-topic embeddings if that starts costing real study time."""
-    words, best, score = _kw(label), None, 0
-    for name, unit in labels.items():
-        n = len(words & _kw(name))
-        if n > score:
-            best, score = unit, n
-    return best
-
-
-def _exam_units(topics, labels, cls_dir):
-    """Units an exam's Covers entries point at, most-covered first. Ties go to
-    the unit touched most recently — the one being studied now."""
-    votes = {}
-    for t in topics:
-        u = _match_unit(t, labels)
-        if u:
-            votes[u] = votes.get(u, 0) + 1
-    return sorted(votes, key=lambda u: (-votes[u], -(cls_dir / u).stat().st_mtime))
+                print(f"[listen] prep flatten skipped for {f}: {e}")
+        try:
+            prep.rmdir()
+        except OSError:
+            pass  # user files left behind — leave the folder alone
 
 
 # "- [[Fall 26/Bio/Cells/Cells|Cells]]" -> "Cells";  "- Vectors" -> "Vectors"
@@ -2462,52 +3310,34 @@ _COVERS_BULLET = re.compile(r"^- (?:\[\[[^|\]]+\|)?([^\]]+?)\]{0,2}$", re.M)
 def _covers_bullets(topic_names):
     """Covers list for an exam note: plain bullets. These used to wikilink the
     unit each entry resolved to, but a wide exam then fanned an edge out to
-    every unit it spanned and the graph stopped reading as the folder tree.
-    Matching still happens — it decides which folder the exam is filed in."""
+    every unit it spanned and the graph stopped reading as the folder tree."""
     return "\n".join(f"- {t}" for t in topic_names)
-
-
-def _exam_notes(cls_dir):
-    """(path, title, covers) for every exam note filed under this class, unit
-    folders first. Reads the notes back rather than a table: the vault is where
-    exams live (the assignments table holds only dated rows, without topics)."""
-    out = []
-    for note in sorted(cls_dir.glob(f"*/{PREP_DIR}/*.md")) + sorted(cls_dir.glob(f"{PREP_DIR}/*.md")):
-        try:
-            text = note.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if "tags: [exam]" not in text:
-            continue  # a quiz/cheatsheet/deck sitting in the same folder
-        covers = _COVERS_BULLET.findall(text.split("## Covers", 1)[1]) if "## Covers" in text else []
-        m = re.search(r"^# (.+)$", text, re.M)
-        out.append((note, m.group(1).strip() if m else note.stem, covers))
-    return out
 
 
 def _prune_exam_links():
     """Strips the cross-links that used to fan arrows across the graph: the
     `Exam:` line study material carried (one link per exam covering its scope)
     and the unit wikilinks inside an exam's `## Covers` bullets. What's left is
-    the containment chain — material -> Exam Prep -> unit -> class -> semester —
-    so the graph reads as the folder tree. Also creates any missing Exam Prep
-    hub note, the one link the material keeps. ponytail: rewrites in place on
-    import, a no-op once every note under a prep folder is already plain."""
+    the containment chain — material -> Exam Prep -> class -> semester — so the
+    graph reads as the folder tree. Also repoints hub links a note carried from
+    a unit-level prep folder (see _flatten_prep_dirs) and creates any missing
+    Exam Prep hub note, the one link the material keeps. ponytail: rewrites in
+    place on import, a no-op once every note under a prep folder is plain."""
     if not OBSIDIAN_VAULT.is_dir():
         return
-    # both shapes: <sem>/<cls>/Exam Prep (material spanning units) and
-    # <sem>/<cls>/<unit>/Exam Prep
-    for prep in (list(OBSIDIAN_VAULT.glob(f"*/*/{PREP_DIR}"))
-                 + list(OBSIDIAN_VAULT.glob(f"*/*/*/{PREP_DIR}"))):
-        parts = prep.relative_to(OBSIDIAN_VAULT).parts
-        sem, cls = parts[0], parts[1]
-        unit = parts[2] if len(parts) == 4 else ""
-        _prep_hub(sem, cls, unit)  # every prep folder gets its graph node
+    for prep in OBSIDIAN_VAULT.glob(f"*/*/{PREP_DIR}"):
+        sem, cls = prep.relative_to(OBSIDIAN_VAULT).parts[:2]
+        hub_line = _prep_hub_link(sem, cls)  # also creates the class's prep node
         for note in prep.glob("*.md"):
+            if note.name == f"{PREP_DIR}.md":
+                continue  # the hub itself
             try:
                 text = note.read_text(encoding="utf-8")
                 # the hub link is "Exam Prep: ", which this pattern doesn't touch
                 out = re.sub(r"\nExam: [^\n]*\n", "", text)
+                # lambda, not a replacement string: the link contains no escapes
+                # but re would try to expand any that appear in a class name
+                out = re.sub(r"\nExam Prep: \[\[[^\]]*\]\]\n", lambda _: hub_line, out)
                 head, sep, covers = out.partition("## Covers")
                 if sep:  # unlink the bullets, keeping the exam's own wording
                     out = head + sep + _COVERS_BULLET.sub(r"- \1", covers)
@@ -2518,15 +3348,10 @@ def _prune_exam_links():
 
 
 def write_exam_note(sem, cls, exam):
-    """Files a detected/announced exam or quiz under the Exam Prep folder:
-    <vault>/<sem>/<cls>/<unit>/Exam Prep/<title>.md when its Covers entries
-    resolve to one or two units, else class-level
-    <vault>/<sem>/<cls>/Exam Prep/<title>.md — a comprehensive final spanning
-    3+ units isn't about any single unit. Same title -> same slug ->
-    overwrites in place (an existing note anywhere under this class's
-    Exam Prep folders is reused), so re-detecting an exam across lectures/a
-    revised syllabus is idempotent. A 'topics' entry that resolves to a unit
-    links to that unit's hub note; anything else stays a plain bullet.
+    """Files a detected/announced exam or quiz under the class's Exam Prep
+    folder: <vault>/<sem>/<cls>/Exam Prep/<title>.md. Same title -> same slug
+    -> overwrites in place, so re-detecting an exam across lectures/a revised
+    syllabus is idempotent. Covers entries stay plain bullets.
     Returns the path (str)."""
     s_sem, s_cls = _slug(sem), _slug(cls)
     # str()-wrap every model-supplied field — same defensiveness as
@@ -2540,7 +3365,6 @@ def write_exam_note(sem, cls, exam):
     topics = topics if isinstance(topics, list) else []
 
     cls_dir = OBSIDIAN_VAULT / s_sem / s_cls
-    labels = _class_labels(cls_dir)
     topic_names = [t for t in (str(x).strip() for x in topics) if t]
 
     fm = {"class": cls, "kind": kind, "date": due or "TBA", "tags": "[exam]"}
@@ -2554,35 +3378,21 @@ def write_exam_note(sem, cls, exam):
     if topic_names:
         body += f"\n## Covers\n\n{_covers_bullets(topic_names)}\n"
     fname = f"{_slug(title)}.md"
-    # reuse an existing note wherever it already lives so re-detection stays
-    # an overwrite even as unit folders appear later
-    path = next(iter(cls_dir.glob(f"*/{PREP_DIR}/{fname}")), None) if cls_dir.is_dir() else None
-    if path is None and (cls_dir / PREP_DIR / fname).exists():
-        path = cls_dir / PREP_DIR / fname
-    if path is None:
-        hit = _exam_units(topic_names, labels, cls_dir)
-        # 1-2 units -> file with the best-matching one; a comprehensive final
-        # spanning 3+ isn't about any single unit, so it stays class-level
-        dest = cls_dir / hit[0] / PREP_DIR if 1 <= len(hit) <= 2 else cls_dir / PREP_DIR
-        path = dest / fname
-    # the hub the exam hangs off depends on where it landed (unit or class level)
-    landed_unit = path.parent.parent.name if path.parent.parent != cls_dir else ""
-    body += _prep_hub_link(sem, cls, landed_unit)
+    path = cls_dir / PREP_DIR / fname
+    body += _prep_hub_link(sem, cls)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return str(path)
 
 
 def write_quiz_note(quiz, questions, results, score):
-    """Files a practice quiz/test under
-    <vault>/<sem>/<cls>/<unit>/Exam Prep/<kind> <date> <time>.md
-    (class-level Exam Prep when the quiz wasn't scoped to a unit). Called at
+    """Files a practice quiz/test under the class's Exam Prep folder,
+    <vault>/<sem>/<cls>/Exam Prep/<kind> <date> <time>.md. Called at
     generation (score=None -> blank, ungraded) and again at grade time; the
     filename is derived from the quiz's created_at so both write the same path
     and grading overwrites the blank. Mirrors write_exam_note's structure/graph
     anchor. Returns the path (str)."""
     s_sem, s_cls = _slug(quiz.get("semester")), _slug(quiz.get("class"))
-    unit = (quiz.get("unit") or "").strip()
     kind = str(quiz.get("kind") or "quiz")
     ca = quiz.get("created_at")
     try:
@@ -2615,17 +3425,15 @@ def write_quiz_note(quiz, questions, results, score):
             body += f"\n{'Correct' if r.get('correct') else 'Incorrect'}\n"
 
     body += f"\nClass: [[{s_sem}/{s_cls}/{s_cls}|{s_cls}]]\n"
-    body += _prep_hub_link(quiz.get("semester"), quiz.get("class"), unit)
+    body += _prep_hub_link(quiz.get("semester"), quiz.get("class"))
 
-    base = OBSIDIAN_VAULT / s_sem / s_cls
-    if unit:
-        base = base / _slug(unit)
-    path = base / PREP_DIR / f"{kind} {now:%Y-%m-%d %H%M}.md"
+    path = (OBSIDIAN_VAULT / s_sem / s_cls / PREP_DIR
+            / f"{kind} {now:%Y-%m-%d %H%M}.md")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return str(path)
 
 
 _migrate_prep_dirs()   # import-time, idempotent — see the function docstring
-_refile_exam_notes()   # ditto — lifts class-level exams to the unit they cover
+_flatten_prep_dirs()   # ditto — lifts unit-level prep folders up to the class
 _prune_exam_links()    # ditto — strips old exam cross-links, keeps the hub chain

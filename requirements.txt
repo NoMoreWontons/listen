@@ -4,5 +4,7 @@ python-dotenv
 supabase
 anthropic
 faster-whisper
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*
 httpx
 yt-dlp

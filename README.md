@@ -11,7 +11,10 @@ the local FastAPI server holds the service key and does all the work. See
 
 ## How it works
 
-1. Browser records audio and streams it in chunks to the local server.
+1. Browser records audio and streams it in chunks to the local server. **Meeting**
+   records an online class instead: it captures the meeting tab's own audio and
+   mixes your mic into it, so the other participants land in the transcript too.
+   Chromium-only, and the share picker needs "Also share tab audio" ticked.
 2. On stop, the server transcribes the audio with Whisper (GPU if available, else CPU).
 3. Claude summarises the transcript and infers **semester / class / unit / topic**.
 4. The row lands in Supabase and a Markdown note is written to your Obsidian vault at
@@ -20,7 +23,8 @@ the local FastAPI server holds the service key and does all the work. See
    — hand-set labels win; Claude only fills the ones you leave blank. Saving after
    `done` re-files the note.
 6. Raw audio stays local and is auto-deleted after `RETENTION_DAYS`.
-7. **Uploads** beyond live recording: audio files, lecture PDFs/slides (`pdf`),
+7. **Uploads** beyond live recording: audio *and video* files (a Zoom or Teams
+   recording drops straight in — ffmpeg pulls the audio out), lecture PDFs/slides (`pdf`),
    syllabi (`syllabus` — due dates land in an `.ics` you can import), homework
    (`homework` — PDF or photo, auto-categorized, then link it to a syllabus due
    date to mark it submitted), and YouTube links (save as a reference note, or
