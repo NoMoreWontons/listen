@@ -2234,7 +2234,7 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False, known_units
         "revisiting, as a markdown bullet list\n"
         "Write ALL math notation as LaTeX ($...$ inline, $$...$$ for display "
         "equations) — never plain-text approximations like x^2, sqrt(), or "
-        "unicode fractions.\n"
+        "unicode fractions. Inside math write \\# and \\%; money in prose is \\$5, never a bare $.\n"
     ) if homework else (
         "- key_points: the document's content distilled as thorough markdown "
         "notes (this stands in for a transcript)\n"
@@ -2245,7 +2245,7 @@ def analyze_pdf(pdf_bytes, notes="", syllabus=False, homework=False, known_units
         "answer (LaTeX $...$ for math); omit if none\n"
         "Write ALL math notation as LaTeX ($...$ inline, $$...$$ for display "
         "equations) — never plain-text approximations like x^2, sqrt(), or "
-        "unicode fractions.\n"
+        "unicode fractions. Inside math write \\# and \\%; money in prose is \\$5, never a bare $.\n"
     )
     msg = claude.messages.create(
         model="claude-haiku-4-5",
@@ -2658,7 +2658,7 @@ def analyze(transcript, notes="", created_at=None, known_classes=(), slot_class=
                     "then '**A:** …' with the lecturer's response (or '*unanswered*'). Omit "
                     "the section if there were none. Write ALL math notation as LaTeX "
                     "($...$ inline, $$...$$ for display equations) — never plain-text "
-                    "approximations like x^2, sqrt(), or unicode fractions.\n"
+                    "approximations like x^2, sqrt(), or unicode fractions. Inside math write \\# and \\%; money in prose is \\$5, never a bare $.\n"
                     "exams is an array (usually empty) of upcoming tests/quizzes/exams the "
                     "lecturer announces or discusses in this transcript — ignore mentions of "
                     "past exams or hypotheticals. Each item: {title, due_date, kind, format, "

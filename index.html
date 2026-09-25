@@ -1142,9 +1142,20 @@ function esc(s) { return s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', 
 // byte still goes through esc() and nothing else can inject HTML.
 function md(s) {
   if (!window.marked) return `<pre>${esc(s || '')}</pre>`;
+  // marked runs before katex and eats LaTeX: \, \{ \\ are markdown escapes that
+  // lose their backslash, and $z_a$ ... $z_b$ pairs into <em>. So each math span
+  // is parked behind a token and put back, still escaped, once marked is done.
+  // Fenced code (mermaid) is left alone -- a $ in a diagram label is not math.
+  // An escaped \$ (currency) is parked too: it is a dollar sign, not a delimiter,
+  // and marked would strip its backslash and hand katex a stray $.
+  const math = [];
+  const park = t => t.split(/(```[\s\S]*?```)/).map((p, i) => i % 2 ? p :
+    p.replace(/\\\$|\$\$(?:\\[\s\S]|[^\\])+?\$\$|\$(?:\\.|[^$\n\\])+?\$/g,
+      m => `@@M${math.push(m) - 1}@@`)).join('');
   const html = (s || '').split(/(<svg[\s\S]*?<\/svg>)/i)
-    .map((part, i) => i % 2 ? `<pre class="svgsrc">${esc(part)}</pre>` : marked.parse(esc(part)))
-    .join('');
+    .map((part, i) => i % 2 ? `<pre class="svgsrc">${esc(part)}</pre>` : marked.parse(esc(park(part))))
+    .join('')
+    .replace(/@@M(\d+)@@/g, (_, n) => esc(math[n]));
   return `<div class="md">${html}</div>`;
 }
 // call after innerHTML that may contain md(); no-op offline (CDN unreachable)
