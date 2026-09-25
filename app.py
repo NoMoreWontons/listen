@@ -2593,7 +2593,9 @@ def analyze(transcript, notes="", created_at=None, known_classes=(), slot_class=
     ) if lecture_date else ""
     msg = claude.messages.create(
         model="claude-haiku-4-5",
-        max_tokens=6000,  # multi-segment replies carry one full summary per topic
+        # multi-segment replies carry one full summary per topic: a 4-segment
+        # lecture on 2026-09-25 hit 6000 mid-JSON and filed the raw reply as the note
+        max_tokens=16000,
         messages=[
             {
                 "role": "user",
