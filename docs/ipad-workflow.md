@@ -218,13 +218,13 @@ same shape, so nothing had to be built for this.
   ```
 
 The page is transcribed on arrival and lands under **Pages waiting** in the
-listen UI. You proofread it there and tap **Attach** to bind it to a lecture —
-see "Pages that arrive before their lecture" below. This is the share-sheet
+listen UI. You proofread it there and tap **New note** to file it as its own
+note — see "Handwritten pages" below. This is the share-sheet
 route to the staging flow; the **✎ iPad Page** button is the same endpoint from
 inside the UI.
 
-Use this, not Shortcut A, for anything belonging to a lecture. A goes to
-`/upload?kind=pdf`, which creates its own `recordings` row.
+Both this and Shortcut A end in a new note. Use this one when you want to
+proofread the transcription before Claude summarizes it.
 
 ### Using them
 
@@ -232,7 +232,7 @@ Use this, not Shortcut A, for anything belonging to a lecture. A goes to
 |---|---|---|
 | Voice memo | **Send Audio to Listen** (`/upload?kind=audio`) | New recording, transcribes |
 | Handout, worksheet, anything with no lecture behind it | **Send Notes to Listen** (`/upload?kind=pdf`) | New row, auto-labeled and filed |
-| Ink for a lecture you recorded | **Stage Page in Listen** (`/pending`) | Pages waiting → proofread → Attach |
+| Handwritten notes you want to proofread first | **Stage Page in Listen** (`/pending`) | Pages waiting → proofread → New note |
 
 | App | Path |
 |---|---|
@@ -275,23 +275,26 @@ text feeds `analyze` → `/quiz/generate` → `/cards/generate`. Wrong granulari
 Page selection is the thing that actually matters, and only the manual export
 offers it. There is no way around that step in either direction.
 
-### Pages that arrive before their lecture
+### Handwritten pages
 
-Ink reaches the laptop long before the audio does — often the audio isn't
-uploaded until that evening, and sometimes there is no recording at all yet. So
-a page can be staged with no lecture chosen and filed later.
+A page is staged first so the transcription can be checked before anything
+is summarized from it, then filed as a note of its own.
 
 1. Tap **✎ iPad Page** in the Upload row. Pick a photo or a PDF.
 2. It's typed up immediately and appears under **Pages waiting** in the side
    column, with the transcription in an editable box. Proofread it now, while
-   the lecture is still fresh — the text saves when you tap out of the box.
-3. Whenever the recording exists — minutes or days later — pick it from the
-   dropdown and tap **Attach**. The lecture closest in date is preselected.
+   the material is still fresh — the text saves when you tap out of the box.
+3. Tap **New note**. The page becomes its own row and its own note — it is
+   never folded into an existing recording.
 
-Attaching does three things in one pass: stores the page in `Attachments/`,
-appends your proofread text to that recording's notes, and re-runs `analyze` so
-the summary absorbs it. If no lecture exists yet the dropdown says so and the
-page simply waits.
+Filing does three things: creates a new `recordings` row (source `ipad_page`)
+whose transcript is your proofread text, stores the page in `Attachments/`, and
+runs `finalize` so Claude labels and summarizes it like any lecture. The page's
+upload time dates the note, so it lands in the semester and class slot it was
+written in. Class and unit still snap to your existing folders, but the topic
+never reuses one another note has: a clash gets the date appended
+(`Friction (2026-09-25)`). A page Claude reads as several topics shows up as a
+split card to confirm, like a multi-topic lecture.
 
 Staged pages live in `listen/pending/` as the original file plus a `.json`
 sidecar holding the filename and text. No database column, so no migration.
@@ -478,7 +481,7 @@ Start read-only. Upgrade if it chafes.
 | Input | Path | Taps |
 |---|---|---|
 | Handwritten notes, standalone | Export PDF → share → "Send Notes to Listen" → auto-labeled and filed | 2 |
-| Handwritten notes, for a lecture | Export PDF → share → "Stage Page in Listen" → proofread in Pages waiting → Attach | 2, plus review when you get to it |
+| Handwritten notes, proofread first | Export PDF → share → "Stage Page in Listen" → proofread in Pages waiting → New note | 2, plus review when you get to it |
 | Handwritten notes, lecture already open in front of you | listen UI in Safari → the recording's "Add notes from file" → review → save | 4, with review |
 | iPhone/iPad audio | Voice Memos → share → "Send Audio to Listen" | 2 |
 | Correction to a filed note | listen UI → correction box → `/addendum` | 3 |

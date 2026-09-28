@@ -895,38 +895,43 @@ def pending_edit(name: str, payload: dict = Body(...)):
     return {"ok": True}
 
 
-@app.post("/pending/{name}/attach")
-def pending_attach(name: str, payload: dict = Body(...)):
-    """File a staged page onto a recording: store the page in the vault, append
-    its text to that recording's notes, and let label() re-integrate the summary
-    and rewrite the note. The attachment is saved FIRST so the note write picks
-    up its embed in the same pass."""
-    rid = (payload.get("rid") or "").strip()
-    if not rid:
-        return {"ok": False, "error": "no recording chosen"}
+@app.post("/pending/{name}/note")
+def pending_note(name: str):
+    """File a staged page as its own new note: a fresh row whose transcript is
+    the proofread text, run through finalize() like any lecture so Claude labels
+    and summarizes it. The page goes into the vault FIRST so the note write
+    picks up its embed. The text is on the row before the staging pair is
+    cleared, so a failed summarize leaves an errored card, never a lost page."""
     try:
         page = _pending_path(name)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     if not page.exists():
         return {"ok": False, "error": "that page is no longer waiting"}
-    rows = sb.table("recordings").select("*").eq("id", rid).execute().data
-    if not rows:
-        return {"ok": False, "error": "that recording no longer exists"}
-    row = rows[0]
     meta = _pending_row(page)
-    save_attachment(rid, meta["filename"], page.read_bytes())
     text = (meta.get("text") or "").strip()
-    notes = "\n\n".join(x for x in [(row.get("notes") or "").strip(), text] if x)
-    # label() owns the re-summarize + refile path; reuse it rather than repeat it.
-    # Existing labels are passed back unchanged so only the notes actually move.
-    out = label(rid, {"semester": row.get("semester") or "", "klass": row.get("class") or "",
-                      "unit": row.get("unit") or "", "topic": row.get("topic") or "",
-                      "notes": notes})
+    if not text:
+        return {"ok": False, "error": "the page has no text to file"}
+    row = sb.table("recordings").insert(
+        {"title": pathlib.Path(meta["filename"]).stem or "iPad page", "status": "transcribing",
+         "source": "ipad_page", "transcript": text, "stage": "summarizing"}
+    ).execute().data[0]
+    save_attachment(row["id"], meta["filename"], page.read_bytes())
     page.unlink(missing_ok=True)
     page.with_name(page.name + ".json").unlink(missing_ok=True)
-    return {"ok": out.get("ok", True), "error": out.get("error"),
-            "obsidian_path": out.get("obsidian_path")}
+    threading.Thread(target=_page_note, args=(row["id"], text, meta.get("uploaded_at")),
+                     daemon=True).start()
+    return {"ok": True, "id": row["id"]}
+
+
+def _page_note(rid, text, uploaded_at):
+    """finalize() for a staged page, dated by when the page was written -- that
+    picks the semester and the class-by-timeslot, not the moment it was filed."""
+    try:
+        finalize(rid, text, created_at=uploaded_at, own_note=True)
+    except Exception as e:
+        traceback.print_exc()
+        _set(rid, status="error", stage=None, progress=None, summary=f"[error: {e}]")
 
 
 @app.delete("/pending/{name}")
@@ -1190,12 +1195,25 @@ def live_preview(rid):
             print(f"[listen] live preview tick failed: {e}")
 
 
-def finalize(rid, transcript, created_at=None):
+def _own_topic(topic, taken, day):
+    """A topic no other note in this unit uses. write_note keeps one combined
+    note per topic, so a page that must stay its own note can't share one:
+    'Friction' -> 'Friction (2026-09-25)', then '... 2', '... 3'. Pure."""
+    if topic not in taken:
+        return topic
+    name, n = f"{topic} ({day})", 2
+    while name in taken:
+        name, n = f"{topic} ({day} {n})", n + 1
+    return name
+
+
+def finalize(rid, transcript, created_at=None, own_note=False):
     """Shared tail for any transcript source (whisper or upload):
     summarize + label with Claude, then either write the row done and file
     the Obsidian note (single topic), or park it split_pending with the
     proposed segments for the user to confirm via /split (multiple topics).
-    The row's own source value is preserved."""
+    The row's own source value is preserved. own_note keeps the class/unit
+    snapping but never lets the topic land in an existing topic's note."""
     _set(rid, stage="summarizing", progress=100, live_transcript=None)
     # honor labels/notes the user set live/before stop; Claude only fills the blanks
     pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source,title")
@@ -1251,6 +1269,10 @@ def finalize(rid, transcript, created_at=None):
         "tokens_in": tokens_in, "tokens_out": tokens_out,
         "source": pre.get("source") or "local",
     }
+    if own_note:
+        fields["topic"] = _own_topic(fields["topic"], {
+            r.get("topic") for r in done if (r.get("semester"), r.get("class"), r.get("unit"))
+            == (semester, fields["class"], fields["unit"])}, created_at[:10])
     _set(rid, **fields)
 
     # auto-file to Obsidian; user can re-file later via /label

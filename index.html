@@ -457,7 +457,6 @@
     resize: vertical; box-sizing: border-box;
   }
   .pending-row { display: flex; gap: .35rem; align-items: center; }
-  .pending-row select { flex: 1; min-width: 0; font-size: .8rem; }
   .split-actions button:disabled { opacity: .55; cursor: default; }
 
   /* ---- graph color settings ---- */
@@ -747,14 +746,25 @@
   details summary { cursor: pointer; font-size: var(--t-sm); color: var(--ink-soft); margin-top: var(--s2); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <script>
-// useMaxWidth:false — the default stretches every diagram to the container, which
-// blows up a tall/narrow decision tree and shrinks a wide one to unreadable.
-// Natural size + an overflow-x container keeps both legible.
-if (window.mermaid) mermaid.initialize({
-  startOnLoad: false, theme: 'neutral', flowchart: { useMaxWidth: false },
-});
+// mermaid is ~3 MB of JS: parsing it blocked every page load, even with no diagram
+// on screen. Fetch it the first time a diagram actually needs drawing instead.
+let mermaidReady = null;
+function loadMermaid() {
+  return mermaidReady ||= new Promise(resolve => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js';
+    s.onload = () => {
+      // useMaxWidth:false — the default stretches every diagram to the container, which
+      // blows up a tall/narrow decision tree and shrinks a wide one to unreadable.
+      // Natural size + an overflow-x container keeps both legible.
+      mermaid.initialize({ startOnLoad: false, theme: 'neutral', flowchart: { useMaxWidth: false } });
+      resolve(true);
+    };
+    s.onerror = () => resolve(false);  // CDN unreachable: diagrams stay as source
+    document.head.appendChild(s);
+  });
+}
 </script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.css">
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.js"></script>
@@ -790,7 +800,7 @@ if (window.mermaid) mermaid.initialize({
       <button id="hwBtn" class="upload-btn" title="Upload homework (PDF or photo) — auto-filed, then link it to a due date">&#8686; Homework</button>
       <input type="file" id="hwInput" accept=".pdf,image/*" hidden>
       <button id="ytBtn" class="upload-btn" title="Add a YouTube video — save the link as a reference note, or transcribe it like a lecture">&#9654; YouTube</button>
-      <button id="pendingBtn" class="upload-btn" title="Handwritten page with no lecture yet — typed up now, attached to a recording later">&#9998; iPad Page</button>
+      <button id="pendingBtn" class="upload-btn" title="Handwritten page — typed up now, filed as its own note once you have proofread it">&#9998; iPad Page</button>
       <input type="file" id="pendingInput" accept="image/*,.pdf" hidden>
     </div>
   </div>
@@ -1206,8 +1216,9 @@ async function drawDiagrams(el) {
     box.appendChild(svg);
     pre.replaceWith(box);
   }
-  if (!window.mermaid) return;
-  for (const code of el.querySelectorAll('code.language-mermaid')) {
+  const codes = el.querySelectorAll('code.language-mermaid');
+  if (!codes.length || !(await loadMermaid())) return;
+  for (const code of codes) {
     const src = new DOMParser().parseFromString(code.textContent, 'text/html')
       .documentElement.textContent;
     try {
@@ -1352,10 +1363,9 @@ async function doSplit(rid, approve, btn) {
   refresh();
 }
 
-// --- pages staged before their lecture exists -------------------------------
-// Notes taken on the iPad reach the laptop long before the audio does, so a page
-// can be typed up and proofread now and attached to a recording that doesn't
-// exist yet. Nothing here touches #list, so the 5s refresh leaves it alone.
+// --- pages staged from the iPad ---------------------------------------------
+// A handwritten page is typed up on arrival, proofread here, then filed as its
+// own note. Nothing here touches #list, so the 5s refresh leaves it alone.
 let pendingPages = [];
 
 async function stagePage(f) {
@@ -1378,16 +1388,13 @@ async function savePendingText(name, text) {
       body: JSON.stringify({ text }) });
 }
 
-async function attachPending(name) {
+async function notePending(name) {
   const box = document.querySelector(`#pending [data-page="${CSS.escape(name)}"]`);
-  const rid = box.querySelector('select').value;
-  if (!rid) { alert('Pick a lecture first.'); return; }
   await savePendingText(name, box.querySelector('textarea').value);  // corrections first
   const btn = box.querySelector('.attach-btn');
   btn.disabled = true; btn.textContent = 'filing…';
-  const resp = await (await fetch(`/pending/${encodeURIComponent(name)}/attach`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rid }) })).json();
+  const resp = await (await fetch(`/pending/${encodeURIComponent(name)}/note`,
+    { method: 'POST' })).json();
   if (resp.error) alert(resp.error);
   document.activeElement.blur();   // or refresh() skips the rebuild
   refresh();
@@ -1400,7 +1407,7 @@ async function dropPending(name) {
   refresh();
 }
 
-function renderPending(rows) {
+function renderPending() {
   const panel = document.getElementById('pending');
   // same trap as renderMerge: never rebuild while the user is mid-proofread
   if (document.activeElement && panel.contains(document.activeElement)) return;
@@ -1409,36 +1416,18 @@ function renderPending(rows) {
     pendingPages = Array.isArray(pages) ? pages : [];
     panel.hidden = pendingPages.length === 0;
     if (panel.hidden) return;
-    const filed = rows.filter(r => r.status === 'done');
-    const nearest = up => {   // default to the lecture closest in time to the upload
-      const t = Date.parse(up) || Date.now();
-      let best = '', gap = Infinity;
-      for (const r of filed) {
-        const d = Math.abs(Date.parse(r.created_at) - t);
-        if (d < gap) { gap = d; best = r.id; }
-      }
-      return best;
-    };
     panel.innerHTML = `<span class="deck-label">Pages waiting (${pendingPages.length})</span>`
-      + pendingPages.map(p => {
-        const sel = nearest(p.uploaded_at);
-        const opts = filed.length
-          ? filed.map(r => `<option value="${escAttr(r.id)}"${r.id === sel ? ' selected' : ''}>`
-              + `${esc((r.created_at || '').slice(0, 10))} — ${esc(r.topic || r.title || 'Lecture')}</option>`).join('')
-          : '<option value="">no lectures yet — upload the audio first</option>';
-        return `<div class="pending-page" data-page="${escAttr(p.name)}">
+      + pendingPages.map(p => `<div class="pending-page" data-page="${escAttr(p.name)}">
           <b>${esc(p.filename)}</b>
           <span class="src">${esc((p.uploaded_at || '').slice(0, 16).replace('T', ' '))}</span>
           <button class="del" title="Discard this page" onclick="dropPending('${escAttr(p.name)}')">&#10005;</button>
           <textarea rows="5" spellcheck="true"
             onblur="savePendingText('${escAttr(p.name)}', this.value)">${esc(p.text || '')}</textarea>
           <div class="pending-row">
-            <select ${filed.length ? '' : 'disabled'}>${opts}</select>
-            <button class="attach-btn pill-btn" ${filed.length ? '' : 'disabled'}
-              onclick="attachPending('${escAttr(p.name)}')">Attach</button>
+            <button class="attach-btn pill-btn" title="File this page as its own new note"
+              onclick="notePending('${escAttr(p.name)}')">New note</button>
           </div>
-        </div>`;
-      }).join('');
+        </div>`).join('');
   }).catch(() => {});
 }
 
@@ -1809,17 +1798,22 @@ async function refresh() {
   const audioPlaying = [...document.querySelectorAll('#list audio')].some(a => !a.paused);
   const rows = await (await fetch(`/recordings?limit=${listLimit}`)).json();
   pollBusy = rows.some(r => r.status === 'recording' || r.status === 'transcribing');
-  await hydrateSummaries(rows);
-  await hydrateSplits(rows);
-  // rows = the page of cards; allRows = the whole library, labels only, for the panels
-  const allRows = await hydrateLabels(rows);
-  // folders in the vault, so a semester scaffolded but not yet recorded into still shows up.
-  // guarded like openAssignments below: a failed fetch (old server, no endpoint) must not blank the tree.
-  try { vaultTree = await (await fetch('/vault_tree')).json() || {}; } catch { vaultTree = {}; }
-  openAssignments = [];  // never let a failed fetch (e.g. migration not yet applied) be non-array — hwLinker.filter would throw and blank the list
-  if (rows.some(r => r.source === 'homework' && r.status === 'done')) {
-    try { const a = await (await fetch('/assignments_open')).json(); if (Array.isArray(a)) openAssignments = a; } catch {}
-  }
+  // the fetches below are independent of each other -- run them side by side, not one
+  // round trip after another. rows = the page of cards; allRows = the whole library,
+  // labels only, for the panels.
+  const [, , allRows, tree, assignments] = await Promise.all([
+    hydrateSummaries(rows),
+    hydrateSplits(rows),
+    hydrateLabels(rows),
+    // folders in the vault, so a semester scaffolded but not yet recorded into still shows up.
+    // guarded like openAssignments below: a failed fetch (old server, no endpoint) must not blank the tree.
+    fetch('/vault_tree').then(r => r.json()).catch(() => ({})),
+    rows.some(r => r.source === 'homework' && r.status === 'done')
+      ? fetch('/assignments_open').then(r => r.json()).catch(() => []) : [],
+  ]);
+  vaultTree = tree || {};
+  // never let a failed fetch (e.g. migration not yet applied) be non-array — hwLinker.filter would throw and blank the list
+  openAssignments = Array.isArray(assignments) ? assignments : [];
   updateDatalists(allRows);
   const openK = new Set([...document.querySelectorAll('#list details[open]')].map(d => d.dataset.k).filter(Boolean));
   // uploading: iOS Safari never focuses a tapped <button>, so the activeElement
@@ -1827,7 +1821,7 @@ async function refresh() {
   // mid-upload and every progress write landed on a dead node.
   if (!audioPlaying && !uploading) document.getElementById('list').innerHTML = rows.map(r => `
     <div class="rec">
-      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.obsidian_uri ? ` <a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">&#8599; Obsidian</a>` : ''}${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload'))}</span>` : ''}${(r.attachments || []).length ? ` <span class="clip" title="${escAttr(r.attachments.join(', '))}">&#128206; ${r.attachments.length} page${r.attachments.length > 1 ? 's' : ''}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
+      <b>${esc(r.title || '')}</b> <span class="status" data-s="${r.status}">${r.status}</span>${r.obsidian_uri ? ` <a class="obs" href="${escAttr(r.obsidian_uri)}" title="Open note in Obsidian">&#8599; Obsidian</a>` : ''}${r.source && r.source !== 'local' ? ` <span class="src">via ${esc(r.source.replace('upload_audio', 'upload').replace('ipad_page', 'iPad page').replace('ipad_page', 'iPad page'))}</span>` : ''}${(r.attachments || []).length ? ` <span class="clip" title="${escAttr(r.attachments.join(', '))}">&#128206; ${r.attachments.length} page${r.attachments.length > 1 ? 's' : ''}</span>` : ''}<button class="del" title="Delete recording" onclick="deleteRec('${r.id}')">&#10005;</button>
       ${r.status === 'transcribing' ? progressBar(r) : ''}
       ${r.status === 'recording' && r.live_transcript ? `<div class="live-tx">${esc(r.live_transcript)}</div>` : ''}
       ${r.status === 'recording' && r.id !== rid ? `<p><button class="pill-btn" title="This tab isn't recording it — transcribe the audio saved so far" onclick="finishStuck('${r.id}')">Finish &amp; transcribe</button></p>` : ''}
@@ -1854,7 +1848,7 @@ async function refresh() {
   document.querySelectorAll('#list details.audio-box[open]').forEach(d => loadAudioBox(d, d.dataset.k.replace('-audio', '')));
   document.querySelectorAll('#list details.tx-box[open]').forEach(d => loadTranscript(d, d.dataset.k.replace('-tx', '')));
   renderTree(allRows);
-  renderPending(rows);      // staged uploads only, never older than this page
+  renderPending();          // staged uploads only, never older than this page
   renderMerge(allRows);
   renderPractice(allRows);
   renderReview(allRows);

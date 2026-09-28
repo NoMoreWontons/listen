@@ -1,6 +1,6 @@
-"""Pages staged before their lecture exists: stored, proofread, then attached.
+"""Pages staged from the iPad: stored, proofread, then filed as their own note.
 
-Pure -- read_page, label and sb are stubbed, so no Claude call and no Supabase.
+Pure -- read_page, sb and the worker thread are stubbed, so no Claude call and no Supabase.
 The staging directory is redirected to a tempdir."""
 import json
 import os
@@ -15,14 +15,18 @@ import app
 
 RID = "759d36d6-15fd-4ec1-af08-a69dce96a94c"
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 32
-ROW = {"id": RID, "notes": "already here", "semester": "Bridge", "class": "Physics",
-       "unit": "Kinematics and Motion", "topic": "Angles and Inclined Planes"}
 
 
 class _Tbl:
-    """Enough of the supabase builder for pending_attach's single lookup."""
+    """Enough of the supabase builder for pending_note's insert."""
     def __init__(self, rows):
         self.rows = rows
+        self.inserted = []
+
+    def insert(self, row):
+        self.inserted.append(row)
+        self.rows = [{"id": RID, **row}]
+        return self
 
     def select(self, *a, **k):
         return self
@@ -34,13 +38,11 @@ class _Tbl:
         return type("R", (), {"data": self.rows})()
 
 
-def stub(monkey_rows=(ROW,), text="typed up"):
+def stub(text="typed up"):
     app.read_page = lambda data, filename: {"text": text}
-    app.sb = type("SB", (), {"table": staticmethod(lambda name: _Tbl(list(monkey_rows)))})()
-    calls = []
-    app.label = lambda rid, payload: (calls.append((rid, payload)),
-                                      {"ok": True, "obsidian_path": "note.md"})[1]
-    return calls
+    tbl = _Tbl([])
+    app.sb = type("SB", (), {"table": staticmethod(lambda name: tbl)})()
+    return tbl
 
 
 async def _add(filename, data=PNG):
@@ -122,39 +124,55 @@ def test_edit_saves_corrections():
     print("ok  proofread corrections persist, and a missing page errors cleanly")
 
 
-def test_attach_files_page_and_appends_notes():
+def test_note_files_page_as_new_row():
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as v:
         app.PENDING_DIR = pathlib.Path(d)
         app.OBSIDIAN_VAULT = pathlib.Path(v)
-        calls = stub(text="board work Claude never heard")
+        tbl = stub(text="board work Claude never heard")
+        ran, real = [], app.threading.Thread
+        app.threading.Thread = lambda target, args, daemon: type(
+            "T", (), {"start": lambda self: ran.append((target, args))})()
         name = run(_add("Incline.png"))["name"]
-        out = app.pending_attach(name, {"rid": RID})
+        try:
+            out = app.pending_note(name)
+        finally:
+            app.threading.Thread = real
         assert out["ok"], out
-        # the page itself is now in the vault, findable by the note writer
-        stored = app._attachments(RID)
+        # a fresh row, carrying the text before anything can fail
+        row = tbl.inserted[0]
+        assert row["transcript"] == "board work Claude never heard", row
+        assert row["source"] == "ipad_page" and row["title"] == "Incline", row
+        # the page itself is in the vault under the NEW row, findable by the note writer
+        stored = app._attachments(out["id"])
         assert len(stored) == 1 and stored[0].startswith("Incline-"), stored
-        # its text was appended to the existing notes, not replacing them
-        rid_seen, payload = calls[0]
-        assert rid_seen == RID
-        assert payload["notes"] == "already here\n\nboard work Claude never heard", payload["notes"]
-        # labels passed straight back so only the notes move
-        assert payload["topic"] == "Angles and Inclined Planes"
-        assert payload["klass"] == "Physics"
-        # and the staging pair is cleared
+        # summarize/label runs in the background on that row
+        target, args = ran[0]
+        assert target is app._page_note and args[0] == out["id"], ran
         assert app.pending_list() == []
-    print("ok  attach stores the page, appends its text, and clears the staging pair")
+    print("ok  new note makes its own row, stores the page, and clears the staging pair")
 
 
-def test_attach_needs_a_real_target():
+def test_note_needs_text():
     with tempfile.TemporaryDirectory() as d:
         app.PENDING_DIR = pathlib.Path(d)
-        stub(monkey_rows=())
+        tbl = stub()
         name = run(_add("p.png"))["name"]
-        assert app.pending_attach(name, {"rid": ""})["ok"] is False
-        out = app.pending_attach(name, {"rid": RID})
-        assert out["ok"] is False and "no longer exists" in out["error"], out
-        assert (pathlib.Path(d) / name).exists(), "failed attach must not eat the page"
-    print("ok  attaching to a missing recording fails without losing the page")
+        app.pending_edit(name, {"text": "   "})
+        out = app.pending_note(name)
+        assert out["ok"] is False and "no text" in out["error"], out
+        assert tbl.inserted == [], "empty page still made a row"
+        assert (pathlib.Path(d) / name).exists(), "refused page must stay waiting"
+    print("ok  a page with no text is refused without losing it")
+
+
+def test_own_topic_never_shares_a_note():
+    """write_note combines every row with the same topic into one note, so a
+    page filed as its own note must not keep a topic another row already has."""
+    assert app._own_topic("Friction", {"Normal force"}, "2026-09-25") == "Friction"
+    assert app._own_topic("Friction", {"Friction"}, "2026-09-25") == "Friction (2026-09-25)"
+    taken = {"Friction", "Friction (2026-09-25)"}
+    assert app._own_topic("Friction", taken, "2026-09-25") == "Friction (2026-09-25 2)"
+    print("ok  a page note's topic never collides with an existing note")
 
 
 def test_drop():
@@ -175,7 +193,8 @@ if __name__ == "__main__":
     test_unreadable_page_is_not_staged()
     test_list_newest_first_and_hides_sidecars()
     test_edit_saves_corrections()
-    test_attach_files_page_and_appends_notes()
-    test_attach_needs_a_real_target()
+    test_note_files_page_as_new_row()
+    test_note_needs_text()
+    test_own_topic_never_shares_a_note()
     test_drop()
     print("\nall pending-page checks passed")
