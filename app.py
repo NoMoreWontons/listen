@@ -2870,9 +2870,7 @@ def _note_md(rows):
         "source": source,
         "summary": _one_line(first.get("summary")),
     }
-    u_no, t_no, _ = _split_ordinal(first.get("title"))
-    if u_no is not None:  # zero-padded: Bases sorts it as a string, so "01-10" must follow "01-02"
-        fm["seq"] = f"{u_no:02d}-{t_no:02d}"
+    # no seq here: order_class owns it, and _refile_group carries it across rewrites
     # json.dumps is a valid YAML double-quoted scalar. Labels and summaries carry
     # colons, quotes and unicode math; unquoted, one of those breaks the WHOLE
     # frontmatter block and the note drops out of every Timeline base.
@@ -3188,7 +3186,14 @@ def _refile_group(sem, cls, unit, topic):
             dest.unlink()
         return None
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(_note_md(group), encoding="utf-8")
+    md = _note_md(group)
+    if dest.exists():  # the timeline position (and a hand-set lock) outlive the rewrite
+        old_md = dest.read_text(encoding="utf-8")
+        for k in ("seq", "seq_lock"):
+            v = _fm_get(old_md, k)
+            if v is not None:
+                md = _fm_set(md, k, v)
+    dest.write_text(md, encoding="utf-8")
     for r in group:
         old = r.get("obsidian_path")
         if old == str(dest):
@@ -3236,7 +3241,147 @@ def write_note(row):
         write_graph_config()
     except Exception as e:
         print(f"[listen] hub notes/graph config failed (note itself is written): {e}")
+    try:
+        order_class(row.get("semester"), row.get("class"))
+    except Exception as e:
+        print(f"[listen] timeline ordering failed (note itself is written): {e}")
     return dest
+
+
+# --- learning order: the timeline's seq property ---
+# Timelines sort on seq, then date. Recording order is not learning order: a
+# split lecture's segments share one timestamp, and online-class videos get
+# watched out of order. So seq comes from one Haiku call per class that orders
+# every lecture note in it. Spaced by 10 so a hand-set seq (with seq_lock:
+# true) can slot between two notes and survive every re-order.
+
+_FM = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+
+
+def _fm_get(text, key):
+    """Raw frontmatter value of key (quotes and all), or None."""
+    m = _FM.match(text or "")
+    k = m and re.search(rf"(?m)^{re.escape(key)}:[ \t]*(.*)$", m.group(1))
+    return k.group(1).strip() if k else None
+
+
+def _fm_val(text, key):
+    """Frontmatter value decoded — _note_md writes json.dumps strings."""
+    v = _fm_get(text, key) or ""
+    try:
+        return json.loads(v) if v.startswith('"') else v
+    except ValueError:
+        return v
+
+
+def _fm_set(text, key, value):
+    """text with frontmatter key set to the raw YAML value; appended to the
+    frontmatter when absent. No frontmatter: text unchanged."""
+    m = _FM.match(text or "")
+    if not m:
+        return text
+    line = f"{key}: {value}"
+    body, n = re.subn(rf"(?m)^{re.escape(key)}:.*$", lambda _m: line, m.group(1), count=1)
+    if not n:
+        body += "\n" + line
+    return text[:m.start(1)] + body + text[m.end(1):]
+
+
+def _fix_order(order, notes):
+    """Pure: the model's order -> a full permutation of range(len(notes)).
+    Drops junk and duplicates, appends whatever it left out in date order,
+    then makes numbered notes (M1-2 titles, (4.3) sections) follow their
+    numbering -- the course's own numbering beats the model's guess. Minimal
+    moves: the longest run the model already has in order stays put, and each
+    other numbered note moves to just after the one numbered before it.
+    (Swapping numbered notes across their slots instead dragged a (1.4)
+    section into the chapter-4 notes.)"""
+    seen, out = set(), []
+    for i in order if isinstance(order, list) else []:
+        if isinstance(i, int) and 0 <= i < len(notes) and i not in seen:
+            seen.add(i)
+            out.append(i)
+    out += sorted((i for i in range(len(notes)) if i not in seen), key=lambda i: notes[i]["date"])
+    num_of = lambda i: notes[i].get("ordinal")
+    num = [i for i in out if num_of(i)]
+    chains = []  # chains[j]: longest in-order run of numbered notes ending at num[j]
+    for j, i in enumerate(num):  # ponytail: O(n²) -- a class has tens of notes
+        prev = [chains[k] for k in range(j) if num_of(num[k]) <= num_of(i)]
+        chains.append(max(prev, key=len, default=[]) + [i])
+    keep = set(max(chains, key=len, default=[]))
+    out = [i for i in out if not num_of(i) or i in keep]
+    for i in sorted((i for i in num if i not in keep), key=num_of):
+        before = [k for k, x in enumerate(out) if num_of(x) and num_of(x) <= num_of(i)]
+        out.insert(before[-1] + 1 if before else next(k for k, x in enumerate(out) if num_of(x)), i)
+    return out
+
+
+def _learning_order(cls, notes):
+    """Indices of notes in the order a student should learn them."""
+    lines = "\n".join(
+        f"{i}. [{n['unit']}] {n['topic']} ({n['date']})"
+        + (f" [course numbering {n['ordinal'][0]}.{n['ordinal'][1]}]" if n.get("ordinal") else "")
+        + (f" — {n['summary']}" if n["summary"] else "")
+        for i, n in enumerate(notes))
+    msg = claude.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": (
+            f"These are a student's lecture notes for the course '{cls}'. Order them "
+            "the way the material is best learned: prerequisites before what builds "
+            "on them, units in course order, and within a unit, foundations before "
+            "applications. Where the subject has a standard textbook order, follow it. "
+            "The recording date is only a hint — some notes were "
+            "recorded out of order. Keep course numbering where given.\n"
+            'Return ONLY a JSON object {"order": [...]} listing every number below '
+            "exactly once.\n\n" + lines)}],
+    )
+    return _fix_order(_json_obj(_text(msg)).get("order"), notes)
+
+
+def _section_no(topic):
+    """(4, 3) from a textbook-section suffix like 'The normal distribution (4.3)'."""
+    m = re.search(r"\((\d+)\.(\d+)\)\s*$", topic or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+_order_sig = {}  # (sem, cls) -> the note set last ordered: an unchanged refile skips the call
+
+
+def order_class(sem, cls):
+    """Rewrites seq on every lecture note in the class to its learning-order
+    rank. Reads notes off disk rather than the DB, so hand-moved notes count.
+    Only the seq line changes; the rest of each note is left byte-for-byte."""
+    root = OBSIDIAN_VAULT / _slug(sem) / _slug(cls)
+    notes = []
+    for p in sorted(root.rglob("*.md")) if root.is_dir() else []:
+        text = p.read_text(encoding="utf-8")
+        if "lecture" in (_fm_get(text, "tags") or ""):
+            notes.append((p, text))
+    sig = tuple(str(p) for p, _ in notes)
+    if len(notes) < 2 or _order_sig.get((sem, cls)) == sig:
+        return
+    ordinals = {}
+    try:
+        for r in sb.table("recordings").select("title,obsidian_path").eq("class", cls).execute().data:
+            u, t, _ = _split_ordinal(r.get("title"))
+            if u is not None and r.get("obsidian_path"):
+                ordinals[pathlib.Path(r["obsidian_path"])] = (u, t)
+    except Exception as e:  # numbering is a hint; order without it
+        print(f"[listen] ordinal lookup failed: {e}")
+    meta = [{"unit": _fm_val(t, "unit"), "topic": _fm_val(t, "topic") or p.stem,
+             "summary": _fm_val(t, "summary"), "date": _fm_get(t, "date") or "",
+             "ordinal": ordinals.get(p) or _section_no(_fm_val(t, "topic"))} for p, t in notes]
+    rank = 0
+    for i in _learning_order(cls, meta):
+        p, text = notes[i]
+        if (_fm_get(text, "seq_lock") or "").lower() == "true":
+            continue
+        rank += 10
+        new = _fm_set(text, "seq", json.dumps(f"{rank:04d}"))  # zero-padded: Bases sorts seq as text
+        if new != text:
+            p.write_text(new, encoding="utf-8")
+    _order_sig[(sem, cls)] = sig
 
 
 def _rows_semester(rows):
