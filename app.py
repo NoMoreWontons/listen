@@ -2806,6 +2806,53 @@ def _folded(text, title="Transcript"):
 _STAMP_TITLE = re.compile(r"^\d{4}-\d{2}-\d{2} (?P<time>\d{2}:\d{2})( \(recovered\))?$")
 
 
+REVIEW_HEAD = re.compile(r"(?mi)^#{2,4} Review of last class[ \t]*$")
+
+
+def _link_review(summary, link):
+    """Puts `link` (a wikilink to last class's note) right under the summary's
+    '## Review of last class' heading, so the 2-4 recap bullets lead to the
+    note holding the detail. No heading or no link: summary unchanged."""
+    if not link or not summary:
+        return summary
+    return REVIEW_HEAD.sub(lambda m: f"{m.group(0)}\n\nPrevious class: {link}", summary, count=1)
+
+
+def _prev_class_link(r):
+    """Wikilink to a note from the same class's previous lecture, or "" when r
+    has no review section, there is no earlier lecture, or none of its notes is
+    on disk. A split lecture is several rows sharing one created_at, so "the
+    previous lecture" is the latest earlier timestamp and any of its segments'
+    notes will do. Syllabus/homework uploads are not classes. A segment sharing
+    r's topic yields no link: that recap is already in this very note.
+    Filters in Python over one eq-only query: a class has tens of rows, not
+    thousands, and it keeps the query builder calls to the ones tests fake."""
+    if not REVIEW_HEAD.search(r.get("summary") or "") or not r.get("class") or not r.get("created_at"):
+        return ""
+    try:
+        rows = (sb.table("recordings").select("semester,class,unit,topic,created_at,obsidian_path,source")
+                .eq("class", r["class"]).eq("status", "done").execute().data)
+    except Exception as e:
+        print(f"[listen] previous-class lookup failed: {e}")
+        return ""
+    earlier = [p for p in rows if (p.get("created_at") or "") < r["created_at"]
+               and p.get("source") not in ("syllabus", "homework")]
+    if not earlier:
+        return ""
+    last = max(p["created_at"] for p in earlier)
+    key = lambda x: tuple(x.get(k) for k in ("semester", "class", "unit", "topic"))
+    for p in earlier:
+        path = pathlib.Path(p.get("obsidian_path") or "")
+        if p["created_at"] != last or not path.name or not path.is_relative_to(OBSIDIAN_VAULT):
+            continue
+        if key(p) == key(r):
+            return ""
+        if path.exists():  # hand-moved or merged notes leave stale obsidian_paths behind
+            rel = path.relative_to(OBSIDIAN_VAULT).with_suffix("").as_posix()
+            return f"[[{rel}|{p.get('topic') or path.stem}]]"
+    return ""
+
+
 def _note_md(rows):
     """Combined note for every recording sharing one topic (rows: non-empty
     transcripts, oldest first — see _group_rows). Frontmatter/H1/date come
@@ -2858,7 +2905,7 @@ def _note_md(rows):
     if len(rows) == 1:
         return (
             head
-            + f"## Summary\n\n{first.get('summary') or ''}"
+            + f"## Summary\n\n{_link_review(first.get('summary') or '', _prev_class_link(first))}"
             + extra(first, "##")
             + pages(first, "##")
             + "\n\n" + _folded(first.get("transcript") or "") + "\n"
@@ -2875,7 +2922,7 @@ def _note_md(rows):
             return f"{day} {stamp.group('time')} — {r.get('topic') or 'Lecture'}"
         return f"{day} — {r.get('title') or r.get('topic') or 'Lecture'}"
     notes = "\n\n".join(
-        f"## {heading(r)}\n\n{r.get('summary') or ''}{extra(r, '###')}{pages(r, '###')}"
+        f"## {heading(r)}\n\n{_link_review(r.get('summary') or '', _prev_class_link(r))}{extra(r, '###')}{pages(r, '###')}"
         for r in rows)
     transcripts = "\n\n".join(
         _folded(r.get("transcript") or "", heading(r)) for r in rows)
