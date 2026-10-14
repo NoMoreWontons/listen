@@ -314,6 +314,52 @@ def test_flatten_prep_dirs():
     print("ok: unit-level Exam Prep folders flatten into one per class")
 
 
+def test_study_plan():
+    """Study plan: deadlines (past ones dropped), weak spots, and the student's
+    own week reach the prompt; the plan files under Exam Prep like a cheat sheet."""
+    import datetime
+    seen = {}
+
+    def spy(**kw):
+        seen["prompt"] = kw["messages"][0]["content"]
+        return FakeMsg("# Study plan - Biology - Cells\n\n## Next action\n- redraw the membrane")
+
+    today = datetime.date.today()
+    with tempfile.TemporaryDirectory() as d:
+        app.OBSIDIAN_VAULT = pathlib.Path(d)
+        sb = FakeSB([mkrow("Cells", "Mitosis", summary="Mitosis is cell division.")])
+        sb.table = lambda name, t=sb.table: FakeQuery([
+            {"klass": "Biology", "status": "open", "title": "Exam 1", "kind": "exam",
+             "due_on": str(today + datetime.timedelta(days=5))},
+            {"klass": "Biology", "status": "open", "title": "Old HW", "kind": "assignment",
+             "due_on": str(today - datetime.timedelta(days=2))},
+        ]) if name == "assignments" else FakeQuery(sb.quizzes) if name == "quizzes" else t(name)
+        sb.quizzes += [
+            {"class": "Biology", "kind": "quiz", "unit": "Cells", "score": None, "created_at": "2026-10-01"},
+            {"class": "Biology", "kind": "test", "unit": "Cells", "score": 55, "created_at": "2026-10-02"},
+            {"class": "Biology", "kind": "quiz", "unit": "Cells", "score": 90, "created_at": "2026-10-03"},
+        ]
+        sb.cards += [{"class": "Biology", "due_at": "2000-01-01"},
+                     {"class": "Biology", "due_at": "2999-01-01"}]
+        app.sb = sb
+        app.weak_spots = lambda cls, sem: [{"topic": "Meiosis", "missed": 3, "attempted": 4, "rate": 0.75}]
+        app.claude.messages.create = spy
+        out = app.study_generate({"kind": "plan", "class": "Biology", "scopes": [{"unit": "Cells"}],
+                                  "constraints": "work 5-8pm weekdays"})
+        assert out["filename"] == "Biology Cells study plan.md", out
+        p = pathlib.Path(out["path"])
+        assert p.parent.name == app.PREP_DIR and p.exists(), p
+        pr = seen["prompt"]
+        assert "Exam 1" in pr and "Old HW" not in pr, pr[:400]
+        assert "Meiosis: missed 3/4" in pr and "work 5-8pm weekdays" in pr
+        assert "buffer" in pr and "conceptual, procedural" in pr and "Mitosis is cell division." in pr
+        # outstanding practice: untaken + under-70 redo + due cards; the 90% quiz is done
+        assert "take the ungraded quiz on Cells" in pr and "redo the test on Cells" in pr, pr
+        assert "scored 90%" not in pr and "review the 1 flashcards due" in pr
+        assert "Parkinson's law" in pr and "Practice checklist" in pr
+    print("ok: study plan carries deadlines/weak spots/practice/week, files under Exam Prep")
+
+
 if __name__ == "__main__":
     test_scope_rows()
     test_validation_errors()
@@ -323,6 +369,7 @@ if __name__ == "__main__":
     test_quiz_format_passthrough()
     test_flashcards()
     test_cheatsheet()
+    test_study_plan()
     test_quiz_files_ungraded()
     test_semester_falls_back_to_rows()
     test_migrate_prep_dirs()

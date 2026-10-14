@@ -2188,6 +2188,7 @@ function openTreeMenu(x, y) {
     ['Test — FRQ', el => genStudy('test', el, 'frq')],
     ['Flashcards', el => genStudy('flashcards', el)],
     ['Cheat sheet', el => genStudy('cheatsheet', el)],
+    ['Study plan', el => genStudy('plan', el)],
   ];
   if (treeSel.size === 1) items.push(['Rename', renameSel], ['Delete', deleteSel]);
   menuEl = document.createElement('div');
@@ -2219,6 +2220,14 @@ function studyByClass() {
 
 async function genStudy(kind, itemEl, fmt = 'mcq') {
   if (genBusy) return;
+  // a plan built without the student's real week is imaginary -- ask, but keep it general
+  let constraints = '';
+  if (kind === 'plan') {
+    constraints = prompt('Your week, in general terms (optional):\n'
+      + 'work/class hours, best focus time, fixed commitments.\n'
+      +'e.g. "work 5-8pm weekdays, most alert mornings, busy Wed evening"');
+    if (constraints === null) { closeTreeMenu(); return; }
+  }
   genBusy = true;
   itemEl.textContent = '…';
   try {
@@ -2227,7 +2236,7 @@ async function genStudy(kind, itemEl, fmt = 'mcq') {
       const [sem, cls] = sc.split('||');
       const resp = await (await fetch('/study/generate', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ kind, format: fmt, semester: sem, class: cls, scopes }),
+        body: JSON.stringify({ kind, format: fmt, semester: sem, class: cls, scopes, constraints }),
       })).json();
       if (resp.error) { alert(`${cls}: ${resp.error}`); continue; }
       out.push({ cls, resp });
@@ -2239,7 +2248,7 @@ async function genStudy(kind, itemEl, fmt = 'mcq') {
     } else if (kind === 'flashcards') {
       alert(out.map(o => `${o.cls}: ${o.resp.count} cards`).join('\n'));
     } else {
-      renderCheatsheets(out);       // in-app view; each is also filed to Obsidian
+      renderCheatsheets(out);       // cheat sheet or study plan; each is also filed to Obsidian
     }
   } finally { genBusy = false; closeTreeMenu(); }
 }

@@ -1861,7 +1861,7 @@ def study_generate(payload: dict = Body(...)):
     kind = payload.get("kind")
     fmt = payload.get("format") if payload.get("format") in ("mcq", "frq") else "mcq"
     scopes = payload.get("scopes")
-    if kind not in ("quiz", "test", "flashcards", "cheatsheet"):
+    if kind not in ("quiz", "test", "flashcards", "cheatsheet", "plan"):
         return {"error": "bad kind"}
     if not cls:
         return {"error": "class required"}
@@ -1913,10 +1913,15 @@ def study_generate(payload: dict = Body(...)):
         return {"count": len(valid), "path": write_cards_note(sem, cls, unit or "")}
 
     try:
-        md = build_cheatsheet(rows, cls, unit or "")
+        if kind == "plan":
+            md = build_study_plan(rows, cls, unit or "", *_plan_context(cls, sem),
+                                  constraints=payload.get("constraints") or "")
+        else:
+            md = build_cheatsheet(rows, cls, unit or "")
     except Exception as e:
         return {"error": f"generation failed: {e}"}
-    fname = _slug(f"{cls} {unit or ''}".strip()) + " cheatsheet.md"
+    suffix = " study plan.md" if kind == "plan" else " cheatsheet.md"
+    fname = _slug(f"{cls} {unit or ''}".strip()) + suffix
     # filed in the vault (opens in Obsidian) as well as returned for the in-app view
     path = write_prep_note(sem, cls, fname, md)
     return {"filename": fname, "markdown": md,
@@ -2086,6 +2091,112 @@ def build_cheatsheet(rows, cls, unit):
             "Write math as LaTeX ($...$ inline, $$...$$ display).\n" + DIAGRAM_RULES +
             "Return ONLY the cheat sheet markdown, starting with the title. Do not "
             "wrap your reply in a code fence.\n\nNotes:\n" + material)}],
+    )
+    return _text(msg) + "\n"
+
+
+RETAKE_BELOW = 70  # graded practice under this % goes back on the plan
+
+
+def _plan_context(cls, sem):
+    """What a study plan has to fit around: the class's open dated deadlines
+    (soonest first, past ones dropped), its quiz weak spots, and the practice
+    already generated in listen that still needs doing -- quizzes/tests never
+    taken, ones scored under RETAKE_BELOW, and flashcards due."""
+    today = datetime.date.today().isoformat()
+    deadlines = sorted(
+        (a for a in sb.table("assignments").select("title,due_on,kind")
+         .eq("klass", cls).eq("status", "open").execute().data
+         if (a.get("due_on") or "") >= today),
+        key=lambda a: a["due_on"])
+    q = sb.table("quizzes").select("kind,unit,score,created_at").eq("class", cls)
+    if sem:
+        q = q.eq("semester", sem)
+    practice = []
+    for z in sorted(q.execute().data, key=lambda z: z.get("created_at") or ""):
+        name = f"{z.get('kind') or 'quiz'} on {z.get('unit') or 'the whole class'} " \
+               f"(made {(z.get('created_at') or '')[:10]})"
+        if z.get("score") is None:
+            practice.append(f"take the ungraded {name}")
+        elif z["score"] < RETAKE_BELOW:
+            practice.append(f"redo the {name}, scored {z['score']}%")
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    due = sum(1 for c in sb.table("cards").select("due_at").eq("class", cls).execute().data
+              if (c.get("due_at") or "") <= now)
+    if due:
+        practice.append(f"review the {due} flashcards due in listen")
+    return deadlines, weak_spots(cls, sem), practice
+
+
+def build_study_plan(rows, cls, unit, deadlines, weak, practice=(), constraints=""):
+    """One Claude call: a study plan built on the ENGR 2001 Module 6 ideas --
+    metacognition (plan/monitor/evaluate), concrete next actions instead of a
+    vague 'study X', energy-aware working windows with buffers, checkpoints
+    that test rather than reread, and a post-study mistake review -- plus
+    Parkinson's law (work expands to fill the time given: tight timeboxes and
+    a self-set deadline ahead of the real one) and a checklist that schedules
+    every outstanding piece of listen practice. constraints is the student's
+    own free-text week (work shifts, best focus hours)."""
+    material = "\n\n".join(
+        f"## {r.get('topic') or r.get('title') or 'Untitled'}\n{(r.get('summary') or '').strip()}"
+        for r in rows if (r.get("summary") or "").strip())
+    head = f"# Study plan — {cls}" + (f" — {unit}" if unit else "")
+    due = "\n".join(f"- {a['due_on']}: {a['title']} ({a.get('kind') or 'assignment'})"
+                    for a in deadlines[:8]) or "- none on the calendar"
+    weak_txt = "\n".join(f"- {w['topic']}: missed {w['missed']}/{w['attempted']} quiz questions"
+                         for w in weak) or "- no quiz history yet"
+    todo = "\n".join(f"- {p}" for p in practice) or "- none yet"
+    msg = claude.messages.create(
+        model="claude-sonnet-5", max_tokens=4000,
+        messages=[{"role": "user", "content": (
+            f"Today is {datetime.date.today().isoformat()}. Write a study plan for a "
+            f"college student. Start it with the title '{head}'.\n\n"
+            f"Upcoming deadlines:\n{due}\n\nWeak spots from their quizzes:\n{weak_txt}\n\n"
+            f"Practice already made in their study app that is not done yet:\n{todo}\n\n"
+            f"The student's week, in their words:\n{constraints.strip() or '(not given)'}\n\n"
+            "Rules for the plan:\n"
+            "- Small and doable, never a giant plan. It runs from today to the next "
+            "deadline above, or 7 days if there is none. Lead with a '## Next action' "
+            "section: ONE task the student can start in the next 10 minutes.\n"
+            "- Parkinson's law: work expands to fill the time it is given. Set a "
+            "self-imposed deadline 1-2 days BEFORE the real one and state it under "
+            "the title as 'Done by: <date>'; everything finishes by then, and the "
+            "days after it are only buffer and a final checkpoint. Every session is "
+            "a hard timebox, sized a little tighter than feels comfortable (25-60 "
+            "min, never open-ended), with a 'Done when' deliverable so it ends on "
+            "an output, not on the clock running out.\n"
+            "- Practice is mandatory. Schedule EVERY practice item listed above in a "
+            "specific session (untaken quizzes/tests first, then redos, flashcards "
+            "as a short daily box). If there is none, schedule generating and taking "
+            "a short listen quiz per topic. End the plan with '## Practice "
+            "checklist': one '- [ ] <item> — <session>' line per practice item, so "
+            "nothing is skipped.\n"
+            "- '## Before you start' (2-3 minutes): have them list what they think they "
+            "already know and what they don't, with a few prompts drawn from the notes.\n"
+            "- '## Sessions': working windows (e.g. 'Tue morning, 45-60 min'), not "
+            "minute-by-minute slots. Fit them around the student's week. Put the "
+            "hardest, most focused work at their best-energy time (default to "
+            "mornings if unknown) and light review at low-energy times. Weak spots "
+            "come first. Never fill every open hour; leave at least one buffer "
+            "block for overruns, a gap a checkpoint exposes, or a bad night's sleep. "
+            "Protect sleep and meals; no studying the whole night before.\n"
+            "- Every session lists concrete actions, never 'study X' or 'review "
+            "notes': e.g. 'redraw the ___ diagram from memory', 'explain ___ vs ___ "
+            "out loud', 'solve 3 problems on ___ before checking'. Active retrieval "
+            "over rereading or highlighting.\n"
+            "- End every session with a checkpoint: a self-test that gives evidence, "
+            "not a feeling (a short listen quiz on the topic, a teach-back, a blank-"
+            "page recall), and what to do if it fails.\n"
+            "- '## Using AI': attempt first, then ask AI to check the work; the "
+            "teach-back prompt 'I'll teach you ___. Act like a student learning it for "
+            "the first time, ask me questions when I'm unclear, don't give me the "
+            "answer.'; no pasting problems in for answers.\n"
+            "- '## After each session': 3 reflection questions — what got clearer, "
+            "which strategy worked and what evidence says so, and for each miss "
+            "whether it was conceptual, procedural, or a careless slip.\n"
+            "Keep it to one screen: 6 sections, tight bullets, a table for the "
+            "sessions with columns Window | Timebox | Actions | Done when | Checkpoint. Return ONLY the plan markdown, starting with the title. Do "
+            "not wrap your reply in a code fence.\n\nNotes:\n" + material)}],
     )
     return _text(msg) + "\n"
 
