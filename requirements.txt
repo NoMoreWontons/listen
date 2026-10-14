@@ -4,6 +4,8 @@ python-dotenv
 supabase
 anthropic
 faster-whisper
+# av 16+ dropped open(metadata_errors=), which faster-whisper 1.2.1 still passes
+av<16
 nvidia-cublas-cu12
 nvidia-cudnn-cu12==9.*
 httpx
