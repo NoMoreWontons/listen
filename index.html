@@ -1324,8 +1324,9 @@ function labelEditor(r) {
     <button class="ocr-btn" data-sel=".lbl-addendum" onclick="ocrNotes('${r.id}', this, '.lbl-addendum')" title="Photo, PDF, PowerPoint, Word, or text file — read and appended to the note straight away">&#128247; Add pages to note</button>`}
     ${hint}
   </div>`;
-  // filed already -> tuck the editor away; relabelling moves the note
-  return filed ? `<details class="labels-done" data-k="${r.id}-labels"><summary>Edit labels / note</summary>${editor}</details>` : editor;
+  // finished -> tuck the editor away; relabelling a filed note moves it.
+  // live recordings keep it open so labels can be set mid-lecture.
+  return live ? editor : `<details class="labels-done" data-k="${r.id}-labels"><summary>${filed ? 'Edit labels / note' : 'Labels / save to Obsidian'}</summary>${editor}</details>`;
 }
 
 function splitCard(r) {
