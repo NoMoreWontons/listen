@@ -1219,6 +1219,10 @@ def finalize(rid, transcript, created_at=None, own_note=False):
     pre = (sb.table("recordings").select("semester,class,unit,topic,notes,source,title")
            .eq("id", rid).single().execute().data or {})
     keep = lambda k, v: (pre.get(k) or "").strip() or v
+    # an upload with no passed-in date gets "now" below -- when the file was
+    # processed, not when the class met -- so its slot hint would name whatever
+    # class meets at upload time. Only a real class time may pick the slot.
+    real_time = bool(created_at) or pre.get("source") == "local"
     created_at = created_at or datetime.datetime.now().isoformat()
     unit_no = _split_ordinal(pre.get("title"))[0]  # 'M1-2' -> this lecture is module 1
     # the semester decides which vault classes are candidates, so resolve it first
@@ -1232,7 +1236,7 @@ def finalize(rid, transcript, created_at=None, own_note=False):
             .eq("status", "done").execute().data)
     segments, exams, tokens_in, tokens_out = analyze(
         transcript, pre.get("notes") or "", created_at, known,
-        _slot_class(created_at, done, semester))
+        _slot_class(created_at, done, semester) if real_time else None)
 
     pre_class = (pre.get("class") or "").strip()
     if pre_class:  # user already told us the class — it applies to every segment
@@ -2305,6 +2309,12 @@ def _doc_block(data):
     if media:
         return {"type": "image", "source": {"type": "base64", "media_type": media,
                                             "data": base64.b64encode(data).decode()}}
+    try:  # plain-text transcript (.txt/.md); NUL bytes mean binary, not text
+        text = data.decode("utf-8-sig")
+        if text.strip() and "\x00" not in text:
+            return {"type": "text", "text": "The document's text:\n\n" + text}
+    except UnicodeDecodeError:
+        pass
     raise ValueError("unsupported file type — upload a PDF, pptx, docx, or a jpg/png/gif/webp photo")
 
 

@@ -22,6 +22,10 @@ def demo():
     b = app._doc_block(buf.getvalue())
     assert b["type"] == "text" and "homework text" in b["text"]
 
+    # plain-text transcript -> text block
+    b = app._doc_block("Hello, everyone, welcome to module 8-1.".encode())
+    assert b["type"] == "text" and "module 8-1" in b["text"]
+
     # junk -> ValueError, not a crash later inside the Claude call
     try:
         app._doc_block(b"\x00\x01\x02garbage")
